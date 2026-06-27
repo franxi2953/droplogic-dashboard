@@ -91,6 +91,12 @@ DROPLOGIC_MCP_CONTEXT_DIR=<this repo>\context\boxmini
 
 The `COCKPIT_*` names are kept for compatibility with the current DropLogic MCP integration. In practice this is Dashboard mode: OpenCV windows stay headless, and the browser renders frames through `visualizer_frame`.
 
+Dashboard contributes only the extra `cockpit-mode.md`/dashboard-mode context. Base agent guidance and cartridge geometry, including `cartridge.default.json`, live in the DropLogic MCP context folder:
+
+```text
+DropLogic/droplogic/mcp/context/boxmini/
+```
+
 Frame polling is faster than state polling by default:
 
 ```json
