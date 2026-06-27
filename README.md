@@ -17,6 +17,7 @@
   <img alt="Python" src="https://img.shields.io/badge/python-3.13-3776ab?style=flat-square&amp;labelColor=111111">
   <img alt="Frontend" src="https://img.shields.io/badge/frontend-vanilla%20JS-64d2ff?style=flat-square&amp;labelColor=111111">
   <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio%20proxy-30d158?style=flat-square&amp;labelColor=111111">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-d29922?style=flat-square&amp;labelColor=111111"></a>
 </p>
 
 DropLogic Dashboard is a browser-based companion for live DropLogic sessions. It owns one local MCP server process, renders the BoxMini streamer and matrix visualizers headlessly, records every tool call into append-only run logs, and can route an OpenAI-compatible agent through the same tools the normal MCP workflow uses.
@@ -166,3 +167,7 @@ $env:DROPLOGIC_REPO="C:\path\to\DropLogic"
 ## Safety Note
 
 Dashboard can control real hardware through DropLogic MCP. Treat every hardware action as live unless the MCP session is explicitly in simulation/debug mode. The UI records tool results, but it does not replace physical inspection or protocol-specific validation.
+
+## License
+
+DropLogic Dashboard is released under the [MIT License](LICENSE).
