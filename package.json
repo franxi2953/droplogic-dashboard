@@ -1,0 +1,15 @@
+{
+  "name": "droplogic-dashboard",
+  "version": "1.0.0",
+  "description": "Local dashboard for watching and driving DropLogic MCP runs.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "playwright": "^1.61.1"
+  }
+}

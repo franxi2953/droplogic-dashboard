@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DropLogic Dashboard</title>
+    <link rel="stylesheet" href="/styles.css?v=20260627-0710" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="topbar">
+        <div class="brand">
+          <h1>Dashboard</h1>
+          <p id="subtitle">BoxMini live control surface</p>
+        </div>
+        <div id="topMenu" class="top-menu">
+          <nav class="tabs" aria-label="Dashboard sections">
+            <button class="tab active" data-tab="main">Main Control</button>
+            <button class="tab" data-tab="context">Context Analysis</button>
+            <button class="tab" data-tab="advanced">Advanced Tools</button>
+          </nav>
+          <button id="runsBtn">Runs</button>
+          <button id="startMcp">Start MCP</button>
+          <button id="stopMcp">Stop MCP</button>
+          <button id="statusBtn">Runtime Status</button>
+        </div>
+      </section>
+
+      <section id="mainTab" class="tab-page active">
+        <section class="main-layout">
+          <section class="control-surface">
+            <section class="visual-grid">
+              <article class="panel visual-panel streamer-panel">
+                <header>
+                  <h2>Streamer</h2>
+                  <div class="visual-actions">
+                    <button id="downloadStreamer" class="icon-button download-frame" type="button" title="Download full-resolution streamer snapshot" aria-label="Download full-resolution streamer snapshot">
+                      <span class="download-icon" aria-hidden="true"></span>
+                    </button>
+                    <code id="streamerMeta">waiting</code>
+                  </div>
+                </header>
+                <div class="viewer streamer">
+                  <img id="streamerFrame" alt="Streamer visualizer frame" />
+                  <div id="streamerEmpty" class="empty">No streamer frame yet</div>
+                </div>
+              </article>
+
+              <article class="panel visual-panel matrix-panel">
+                <header>
+                  <h2>Matrix</h2>
+                  <div class="visual-actions">
+                    <button id="downloadMatrix" class="icon-button download-frame" type="button" title="Download full-resolution matrix snapshot" aria-label="Download full-resolution matrix snapshot">
+                      <span class="download-icon" aria-hidden="true"></span>
+                    </button>
+                    <code id="matrixMeta">waiting</code>
+                  </div>
+                </header>
+                <div class="viewer matrix">
+                  <img id="matrixFrame" alt="Matrix visualizer frame" />
+                  <div id="matrixEmpty" class="empty">No matrix frame yet</div>
+                </div>
+              </article>
+            </section>
+
+            <section class="telemetry-grid">
+              <article class="panel temperature-panel">
+                <header>
+                  <h2>Temperature</h2>
+                  <div class="temperature-readout">
+                    <strong id="temperatureValue">-</strong>
+                    <span id="temperatureTarget">target -</span>
+                  </div>
+                </header>
+                <canvas id="temperatureChart" width="640" height="180" aria-label="Temperature trend"></canvas>
+              </article>
+
+              <article class="panel state-panel">
+                <header>
+                  <h2>BoxMini State</h2>
+                  <code id="liveState">-</code>
+                </header>
+                <div id="stateGrid" class="state-grid"></div>
+              </article>
+            </section>
+          </section>
+
+          <aside class="panel conversation-panel">
+            <header>
+              <h2>Conversation</h2>
+              <div class="conversation-actions">
+                <button id="copyOutput" type="button">Copy Output</button>
+                <button id="cancelAgent" class="danger-button" type="button">Cancel</button>
+                <code id="mcpState">-</code>
+              </div>
+            </header>
+            <div class="now-strip">
+              <span id="now">Connecting...</span>
+              <code id="runId">-</code>
+            </div>
+            <ol id="conversation" class="conversation"></ol>
+            <button id="jumpToBottom" class="jump-bottom" type="button">Jump to latest</button>
+            <div id="thinkingOverlay" class="thinking-overlay" aria-live="polite">Thinking</div>
+            <div id="retryStrip" class="retry-strip" aria-live="polite"></div>
+            <div class="composer">
+              <textarea
+                id="agentPrompt"
+                spellcheck="false"
+                placeholder="Tell the agent what to do..."
+              ></textarea>
+              <button id="askAgent">Ask Agent</button>
+              <button id="stopAgent" class="danger-button" type="button">Cancel</button>
+            </div>
+            <section id="conversationFilters" class="conversation-filters collapsed">
+              <button id="filtersToggle" class="filters-toggle" type="button">
+                <span class="filter-chevron" aria-hidden="true"></span>
+                Conversation Filters
+              </button>
+              <div class="filter-options">
+                <label><input type="checkbox" data-filter="text" checked /> Text</label>
+                <label><input type="checkbox" data-filter="thinking" checked /> Thinking</label>
+                <label><input type="checkbox" data-filter="tools" checked /> Tool calls</label>
+                <label><input type="checkbox" data-filter="context" checked /> Context</label>
+                <label><input type="checkbox" data-filter="system" checked /> System</label>
+              </div>
+            </section>
+          </aside>
+        </section>
+      </section>
+
+      <section id="contextTab" class="tab-page">
+        <section class="context-analysis-layout">
+          <article class="panel token-panel">
+            <header>
+              <h2>AI Context Per Call</h2>
+              <code id="tokenSummary">waiting</code>
+            </header>
+            <div class="token-metrics">
+              <div>
+                <span>Total Sent</span>
+                <strong id="tokensTotal">-</strong>
+              </div>
+              <div>
+                <span>Mean Input</span>
+                <strong id="tokensMean">-</strong>
+              </div>
+              <div>
+                <span>Last</span>
+                <strong id="tokensLast">-</strong>
+              </div>
+              <div>
+                <span>Images</span>
+                <strong id="tokensImages">-</strong>
+              </div>
+            </div>
+            <div class="token-line-controls" aria-label="Token chart lines">
+              <label><input type="checkbox" data-token-line="request" checked /> Context per request</label>
+              <label><input type="checkbox" data-token-line="cumulative" /> Total sent</label>
+              <label><input type="checkbox" data-token-line="mean5" /> Last 5 mean</label>
+            </div>
+            <canvas id="tokenCumulativeChart" width="760" height="180" aria-label="AI context tokens sent per model call"></canvas>
+          </article>
+
+          <article class="panel context-breakdown-panel">
+            <header>
+              <h2>Last Context Breakdown</h2>
+              <code id="contextBreakdownMeta">-</code>
+            </header>
+            <canvas id="contextHistogram" width="520" height="180" aria-label="Last context token histogram"></canvas>
+            <div class="context-breakdown-summary" aria-label="Latest context diagnostics">
+              <div>
+                <span>Request</span>
+                <strong id="contextRequestChars">-</strong>
+              </div>
+              <div>
+                <span>Input Items</span>
+                <strong id="contextInputItems">-</strong>
+              </div>
+              <div>
+                <span>Tool Outputs</span>
+                <strong id="contextToolOutputTokens">-</strong>
+              </div>
+              <div>
+                <span>Overhead</span>
+                <strong id="contextOverheadTokens">-</strong>
+              </div>
+              <div>
+                <span>Largest Bucket</span>
+                <strong id="contextLargestBucket">-</strong>
+              </div>
+              <div>
+                <span>Retries</span>
+                <strong id="contextRetryCount">-</strong>
+              </div>
+            </div>
+            <section class="context-event-panel" aria-label="Recent context events">
+              <header>
+                <h3>Recent Context Events</h3>
+              </header>
+              <ol id="contextEventList"></ol>
+            </section>
+          </article>
+        </section>
+      </section>
+
+      <section id="advancedTab" class="tab-page">
+        <section class="advanced-layout">
+          <article class="panel status-panel">
+            <header>
+              <h2>Status</h2>
+            </header>
+            <div class="state-row">
+              <span>Run</span>
+              <code id="runIdAdvanced">-</code>
+            </div>
+            <div class="state-row">
+              <span>MCP</span>
+              <code id="mcpStateAdvanced">-</code>
+            </div>
+            <div class="state-row">
+              <span>AI</span>
+              <code id="aiState">-</code>
+            </div>
+            <div class="state-row">
+              <span>Live</span>
+              <code id="liveStateAdvanced">-</code>
+            </div>
+          </article>
+
+          <article class="panel tool-panel">
+            <header>
+              <h2>Tool Call</h2>
+            </header>
+            <label>
+              Tool
+              <input id="toolName" value="capabilities" />
+            </label>
+            <label>
+              Arguments JSON
+              <textarea id="toolArgs" spellcheck="false">{}</textarea>
+            </label>
+            <button id="callTool">Call Tool</button>
+            <pre id="toolResult"></pre>
+          </article>
+
+          <article class="panel result-panel">
+            <header>
+              <h2>Agent Result</h2>
+            </header>
+            <pre id="agentResult"></pre>
+          </article>
+
+          <article class="panel timeline-panel">
+            <header>
+              <h2>Timeline</h2>
+              <button id="clearLocal">Clear View</button>
+            </header>
+            <ol id="timeline" class="timeline"></ol>
+          </article>
+        </section>
+      </section>
+
+      <aside id="runsDrawer" class="runs-drawer" aria-label="Runs">
+        <header>
+          <div>
+            <h2>Runs</h2>
+            <p>Past conversations and traces</p>
+          </div>
+          <button id="closeRuns">Close</button>
+        </header>
+        <div class="run-actions">
+          <button id="newRun">New Run</button>
+          <button id="refreshRuns">Refresh</button>
+          <button id="selectAllRuns">Select All</button>
+          <button id="deleteSelectedRuns">Delete Selected</button>
+        </div>
+        <ol id="runsList" class="runs-list"></ol>
+      </aside>
+    </main>
+
+    <script src="/app.js?v=20260627-0710"></script>
+  </body>
+</html>

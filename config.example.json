@@ -1,0 +1,45 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "runs_dir": "runs",
+  "live_frame_interval_seconds": 0.33,
+  "live_state_interval_seconds": 1.0,
+  "mcp": {
+    "command": "py",
+    "args": [
+      "-3.13",
+      "-m",
+      "droplogic.mcp.server",
+      "--transport",
+      "stdio",
+      "--allow-real-hardware",
+      "--config",
+      "config.json"
+    ],
+    "env": {
+      "PYTHONPATH": "../DropLogic",
+      "DROPLOGIC_LOG_DIR": "%LOCALAPPDATA%/DropLogic/logs",
+      "DROPLOGIC_COCKPIT_MODE": "1",
+      "DROPLOGIC_VISUALIZER_HEADLESS": "1",
+      "DROPLOGIC_MCP_CONTEXT_DIR": "../droplogic-dashboard/context/boxmini"
+    }
+  },
+  "ai": {
+    "enabled": true,
+    "codex_config": "%USERPROFILE%/.codex/config.toml",
+    "codex_auth": "%USERPROFILE%/.codex/auth.json",
+    "max_context_chars": 800000,
+    "target_context_chars": 90000,
+    "recent_event_target": 120,
+    "large_event_chars": 8000,
+    "max_tool_output_chars": 12000,
+    "ai_context_summary_enabled": true,
+    "ai_context_summary_trigger_chars": 300000,
+    "ai_context_summary_max_chars": 12000,
+    "pinned_context_files": [
+      "agent-guide.md",
+      "cockpit-mode.md",
+      "cartridge.default.json"
+    ]
+  }
+}
