@@ -28,6 +28,7 @@ It is intentionally separate from the `droplogic` Python package: DropLogic rema
 
 - **Main Control**: large live streamer, matrix visualizer, temperature chart, and BoxMini state panels.
 - **Agent Chat**: a Codex/OpenAI-compatible control loop with thinking summaries, tool calls, retries, cancellation, copy buttons, and run history.
+- **Local Audio Input**: browser microphone capture sent to a local speech-to-text model before text is placed into the agent prompt.
 - **Context Analysis**: per-request token charts, context breakdown histograms, compaction events, retry diagnostics, and tool-output size badges.
 - **Run Records**: append-only `events.jsonl` histories, artifacts, visualizer frames, and persistent context checkpoints.
 - **MCP Proxy Mode**: agents can keep using the DropLogic MCP tool surface while Dashboard observes, records, and displays the same session.
@@ -108,29 +109,79 @@ Frame polling is faster than state polling by default:
 
 ## AI Provider
 
-The backend reads OpenAI-compatible defaults from your Codex config:
+The backend reads model profiles from private Dashboard files:
 
 ```text
-%USERPROFILE%\.codex\config.toml
-%USERPROFILE%\.codex\auth.json
+backend/ai_config.local.json
+backend/ai_auth.local.json
 ```
 
-It uses:
+Both files are ignored by git. The config file stores profile ids, labels, RKAPI URLs, model names, reasoning settings, and `api_key_id` references. The auth file stores the matching API keys.
 
-- `model_providers.<provider>.base_url`
-- `model`
-- `model_reasoning_effort`
-- `OPENAI_API_KEY`
+Profiles may use different RKAPI wire formats. Codex-style profiles can use `wire_api: "responses"`; Claude profiles currently use `wire_api: "anthropic_messages"` so Dashboard can read returned `thinking`, `text`, and `tool_use` blocks.
 
-Environment variables override those values:
+The browser receives only public profile metadata such as label/model/configured status. It never receives API keys.
+
+Minimal shape:
+
+```json
+{
+  "active_profile": "codex-5-5",
+  "profiles": [
+    {
+      "id": "codex-5-5",
+      "label": "Codex 5.5",
+      "base_url": "https://rkapi.com/v1",
+      "wire_api": "responses",
+      "model": "gpt-5.5",
+      "reasoning_effort": "xhigh",
+      "api_key_id": "codex"
+    }
+  ]
+}
+```
+
+```json
+{
+  "api_keys": {
+    "codex": "..."
+  }
+}
+```
+
+## Local Speech Input
+
+The **Audio** button records microphone audio in the browser and sends it to the local Dashboard backend for transcription. The transcript is inserted into the prompt box for review; it is not sent to the agent automatically.
+
+Install a local recognizer:
 
 ```powershell
-$env:COCKPIT_AI_BASE_URL="https://rkapi.com/v1"
-$env:COCKPIT_AI_MODEL="gpt-5.5"
-$env:OPENAI_API_KEY="..."
+py -3.13 -m pip install faster-whisper
 ```
 
-The browser never receives the API key.
+Then tune `config.example.json` or a private config:
+
+```json
+{
+  "speech": {
+    "enabled": true,
+    "engine": "faster_whisper",
+    "model": "large-v3-turbo",
+    "device": "auto",
+    "compute_type": "int8",
+    "language": null,
+    "beam_size": 5,
+    "best_of": 5,
+    "temperature": 0,
+    "condition_on_previous_text": false,
+    "hotwords": "BoxMini DropLogic droplet reservoir cartridge streamer visualizer Brightfield FAM stage temperature IVT TX TL MCP"
+  }
+}
+```
+
+Recommended defaults are `model: "large-v3-turbo"` and `compute_type: "int8"` for responsive local use on a CPU laptop. For maximum accuracy, use `model: "large-v3"`. For a CUDA GPU, use `device: "cuda"` and `compute_type: "float16"`.
+
+The same backend path can later host wake-word/name detection or lab-specific command parsing without changing the MCP tool flow.
 
 ## Run Logs
 

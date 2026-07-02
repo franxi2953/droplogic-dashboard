@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from .config import AiConfig
+from .config import AiConfig, active_ai_profile_public, ai_profiles_public, select_ai_profile
 from .context_builder import (
     build_run_memory,
     compact_tool_output_for_model,
@@ -43,10 +43,17 @@ class AiProvider:
             "provider": self.config.provider_name,
             "base_url": self.config.base_url,
             "model": self.config.model,
+            "wire_api": self.config.wire_api,
             "reasoning_effort": self.config.reasoning_effort,
             "reasoning_summary": self.config.reasoning_summary,
             "has_api_key": bool(self.config.api_key),
+            "active_profile": self.config.active_profile,
+            "profile": active_ai_profile_public(self.config),
+            "profiles": ai_profiles_public(self.config),
         }
+
+    def set_profile(self, profile_id: str) -> dict[str, Any]:
+        return select_ai_profile(self.config, profile_id)
 
     async def ask(self, prompt: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         if not self.configured:
@@ -58,6 +65,47 @@ class AiProvider:
             "safe next actions. Do not claim physical actions happened unless they "
             "appear in the event log. Keep responses concise."
         )
+        if uses_anthropic_messages(self.config):
+            payload = {
+                "model": self.config.model,
+                "system": instructions,
+                "max_tokens": 4096,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Curated dashboard event log JSON for model context:\n{context}\n\n"
+                            f"User request:\n{prompt}"
+                        ),
+                    }
+                ],
+            }
+            apply_anthropic_options(payload, self.config)
+            data = await self._post_anthropic_message(payload, on_retry_compact=retry_payload_compactor(payload))
+            return {
+                "text": extract_anthropic_text(data),
+                "reasoning": extract_anthropic_thinking(data),
+                "raw": data,
+            }
+
+        if uses_chat_completions(self.config):
+            payload = {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Curated dashboard event log JSON for model context:\n{context}\n\n"
+                            f"User request:\n{prompt}"
+                        ),
+                    },
+                ],
+            }
+            apply_chat_options(payload, self.config)
+            data = await self._post_chat_completion(payload, on_retry_compact=retry_payload_compactor(payload))
+            return {"text": extract_chat_response_text(data), "reasoning": [], "raw": data}
+
         payload = {
             "model": self.config.model,
             "instructions": instructions,
@@ -100,6 +148,32 @@ class AiProvider:
                 }
             ],
         }
+        if uses_anthropic_messages(self.config):
+            anthropic_payload = {
+                "model": self.config.model,
+                "system": instructions,
+                "max_tokens": 1000,
+                "messages": [
+                    {"role": "user", "content": json.dumps(events, ensure_ascii=True, default=str)}
+                ],
+            }
+            data = await self._post_anthropic_message(
+                anthropic_payload,
+                on_retry_compact=retry_payload_compactor(anthropic_payload),
+            )
+            return sanitize_run_name(extract_anthropic_text(data))
+
+        if uses_chat_completions(self.config):
+            chat_payload = {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": json.dumps(events, ensure_ascii=True, default=str)},
+                ],
+            }
+            apply_chat_options(chat_payload, self.config)
+            data = await self._post_chat_completion(chat_payload, on_retry_compact=retry_payload_compactor(chat_payload))
+            return sanitize_run_name(extract_chat_response_text(data))
         data = await self._post_response(payload, on_retry_compact=retry_payload_compactor(payload))
         return sanitize_run_name(extract_response_text(data))
 
@@ -119,7 +193,8 @@ class AiProvider:
             "Summarize the user's objective, confirmed completed actions, active blockers/errors, pending next steps, "
             "important file/output locations, and any user preferences. "
             "Do not invent physical state. For matrices, stage position, temperatures, droplet existence, voltage, "
-            "or live hardware status, say that the agent must refresh state with MCP tools before acting. "
+            "or live hardware status, say that the agent must refresh state with execution_status_summary() "
+            "or a targeted MCP tool before acting. "
             "Return plain text with short sections. Keep it concise."
         )
         context = json.dumps(events, ensure_ascii=True, default=str)
@@ -136,6 +211,64 @@ class AiProvider:
                 }
             ],
         }
+        if uses_anthropic_messages(self.config):
+            anthropic_payload = {
+                "model": self.config.model,
+                "system": instructions,
+                "max_tokens": max(1000, min(8192, max_chars + 500)),
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Curated deterministic event log for summarization:\n{context}\n\n"
+                            f"Maximum memory length: {max_chars} characters."
+                        ),
+                    }
+                ],
+            }
+            apply_anthropic_options(anthropic_payload, self.config)
+            data = await self._post_anthropic_message(
+                anthropic_payload,
+                on_retry=on_retry,
+                on_retry_compact=retry_payload_compactor(
+                    anthropic_payload,
+                    max_tool_output_chars=12_000,
+                    on_context_compacted=on_context_compacted,
+                ),
+            )
+            text = extract_anthropic_text(data).strip()
+            if len(text) > max_chars:
+                text = f"{text[: max_chars - 200].rstrip()}\n\n[AI memory truncated to configured limit.]"
+            return text
+
+        if uses_chat_completions(self.config):
+            chat_payload = {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Curated deterministic event log for summarization:\n{context}\n\n"
+                            f"Maximum memory length: {max_chars} characters."
+                        ),
+                    },
+                ],
+            }
+            apply_chat_options(chat_payload, self.config)
+            data = await self._post_chat_completion(
+                chat_payload,
+                on_retry=on_retry,
+                on_retry_compact=retry_payload_compactor(
+                    chat_payload,
+                    max_tool_output_chars=12_000,
+                    on_context_compacted=on_context_compacted,
+                ),
+            )
+            text = extract_chat_response_text(data).strip()
+            if len(text) > max_chars:
+                text = f"{text[: max_chars - 200].rstrip()}\n\n[AI memory truncated to configured limit.]"
+            return text
         data = await self._post_response(
             payload,
             on_retry=on_retry,
@@ -168,6 +301,38 @@ class AiProvider:
         if not self.configured:
             raise RuntimeError("AI provider is not configured.")
 
+        if uses_anthropic_messages(self.config):
+            return await self.ask_with_anthropic_tools(
+                prompt,
+                events,
+                tools,
+                call_tool,
+                pinned_context=pinned_context,
+                on_reasoning=on_reasoning,
+                on_text=on_text,
+                on_model_response=on_model_response,
+                on_retry=on_retry,
+                max_tool_rounds=max_tool_rounds,
+                max_tool_output_chars=max_tool_output_chars,
+                on_context_compacted=on_context_compacted,
+            )
+
+        if uses_chat_completions(self.config):
+            return await self.ask_with_chat_tools(
+                prompt,
+                events,
+                tools,
+                call_tool,
+                pinned_context=pinned_context,
+                on_reasoning=on_reasoning,
+                on_text=on_text,
+                on_model_response=on_model_response,
+                on_retry=on_retry,
+                max_tool_rounds=max_tool_rounds,
+                max_tool_output_chars=max_tool_output_chars,
+                on_context_compacted=on_context_compacted,
+            )
+
         context = json.dumps(events, ensure_ascii=True, default=str)
         instructions = (
             "You are the DropLogic Dashboard agent controlling BoxMini through MCP tools. "
@@ -176,7 +341,12 @@ class AiProvider:
             "For hardware actions, proceed carefully, report errors, and do not claim success "
             "unless the tool result confirms it. Keep user-facing narration brief, but use the "
             "available tool calls to make real progress. Continue tool-use until the requested "
-            "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs."
+            "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
+            "Do not query status after every action; when fresh live state is needed, prefer "
+            "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
+            "If execute_segment_to_breakpoint starts a background wait, call "
+            "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
+            "repeated immediate status calls."
         )
         response_tools = mcp_tools_to_response_tools(tools)
         input_list: list[dict[str, Any]] = [
@@ -326,6 +496,308 @@ class AiProvider:
             "raw": data,
         }
 
+    async def ask_with_chat_tools(
+        self,
+        prompt: str,
+        events: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        call_tool: Callable[[str, dict[str, Any]], Awaitable[Any]],
+        pinned_context: str | None = None,
+        on_reasoning: Callable[[str, int], Awaitable[None]] | None = None,
+        on_text: Callable[[str, int], Awaitable[None]] | None = None,
+        on_model_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        max_tool_rounds: int | None = None,
+        max_tool_output_chars: int = 12_000,
+        on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        context = json.dumps(events, ensure_ascii=True, default=str)
+        instructions = (
+            "You are the DropLogic Dashboard agent controlling BoxMini through MCP tools. "
+            "When the user asks for an action, call the appropriate MCP tools and execute it; "
+            "do not merely propose steps. Use the event log to avoid repeating completed work. "
+            "For hardware actions, proceed carefully, report errors, and do not claim success "
+            "unless the tool result confirms it. Keep user-facing narration brief, but use the "
+            "available tool calls to make real progress. Continue tool-use until the requested "
+            "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
+            "Do not query status after every action; when fresh live state is needed, prefer "
+            "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
+            "If execute_segment_to_breakpoint starts a background wait, call "
+            "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
+            "repeated immediate status calls."
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": instructions},
+            {
+                "role": "user",
+                "content": (
+                    f"{format_pinned_context(pinned_context)}"
+                    f"Curated dashboard event log JSON for model context:\n{context}\n\n"
+                    f"User request:\n{prompt}"
+                ),
+            },
+        ]
+        chat_tools = mcp_tools_to_chat_tools(tools)
+        payload = {
+            "model": self.config.model,
+            "messages": messages,
+            "tools": chat_tools,
+            "tool_choice": "auto",
+        }
+        apply_chat_options(payload, self.config)
+        request_started = time.monotonic()
+        data = await self._post_chat_completion(
+            payload,
+            on_retry=on_retry,
+            on_retry_compact=retry_payload_compactor(
+                payload,
+                on_context_compacted=on_context_compacted,
+            ),
+        )
+        if on_model_response is not None:
+            await on_model_response(
+                chat_model_response_metrics(
+                    data,
+                    round_index=0,
+                    elapsed_seconds=time.monotonic() - request_started,
+                    payload=payload,
+                )
+            )
+
+        all_reasoning: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        pending_calls: list[dict[str, Any]] = []
+        emitted_texts: set[str] = set()
+        round_index = 0
+        await emit_chat_response_text(data, round_index, emitted_texts, on_text)
+
+        while True:
+            calls = extract_chat_tool_calls(data)
+            if not calls:
+                break
+            if max_tool_rounds is not None and round_index >= max_tool_rounds:
+                pending_calls = calls
+                break
+            messages.append(chat_assistant_message(data))
+            for call in calls:
+                name = call["name"]
+                arguments = call["arguments"]
+                result = await call_tool(name, arguments)
+                result, _attachments = pop_model_attachments(result)
+                compacted_result = compact_chat_tool_result(result, max_tool_output_chars)
+                tool_calls.append({"name": name, "arguments": arguments, "result": compacted_result})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call["call_id"],
+                        "content": json.dumps(compacted_result, ensure_ascii=True, default=str),
+                    }
+                )
+            followup = {
+                "model": self.config.model,
+                "messages": messages,
+                "tools": chat_tools,
+                "tool_choice": "auto",
+            }
+            apply_chat_options(followup, self.config)
+            round_index += 1
+            request_started = time.monotonic()
+            data = await self._post_chat_completion(
+                followup,
+                on_retry=on_retry,
+                on_retry_compact=retry_payload_compactor(
+                    followup,
+                    max_tool_output_chars=max_tool_output_chars,
+                    on_context_compacted=on_context_compacted,
+                ),
+            )
+            if on_model_response is not None:
+                await on_model_response(
+                    chat_model_response_metrics(
+                        data,
+                        round_index=round_index,
+                        elapsed_seconds=time.monotonic() - request_started,
+                        payload=followup,
+                    )
+                )
+            await emit_chat_response_text(data, round_index, emitted_texts, on_text)
+
+        text = extract_chat_response_text(data)
+        stopped_reason = None
+        if pending_calls:
+            stopped_reason = "max_tool_rounds"
+            pending_names = ", ".join(call["name"] for call in pending_calls)
+            text = (
+                f"Stopped after {max_tool_rounds} tool rounds with pending tool call(s): "
+                f"{pending_names}. Send a short follow-up to continue from the current state."
+            )
+        elif not text:
+            text = "The model returned no user-facing text."
+
+        return {
+            "text": text,
+            "reasoning": all_reasoning,
+            "tool_calls": tool_calls,
+            "pending_tool_calls": pending_calls,
+            "stopped_reason": stopped_reason,
+            "raw": data,
+        }
+
+    async def ask_with_anthropic_tools(
+        self,
+        prompt: str,
+        events: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        call_tool: Callable[[str, dict[str, Any]], Awaitable[Any]],
+        pinned_context: str | None = None,
+        on_reasoning: Callable[[str, int], Awaitable[None]] | None = None,
+        on_text: Callable[[str, int], Awaitable[None]] | None = None,
+        on_model_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        max_tool_rounds: int | None = None,
+        max_tool_output_chars: int = 12_000,
+        on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        context = json.dumps(events, ensure_ascii=True, default=str)
+        instructions = (
+            "You are the DropLogic Dashboard agent controlling BoxMini through MCP tools. "
+            "When the user asks for an action, call the appropriate MCP tools and execute it; "
+            "do not merely propose steps. Use the event log to avoid repeating completed work. "
+            "For hardware actions, proceed carefully, report errors, and do not claim success "
+            "unless the tool result confirms it. Keep user-facing narration brief, but use the "
+            "available tool calls to make real progress. Continue tool-use until the requested "
+            "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
+            "Do not query status after every action; when fresh live state is needed, prefer "
+            "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
+            "If execute_segment_to_breakpoint starts a background wait, call "
+            "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
+            "repeated immediate status calls."
+        )
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": (
+                    f"{format_pinned_context(pinned_context)}"
+                    f"Curated dashboard event log JSON for model context:\n{context}\n\n"
+                    f"User request:\n{prompt}"
+                ),
+            }
+        ]
+        anthropic_tools = mcp_tools_to_anthropic_tools(tools)
+        payload = {
+            "model": self.config.model,
+            "system": instructions,
+            "messages": messages,
+            "tools": anthropic_tools,
+            "max_tokens": 8192,
+        }
+        apply_anthropic_options(payload, self.config)
+        request_started = time.monotonic()
+        data = await self._post_anthropic_message(
+            payload,
+            on_retry=on_retry,
+            on_retry_compact=retry_payload_compactor(
+                payload,
+                on_context_compacted=on_context_compacted,
+            ),
+        )
+        if on_model_response is not None:
+            await on_model_response(
+                anthropic_model_response_metrics(
+                    data,
+                    round_index=0,
+                    elapsed_seconds=time.monotonic() - request_started,
+                    payload=payload,
+                )
+            )
+
+        all_reasoning: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
+        pending_calls: list[dict[str, Any]] = []
+        emitted_texts: set[str] = set()
+        emitted_reasoning: set[str] = set()
+        round_index = 0
+        await emit_anthropic_thinking(data, round_index, emitted_reasoning, on_reasoning)
+        all_reasoning.extend(extract_anthropic_thinking(data))
+        await emit_anthropic_text(data, round_index, emitted_texts, on_text)
+
+        while True:
+            calls = extract_anthropic_tool_calls(data)
+            if not calls:
+                break
+            if max_tool_rounds is not None and round_index >= max_tool_rounds:
+                pending_calls = calls
+                break
+            messages.append(anthropic_assistant_message(data))
+            tool_results = []
+            for call in calls:
+                name = call["name"]
+                arguments = call["arguments"]
+                result = await call_tool(name, arguments)
+                result, _attachments = pop_model_attachments(result)
+                compacted_result = compact_chat_tool_result(result, max_tool_output_chars)
+                tool_calls.append({"name": name, "arguments": arguments, "result": compacted_result})
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call["call_id"],
+                        "content": json.dumps(compacted_result, ensure_ascii=True, default=str),
+                    }
+                )
+            messages.append({"role": "user", "content": tool_results})
+            followup = {
+                "model": self.config.model,
+                "system": instructions,
+                "messages": messages,
+                "tools": anthropic_tools,
+                "max_tokens": 8192,
+            }
+            apply_anthropic_options(followup, self.config)
+            round_index += 1
+            request_started = time.monotonic()
+            data = await self._post_anthropic_message(
+                followup,
+                on_retry=on_retry,
+                on_retry_compact=retry_payload_compactor(
+                    followup,
+                    max_tool_output_chars=max_tool_output_chars,
+                    on_context_compacted=on_context_compacted,
+                ),
+            )
+            if on_model_response is not None:
+                await on_model_response(
+                    anthropic_model_response_metrics(
+                        data,
+                        round_index=round_index,
+                        elapsed_seconds=time.monotonic() - request_started,
+                        payload=followup,
+                    )
+                )
+            await emit_anthropic_thinking(data, round_index, emitted_reasoning, on_reasoning)
+            all_reasoning.extend(extract_anthropic_thinking(data))
+            await emit_anthropic_text(data, round_index, emitted_texts, on_text)
+
+        text = extract_anthropic_text(data)
+        stopped_reason = None
+        if pending_calls:
+            stopped_reason = "max_tool_rounds"
+            pending_names = ", ".join(call["name"] for call in pending_calls)
+            text = (
+                f"Stopped after {max_tool_rounds} tool rounds with pending tool call(s): "
+                f"{pending_names}. Send a short follow-up to continue from the current state."
+            )
+        elif not text:
+            text = "The model returned no user-facing text."
+
+        return {
+            "text": text,
+            "reasoning": all_reasoning,
+            "tool_calls": tool_calls,
+            "pending_tool_calls": pending_calls,
+            "stopped_reason": stopped_reason,
+            "raw": data,
+        }
+
     async def _post_response(
         self,
         payload: dict[str, Any],
@@ -363,7 +835,136 @@ class AiProvider:
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
                     continue
-                if is_retryable_status(response.status_code):
+                if is_retryable_response(response):
+                    if on_retry is not None:
+                        body = response.text
+                        await on_retry(
+                            {
+                                "attempt": attempt,
+                                "delay_seconds": delay,
+                                "status_code": response.status_code,
+                                "response": preview_response_body(body),
+                                "body_preview": preview_response_body(body),
+                                "body_chars": len(body),
+                                **payload_diagnostics(payload),
+                            }
+                        )
+                    if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
+                        await on_retry_compact(attempt)
+                    continue
+                break
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                body = response.text
+                raise RuntimeError(f"{exc}. Response body: {body}") from exc
+            data = response.json()
+            data["_cockpit_retry_attempts"] = attempt
+            return data
+
+    async def _post_chat_completion(
+        self,
+        payload: dict[str, Any],
+        on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_retry_compact: Callable[[int], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.config.base_url}/chat/completions"
+        delays = [0.0, 0.0, 0.25, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0]
+        attempt = 0
+        async with httpx.AsyncClient(timeout=None) as client:
+            while True:
+                delay = delays[attempt] if attempt < len(delays) else delays[-1]
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                attempt += 1
+                try:
+                    response = await client.post(url, headers=headers, json=payload)
+                except httpx.RequestError as exc:
+                    if not is_retryable_request_error(exc):
+                        raise RuntimeError(f"Request error for {url}: {exc}") from exc
+                    if on_retry is not None:
+                        await on_retry(
+                            {
+                                "attempt": attempt,
+                                "delay_seconds": delay,
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                **payload_diagnostics(payload),
+                            }
+                        )
+                    if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
+                        await on_retry_compact(attempt)
+                    continue
+                if is_retryable_response(response):
+                    if on_retry is not None:
+                        body = response.text
+                        await on_retry(
+                            {
+                                "attempt": attempt,
+                                "delay_seconds": delay,
+                                "status_code": response.status_code,
+                                "response": preview_response_body(body),
+                                "body_preview": preview_response_body(body),
+                                "body_chars": len(body),
+                                **payload_diagnostics(payload),
+                            }
+                        )
+                    if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
+                        await on_retry_compact(attempt)
+                    continue
+                break
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                body = response.text
+                raise RuntimeError(f"{exc}. Response body: {body}") from exc
+            data = response.json()
+            data["_cockpit_retry_attempts"] = attempt
+            return data
+
+    async def _post_anthropic_message(
+        self,
+        payload: dict[str, Any],
+        on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_retry_compact: Callable[[int], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        url = f"{self.config.base_url}/messages"
+        delays = [0.0, 0.0, 0.25, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0]
+        attempt = 0
+        async with httpx.AsyncClient(timeout=None) as client:
+            while True:
+                delay = delays[attempt] if attempt < len(delays) else delays[-1]
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                attempt += 1
+                try:
+                    response = await client.post(url, headers=headers, json=payload)
+                except httpx.RequestError as exc:
+                    if not is_retryable_request_error(exc):
+                        raise RuntimeError(f"Request error for {url}: {exc}") from exc
+                    if on_retry is not None:
+                        await on_retry(
+                            {
+                                "attempt": attempt,
+                                "delay_seconds": delay,
+                                "error": str(exc),
+                                "error_type": type(exc).__name__,
+                                **payload_diagnostics(payload),
+                            }
+                        )
+                    if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
+                        await on_retry_compact(attempt)
+                    continue
+                if is_retryable_response(response):
                     if on_retry is not None:
                         body = response.text
                         await on_retry(
@@ -405,6 +1006,17 @@ def apply_reasoning_options(payload: dict[str, Any], config: AiConfig) -> None:
     )
 
 
+def apply_chat_options(payload: dict[str, Any], config: AiConfig) -> None:
+    if config.reasoning_effort:
+        payload["reasoning_effort"] = config.reasoning_effort
+
+
+def apply_anthropic_options(payload: dict[str, Any], config: AiConfig) -> None:
+    if config.reasoning_effort:
+        payload["output_config"] = {"effort": config.reasoning_effort}
+        payload["thinking"] = {"type": "adaptive", "display": "summarized"}
+
+
 def unique_list(values: list[Any]) -> list[Any]:
     result: list[Any] = []
     for value in values:
@@ -413,12 +1025,34 @@ def unique_list(values: list[Any]) -> list[Any]:
     return result
 
 
+def uses_chat_completions(config: AiConfig) -> bool:
+    return str(getattr(config, "wire_api", "") or "").strip().lower() in {
+        "chat",
+        "chat_completion",
+        "chat_completions",
+        "chat/completions",
+    }
+
+
+def uses_anthropic_messages(config: AiConfig) -> bool:
+    return str(getattr(config, "wire_api", "") or "").strip().lower() in {
+        "anthropic",
+        "anthropic_messages",
+        "messages",
+        "claude_messages",
+    }
+
+
 def payload_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
     input_list = payload.get("input")
+    if input_list is None:
+        input_list = payload.get("messages")
     input_items = input_list if isinstance(input_list, list) else []
     input_types = [str(item.get("type") or item.get("role") or "?") for item in input_items if isinstance(item, dict)]
     function_outputs = [
-        item for item in input_items if isinstance(item, dict) and item.get("type") == "function_call_output"
+        item
+        for item in input_items
+        if isinstance(item, dict) and (item.get("type") == "function_call_output" or item.get("role") == "tool")
     ]
     request_chars = encoded_json_length(payload)
     return {
@@ -828,6 +1462,88 @@ def model_response_metrics(
     return metrics
 
 
+def chat_model_response_metrics(
+    data: dict[str, Any],
+    round_index: int,
+    elapsed_seconds: float,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    calls = extract_chat_tool_calls(data)
+    metrics = {
+        "round": round_index,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "status": "completed",
+        "output_types": ["chat.completion"],
+        "tool_calls": [call["name"] for call in calls],
+        "tool_call_count": len(calls),
+        "has_text": bool(extract_chat_response_text(data)),
+        "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
+        "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
+        "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        if isinstance(usage.get("completion_tokens_details"), dict)
+        else None,
+        "total_tokens": usage.get("total_tokens"),
+        "retry_attempts": data.get("_cockpit_retry_attempts"),
+    }
+    if payload is not None:
+        request_chars = encoded_json_length(payload)
+        metrics.update(
+            {
+                "request_chars": request_chars,
+                "estimated_context_tokens": estimate_tokens_from_chars(request_chars),
+                "input_item_count": len(payload.get("messages") if isinstance(payload.get("messages"), list) else []),
+                "input_image_count": count_input_images(payload),
+                "context_breakdown": payload_context_breakdown(payload),
+            }
+        )
+    return metrics
+
+
+def anthropic_model_response_metrics(
+    data: dict[str, Any],
+    round_index: int,
+    elapsed_seconds: float,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    calls = extract_anthropic_tool_calls(data)
+    metrics = {
+        "round": round_index,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "status": data.get("stop_reason") or "completed",
+        "output_types": [item.get("type") for item in data.get("content", []) if isinstance(item, dict)],
+        "tool_calls": [call["name"] for call in calls],
+        "tool_call_count": len(calls),
+        "has_text": bool(extract_anthropic_text(data)),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "reasoning_tokens": usage.get("thinking_tokens"),
+        "total_tokens": sum(
+            value
+            for value in [
+                usage.get("input_tokens"),
+                usage.get("output_tokens"),
+            ]
+            if isinstance(value, (int, float))
+        )
+        or None,
+        "retry_attempts": data.get("_cockpit_retry_attempts"),
+    }
+    if payload is not None:
+        request_chars = encoded_json_length(payload)
+        metrics.update(
+            {
+                "request_chars": request_chars,
+                "estimated_context_tokens": estimate_tokens_from_chars(request_chars),
+                "input_item_count": len(payload.get("messages") if isinstance(payload.get("messages"), list) else []),
+                "input_image_count": count_input_images(payload),
+                "context_breakdown": payload_context_breakdown(payload),
+            }
+        )
+    return metrics
+
+
 def estimate_tokens_from_chars(chars: int | float | None) -> int | None:
     try:
         value = int(chars or 0)
@@ -849,7 +1565,10 @@ def count_input_images(payload: Any) -> int:
 
 def payload_context_breakdown(payload: dict[str, Any]) -> list[dict[str, Any]]:
     buckets = {
-        "instructions": {"label": "Instructions", "chars": len(str(payload.get("instructions") or ""))},
+        "instructions": {
+            "label": "Instructions",
+            "chars": len(str(payload.get("instructions") or "")) + encoded_json_length(payload.get("system") or ""),
+        },
         "tools_schema": {"label": "Tool Schema", "chars": encoded_json_length(payload.get("tools") or [])},
         "user_context": {"label": "Guide/Event Log", "chars": 0},
         "model_history": {"label": "Model History", "chars": 0},
@@ -858,6 +1577,8 @@ def payload_context_breakdown(payload: dict[str, Any]) -> list[dict[str, Any]]:
         "overhead": {"label": "Overhead", "chars": 0},
     }
     input_list = payload.get("input")
+    if input_list is None:
+        input_list = payload.get("messages")
     if isinstance(input_list, list):
         for item in input_list:
             if not isinstance(item, dict):
@@ -865,11 +1586,14 @@ def payload_context_breakdown(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             item_type = str(item.get("type") or "")
             role = str(item.get("role") or "")
-            if item_type == "function_call_output":
+            if item_type == "function_call_output" or role == "tool":
                 buckets["tool_outputs"]["chars"] += encoded_json_length(item)
                 continue
             if item_type in {"function_call", "message"} or role == "assistant":
                 buckets["model_history"]["chars"] += encoded_json_length(item)
+                continue
+            if role == "system":
+                buckets["instructions"]["chars"] += encoded_json_length(item)
                 continue
             if role == "user":
                 text_chars, image_chars, image_count = input_content_breakdown(item.get("content"))
@@ -1193,6 +1917,27 @@ def is_retryable_status(status_code: int) -> bool:
     return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
 
 
+def is_retryable_response(response: httpx.Response) -> bool:
+    if not is_retryable_status(response.status_code):
+        return False
+    return provider_error_code(response) not in {
+        "model_not_found",
+        "invalid_model",
+        "convert_request_failed",
+    }
+
+
+def provider_error_code(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return ""
+    return str(error.get("code") or error.get("type") or "").strip().lower()
+
+
 def is_retryable_request_error(exc: httpx.RequestError) -> bool:
     return isinstance(
         exc,
@@ -1253,6 +1998,43 @@ def mcp_tools_to_response_tools(tools: list[dict[str, Any]]) -> list[dict[str, A
     return response_tools
 
 
+def mcp_tools_to_chat_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chat_tools = []
+    for tool in tools:
+        name = tool.get("name")
+        if not name:
+            continue
+        parameters = tool.get("inputSchema") or tool.get("input_schema") or {"type": "object", "properties": {}}
+        chat_tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": str(name),
+                    "description": str(tool.get("description") or ""),
+                    "parameters": parameters,
+                },
+            }
+        )
+    return chat_tools
+
+
+def mcp_tools_to_anthropic_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    anthropic_tools = []
+    for tool in tools:
+        name = tool.get("name")
+        if not name:
+            continue
+        parameters = tool.get("inputSchema") or tool.get("input_schema") or {"type": "object", "properties": {}}
+        anthropic_tools.append(
+            {
+                "name": str(name),
+                "description": str(tool.get("description") or ""),
+                "input_schema": parameters,
+            }
+        )
+    return anthropic_tools
+
+
 def extract_function_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
     calls = []
     for item in data.get("output", []) or []:
@@ -1274,3 +2056,155 @@ def extract_function_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
         if name and call_id:
             calls.append({"name": str(name), "call_id": str(call_id), "arguments": arguments})
     return calls
+
+
+def extract_chat_response_text(data: dict[str, Any]) -> str:
+    texts: list[str] = []
+    for choice in data.get("choices", []) or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            texts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in {"text", "input_text"} and part.get("text"):
+                    texts.append(str(part["text"]))
+    return "\n".join(texts).strip()
+
+
+async def emit_chat_response_text(
+    data: dict[str, Any],
+    round_index: int,
+    emitted_texts: set[str],
+    on_text: Callable[[str, int], Awaitable[None]] | None,
+) -> None:
+    if on_text is None:
+        return
+    text = extract_chat_response_text(data).strip()
+    if not text or text in emitted_texts:
+        return
+    emitted_texts.add(text)
+    await on_text(text, round_index)
+
+
+def extract_chat_tool_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = []
+    for choice in data.get("choices", []) or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        for item in message.get("tool_calls", []) or []:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function") if isinstance(item.get("function"), dict) else {}
+            name = function.get("name")
+            call_id = item.get("id")
+            raw_arguments = function.get("arguments")
+            arguments = {}
+            if isinstance(raw_arguments, str) and raw_arguments.strip():
+                try:
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError:
+                    arguments = {"_raw_arguments": raw_arguments}
+            elif isinstance(raw_arguments, dict):
+                arguments = raw_arguments
+            if set(arguments.keys()) == {"_noargs"}:
+                arguments = {}
+            if name and call_id:
+                calls.append({"name": str(name), "call_id": str(call_id), "arguments": arguments})
+    return calls
+
+
+def chat_assistant_message(data: dict[str, Any]) -> dict[str, Any]:
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") if isinstance(choice, dict) and isinstance(choice.get("message"), dict) else {}
+    assistant: dict[str, Any] = {
+        "role": "assistant",
+        "content": message.get("content") or "",
+    }
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        assistant["tool_calls"] = tool_calls
+    return assistant
+
+
+def compact_chat_tool_result(result: Any, max_chars: int) -> Any:
+    if encoded_json_length(result) <= max_chars:
+        return result
+    compacted, _details = compact_tool_output_for_model("chat_tool_result", result, max_chars=max_chars)
+    if encoded_json_length(compacted) <= max_chars:
+        return compacted
+    return force_compact_tool_output("chat_tool_result", compacted, max_chars=max_chars)
+
+
+def extract_anthropic_text(data: dict[str, Any]) -> str:
+    texts = []
+    for item in data.get("content", []) or []:
+        if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+            texts.append(str(item["text"]))
+    return "\n".join(texts).strip()
+
+
+def extract_anthropic_thinking(data: dict[str, Any]) -> list[str]:
+    thinking = []
+    for item in data.get("content", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "thinking" and item.get("thinking"):
+            thinking.append(str(item["thinking"]))
+        elif item.get("type") in {"redacted_thinking", "summary"} and item.get("text"):
+            thinking.append(str(item["text"]))
+    return thinking
+
+
+async def emit_anthropic_thinking(
+    data: dict[str, Any],
+    round_index: int,
+    emitted_reasoning: set[str],
+    on_reasoning: Callable[[str, int], Awaitable[None]] | None,
+) -> None:
+    if on_reasoning is None:
+        return
+    for item in extract_anthropic_thinking(data):
+        text = item.strip()
+        if not text or text in emitted_reasoning:
+            continue
+        emitted_reasoning.add(text)
+        await on_reasoning(text, round_index)
+
+
+async def emit_anthropic_text(
+    data: dict[str, Any],
+    round_index: int,
+    emitted_texts: set[str],
+    on_text: Callable[[str, int], Awaitable[None]] | None,
+) -> None:
+    if on_text is None:
+        return
+    text = extract_anthropic_text(data).strip()
+    if not text or text in emitted_texts:
+        return
+    emitted_texts.add(text)
+    await on_text(text, round_index)
+
+
+def extract_anthropic_tool_calls(data: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = []
+    for item in data.get("content", []) or []:
+        if not isinstance(item, dict) or item.get("type") != "tool_use":
+            continue
+        name = item.get("name")
+        call_id = item.get("id")
+        arguments = item.get("input") if isinstance(item.get("input"), dict) else {}
+        if set(arguments.keys()) == {"_noargs"}:
+            arguments = {}
+        if name and call_id:
+            calls.append({"name": str(name), "call_id": str(call_id), "arguments": arguments})
+    return calls
+
+
+def anthropic_assistant_message(data: dict[str, Any]) -> dict[str, Any]:
+    content = data.get("content", []) if isinstance(data.get("content"), list) else []
+    return {"role": "assistant", "content": content}

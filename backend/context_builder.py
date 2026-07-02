@@ -22,6 +22,8 @@ STATE_SNAPSHOT_TOOLS = {
     "state_summary",
     "read_state",
     "matrix_summary",
+    "execution_status_summary",
+    "execution_scene",
     "visualizer_status",
     "executor_status",
     "plan_summary",
@@ -301,16 +303,19 @@ def extract_result_path(event: dict[str, Any]) -> str | None:
 
 
 def compact_stale_state_event(event: dict[str, Any]) -> dict[str, Any]:
-    return {
+    compacted = {
         "type": "stale_state_snapshot_omitted",
         "tool": event.get("tool"),
         "ts": event.get("ts"),
         "t": event.get("t"),
+        "via": event.get("via"),
         "message": (
             "Older read-only state snapshot omitted from model context because a newer snapshot "
             "for the same tool/path is available. Full event remains in events.jsonl."
         ),
     }
+    compacted.update(tool_origin_fields(event))
+    return {key: value for key, value in compacted.items() if value not in (None, "", {})}
 
 
 def old_tool_event_indices(events: list[dict[str, Any]]) -> set[int]:
@@ -352,6 +357,7 @@ def compact_old_tool_event(event: dict[str, Any]) -> dict[str, Any]:
             "context focused. Full details remain in events.jsonl/artifacts."
         ),
     }
+    compacted.update(tool_origin_fields(event))
     if event_type == "mcp_tool_result":
         compacted["ok"] = event.get("ok")
         compacted["artifact"] = extract_artifact_ref(event)
@@ -457,6 +463,7 @@ def force_compact_large_event(
             "The complete event remains in events.jsonl/artifacts."
         ),
     }
+    summary.update(tool_origin_fields(event))
     if compacted.get("_artifact_ref"):
         summary["_artifact_ref"] = compacted["_artifact_ref"]
     if event.get("error"):
@@ -480,6 +487,17 @@ def force_compact_large_event(
         if key in summary and encoded_json_length(summary) > max_chars:
             summary[key] = short_text(json.dumps(compact_value(summary[key]), ensure_ascii=True, default=str), 500)
     return summary
+
+
+def tool_origin_fields(event: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if event.get("via"):
+        fields["via"] = event.get("via")
+    if event.get("called_by_user") is True:
+        fields["called_by_user"] = True
+    if event.get("tool_invocation_origin"):
+        fields["tool_invocation_origin"] = event.get("tool_invocation_origin")
+    return fields
 
 
 def compact_value(value: Any, path: str = "") -> Any:
@@ -707,7 +725,7 @@ def build_ai_memory_event(ai_summary: str) -> dict[str, Any]:
         "text": ai_summary.strip(),
         "safety_note": (
             "Before hardware actions, refresh physical state with MCP tools such as "
-            "runtime_status, state_summary, executor_status, droplets_summary, or module calls."
+            "execution_status_summary, execution_scene, or targeted module calls."
         ),
     }
 

@@ -3,6 +3,10 @@ logs/
 __pycache__/
 *.pyc
 .env
+backend/ai_config.local.json
+backend/ai_auth.local.json
+backend/*.local.json
 node_modules/
 .pytest_cache/
 artifacts/
+runtime/

@@ -6,10 +6,11 @@ import base64
 import hashlib
 import http.server
 import json
+import re
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,24 +19,68 @@ import websockets
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from backend.ai_provider import AiProvider, MODEL_ATTACHMENTS_KEY
+    from backend.agent_tools import filter_agent_tools, parse_optional_float
+    from backend.audio_handlers import AudioHandlersMixin
+    from backend.calibration import DashboardCalibrationSession
     from backend.config import COCKPIT_ROOT, DROPLOGIC_ROOT, CockpitConfig, load_config
-    from backend.context_builder import build_model_context, encoded_json_length
+    from backend.context_builder import build_model_context
+    from backend.context_memory import ContextMemoryMixin
+    from backend.goals import (
+        GOAL_MAX_CHARS,
+        goal_completion_missing_terms,
+        goal_status_from_events,
+        latest_goal_completion_blocker,
+    )
+    from backend.live_snapshot import LiveSnapshotMixin
     from backend.mcp_client import McpStdioClient
     from backend.recorder import RunRecorder
+    from backend.runtime_utils import safe_filename, websocket_closed_ok
+    from backend.tool_payloads import (
+        compact_tool_payload,
+        mark_failed_mcp_payload,
+        mcp_tool_call_succeeded,
+        replace_mcp_text_payload,
+        tool_attachment_metrics,
+        tool_context_metrics,
+        visualizer_attachment_label,
+    )
 else:
     from .ai_provider import AiProvider, MODEL_ATTACHMENTS_KEY
+    from .agent_tools import filter_agent_tools, parse_optional_float
+    from .audio_handlers import AudioHandlersMixin
+    from .calibration import DashboardCalibrationSession
     from .config import COCKPIT_ROOT, DROPLOGIC_ROOT, CockpitConfig, load_config
-    from .context_builder import build_model_context, encoded_json_length
+    from .context_builder import build_model_context
+    from .context_memory import ContextMemoryMixin
+    from .goals import (
+        GOAL_MAX_CHARS,
+        goal_completion_missing_terms,
+        goal_status_from_events,
+        latest_goal_completion_blocker,
+    )
+    from .live_snapshot import LiveSnapshotMixin
     from .mcp_client import McpStdioClient
     from .recorder import RunRecorder
+    from .runtime_utils import safe_filename, websocket_closed_ok
+    from .tool_payloads import (
+        compact_tool_payload,
+        mark_failed_mcp_payload,
+        mcp_tool_call_succeeded,
+        replace_mcp_text_payload,
+        tool_attachment_metrics,
+        tool_context_metrics,
+        visualizer_attachment_label,
+    )
 
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
-CHECKPOINT_NEW_EVENT_TRIGGER = 40
-CHECKPOINT_NEW_CHARS_TRIGGER = 40_000
+GOAL_COMPLETE_TOOL = "dashboard_complete_goal"
+DEFAULT_AGENT_FRAME_DELAY_SECONDS = 1.0
+DEFAULT_AGENT_EXECUTION_WAIT_SECONDS = 30.0
+FRAME_DELAY_AGENT_TOOLS = {"start_plan", "execute_segment_to_breakpoint"}
 
 
-class CockpitApp:
+class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
     def __init__(self, config: CockpitConfig):
         self.config = config
         runs_dir = Path(config.runs_dir)
@@ -52,25 +97,45 @@ class CockpitApp:
         self.clients: set[Any] = set()
         self.now = "Idle"
         self.live: dict[str, Any] = {}
+        self.streamer_frame_options: dict[str, int] = {
+            "max_width": 720,
+            "max_height": 460,
+        }
+        self.calibration: DashboardCalibrationSession | None = None
         self._poll_task: asyncio.Task | None = None
         self._agent_task: asyncio.Task | None = None
+        self._audio_transcriber: Any | None = None
 
     def status(self) -> dict[str, Any]:
         return {
             "run_id": self.recorder.run_id,
             "runs": self.recorder.list_runs(),
             "now": self.now,
+            "goal": self.goal_status(),
+            "calibration": self.calibration.state() if self.calibration else {"active": False},
             "mcp": {
                 "running": self.mcp.running,
                 "command": self.mcp.command_line(),
             },
             "ai": self.ai.status(),
+            "speech": {
+                "enabled": self.config.speech.enabled,
+                "engine": self.config.speech.engine,
+                "model": self.config.speech.model,
+                "language": self.config.speech.language,
+                "beam_size": self.config.speech.beam_size,
+                "best_of": self.config.speech.best_of,
+                "temperature": self.config.speech.temperature,
+                "max_audio_seconds": self.config.speech.max_audio_seconds,
+            },
             "agent_busy": self._agent_task is not None and not self._agent_task.done(),
             "live": {
                 "has_runtime": bool(self.live.get("runtime")),
                 "has_state": bool(self.live.get("state")),
+                "has_scene": bool(self.live.get("scene", {}).get("available")),
                 "has_matrix_frame": bool(self.live.get("frames", {}).get("matrix")),
                 "has_streamer_frame": bool(self.live.get("frames", {}).get("streamer")),
+                "streamer_frame_options": self.streamer_frame_options,
                 "updated_at": self.live.get("updated_at"),
             },
         }
@@ -145,6 +210,8 @@ class CockpitApp:
         try:
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             await self.safe_send(websocket, self.run_loaded_payload())
+            if self.live:
+                await self.safe_send(websocket, {"type": "live", "live": self.live})
 
             async for raw in websocket:
                 try:
@@ -166,6 +233,16 @@ class CockpitApp:
 
         if msg_type == "list_runs":
             await websocket.send(json.dumps({"type": "runs", "runs": self.recorder.list_runs()}))
+            return
+
+        if msg_type == "set_ai_profile":
+            if self._agent_task is not None and not self._agent_task.done():
+                raise RuntimeError("Cannot switch AI model while the agent is running.")
+            profile_id = str(message.get("profile_id", "")).strip()
+            profile = self.ai.set_profile(profile_id)
+            self.now = f"AI model: {profile.get('label') or profile_id}"
+            await self.record("ai_profile_selected", profile=profile)
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
         if msg_type == "new_run":
@@ -201,6 +278,51 @@ class CockpitApp:
             name = str(message.get("name", "")).strip()
             self.recorder.rename_run(run_id, name)
             await websocket.send(json.dumps({"type": "runs", "runs": self.recorder.list_runs()}))
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "goal_set":
+            objective = str(message.get("objective", "")).strip()
+            if not objective:
+                raise ValueError("Goal objective cannot be empty.")
+            if len(objective) > GOAL_MAX_CHARS:
+                raise ValueError(f"Goal objective is too long ({len(objective)} > {GOAL_MAX_CHARS} characters).")
+            previous = self.goal_status()
+            event_type = "goal_updated" if previous.get("objective") else "goal_set"
+            self.now = "Goal active"
+            await self.record(
+                event_type,
+                objective=objective,
+                previous_status=previous.get("status"),
+            )
+            if message.get("start_agent"):
+                await self.start_agent_task(websocket, objective, event_type="agent_prompt")
+                return
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "goal_pause":
+            goal = self.goal_status()
+            if not goal.get("objective"):
+                raise RuntimeError("No goal is set.")
+            self.now = "Goal paused"
+            await self.record("goal_paused", objective=goal.get("objective"))
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "goal_resume":
+            goal = self.goal_status()
+            if not goal.get("objective"):
+                raise RuntimeError("No goal is set.")
+            self.now = "Goal active"
+            await self.record("goal_resumed", objective=goal.get("objective"))
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "goal_clear":
+            goal = self.goal_status()
+            self.now = "Goal cleared"
+            await self.record("goal_cleared", objective=goal.get("objective"))
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
@@ -258,21 +380,33 @@ class CockpitApp:
         if msg_type == "mcp_tool":
             tool = str(message.get("tool", "")).strip()
             arguments = message.get("arguments") or {}
-            event = await self.record("mcp_tool_call", tool=tool, arguments=arguments)
+            event = await self.record(
+                "mcp_tool_call",
+                tool=tool,
+                arguments=arguments,
+                via="dashboard_user",
+                called_by_user=True,
+                tool_invocation_origin="dashboard_user",
+            )
             try:
                 result = await self.mcp.call_tool(tool, arguments)
+                result = mark_failed_mcp_payload(result)
                 event_result, _, _ = self.prepare_visual_tool_result_for_model(
                     tool,
                     arguments,
                     result,
                     attach_for_model=False,
                 )
-                ok = not bool(result.get("isError")) if isinstance(result, dict) else True
+                ok = mcp_tool_call_succeeded(result)
                 result_event = await self.record(
                     "mcp_tool_result",
                     tool=tool,
                     ok=ok,
                     result=event_result,
+                    call_event_id=event.get("t"),
+                    via="dashboard_user",
+                    called_by_user=True,
+                    tool_invocation_origin="dashboard_user",
                     **tool_context_metrics(event_result),
                 )
                 await websocket.send(
@@ -286,11 +420,18 @@ class CockpitApp:
                     ok=False,
                     error=str(exc),
                     call_event_id=event.get("t"),
+                    via="dashboard_user",
+                    called_by_user=True,
+                    tool_invocation_origin="dashboard_user",
                 )
                 await websocket.send(
                     json.dumps({"type": "tool_result", "event": result_event, "result": {"error": str(exc)}})
                 )
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "transcribe_audio":
+            await self.handle_transcribe_audio(websocket, message)
             return
 
         if msg_type == "download_visualizer_frame":
@@ -317,6 +458,433 @@ class CockpitApp:
                     ensure_ascii=True,
                 )
             )
+            return
+
+        if msg_type == "calibration_start":
+            await self.start_calibration_session(websocket)
+            return
+
+        if msg_type == "calibration_close":
+            self.calibration = None
+            self.streamer_frame_options = {"max_width": 720, "max_height": 460}
+            self.now = "Calibration closed"
+            await websocket.send(json.dumps({"type": "calibration_state", "calibration": {"active": False}}))
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "calibration_move_stage":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            position = message.get("position") or {}
+            result = compact_tool_payload(
+                await self.safe_tool(
+                    "move_stage",
+                    {
+                        "position": position,
+                        "wait_timeout_seconds": float(message.get("wait_timeout_seconds") or 1.2),
+                        "poll_interval": 0.05,
+                    },
+                )
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_move_result",
+                        "result": result,
+                        "position": position,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_move_to_target":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            move = await self.move_calibration_to_current_target(wait_timeout_seconds=20)
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_move_result",
+                        "result": move.get("result"),
+                        "position": move.get("position"),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.state(position=move.get("position")),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_record":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            position = message.get("position") or {}
+            calibration = self.calibration.record_current_step(position)
+            apply_result = None
+            move = None
+            if calibration.get("workflow_complete"):
+                apply_result = await self.apply_calibration_to_runtime()
+            else:
+                move = await self.move_calibration_to_current_target(wait_timeout_seconds=20)
+                calibration = self.calibration.state(position=move.get("position"))
+            await self.record(
+                "calibration_recorded",
+                step=calibration.get("guided_index"),
+                position=position,
+                workflow_complete=calibration.get("workflow_complete"),
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": calibration,
+                        "apply_result": compact_tool_payload(apply_result) if apply_result else None,
+                        "move_result": move.get("result") if move else None,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "calibration_save":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            self.calibration.save()
+            apply_result = await self.apply_calibration_to_runtime()
+            await self.record("calibration_saved", config_path=str(self.calibration.config_path))
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.state(),
+                        "apply_result": compact_tool_payload(apply_result),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "paint_matrix_rect":
+            arguments = {
+                "value": int(message.get("value", 0)),
+                "row_min": int(message.get("row_min", 0)),
+                "row_max": int(message.get("row_max", 0)),
+                "col_min": int(message.get("col_min", 0)),
+                "col_max": int(message.get("col_max", 0)),
+                "wait_for_queue": False,
+            }
+            raw_result = mark_failed_mcp_payload(await self.safe_tool("set_matrix_cells", arguments))
+            result = compact_tool_payload(raw_result)
+            droplet_update_results: list[dict[str, Any]] = []
+            if arguments["value"] == 0 and mcp_tool_call_succeeded(raw_result):
+                droplet_update_results = await self.apply_matrix_erase_droplet_updates(
+                    message.get("droplet_updates") or []
+                )
+                if isinstance(result, dict):
+                    result["droplet_updates"] = droplet_update_results
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "matrix_paint_result",
+                        "result": result,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if self.mcp.running:
+                live = await self.collect_live_snapshot(include_state=True)
+                self.live = live
+                await self.broadcast_json({"type": "live", "live": live})
+            return
+
+        if msg_type == "matrix_update_droplet_position":
+            droplet_id = int(message.get("droplet_id"))
+            raw_position = message.get("position") or []
+            if not isinstance(raw_position, list) or len(raw_position) < 2:
+                raise RuntimeError("Droplet position must be [row, col].")
+            position = [int(raw_position[0]), int(raw_position[1])]
+            result = compact_tool_payload(
+                await self.safe_tool(
+                    "update_droplet_position",
+                    {
+                        "droplet_id": droplet_id,
+                        "position": position,
+                    },
+                )
+            )
+            await self.record("matrix_droplet_position_updated", droplet_id=droplet_id, position=position)
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "matrix_droplet_update_result",
+                        "droplet_id": droplet_id,
+                        "position": position,
+                        "result": result,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if self.mcp.running:
+                live = await self.collect_live_snapshot(include_state=True)
+                self.live = live
+                await self.broadcast_json({"type": "live", "live": live})
+            return
+
+        if msg_type == "matrix_plan_waypoint_paths":
+            droplet_id = int(message.get("droplet_id"))
+            mode = str(message.get("mode") or "sipp").strip() or "sipp"
+            raw_waypoints = message.get("waypoints") or []
+            if not isinstance(raw_waypoints, list) or not raw_waypoints:
+                raise RuntimeError("At least one waypoint is required.")
+            waypoints: list[list[int]] = []
+            for raw in raw_waypoints:
+                if not isinstance(raw, list) or len(raw) < 2:
+                    raise RuntimeError("Each waypoint must be [row, col].")
+                waypoints.append([int(raw[0]), int(raw[1])])
+
+            await self.record(
+                "matrix_waypoint_plan_requested",
+                droplet_id=droplet_id,
+                waypoints=waypoints,
+                mode=mode,
+            )
+            result: dict[str, Any] = {
+                "ok": True,
+                "droplet_id": droplet_id,
+                "mode": mode,
+                "waypoints": waypoints,
+                "steps": [],
+            }
+            for index, waypoint in enumerate(waypoints, start=1):
+                target_result = mark_failed_mcp_payload(
+                    await self.safe_tool(
+                        "update_droplet_target",
+                        {"droplet_id": droplet_id, "target": waypoint},
+                    )
+                )
+                target_payload = compact_tool_payload(target_result)
+                target_ok = mcp_tool_call_succeeded(target_result)
+                step: dict[str, Any] = {
+                    "index": index,
+                    "target": waypoint,
+                    "target_ok": target_ok,
+                    "target_result": target_payload,
+                }
+                if not target_ok:
+                    result["steps"].append(step)
+                    result.update(
+                        {
+                            "ok": False,
+                            "error": "Could not update droplet target.",
+                            "failed_step": step,
+                        }
+                    )
+                    break
+
+                plan_result = mark_failed_mcp_payload(
+                    await self.safe_tool(
+                        "plan_move",
+                        {
+                            "mode": mode,
+                            "remove_duplicate_frames": False,
+                            "planning_timeout": 120.0,
+                            "background": False,
+                            "allow_long_sync": True,
+                        },
+                    )
+                )
+                plan_payload = compact_tool_payload(plan_result)
+                plan_ok = mcp_tool_call_succeeded(plan_result)
+                step.update(
+                    {
+                        "plan_ok": plan_ok,
+                        "plan_result": plan_payload,
+                    }
+                )
+                result["steps"].append(step)
+                if not plan_ok:
+                    reason = "SIPP planning failed."
+                    if isinstance(plan_payload, dict):
+                        reason = str(plan_payload.get("error") or plan_payload.get("reason") or reason)
+                    result.update(
+                        {
+                            "ok": False,
+                            "error": reason,
+                            "failed_step": step,
+                        }
+                    )
+                    break
+
+            await self.record(
+                "matrix_waypoint_plan_result",
+                droplet_id=droplet_id,
+                ok=bool(result.get("ok")),
+                waypoint_count=len(waypoints),
+                error=result.get("error"),
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "matrix_waypoint_plan_result",
+                        "droplet_id": droplet_id,
+                        "result": result,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if self.mcp.running:
+                live = await self.collect_live_snapshot(include_state=True)
+                self.live = live
+                await self.broadcast_json({"type": "live", "live": live})
+            return
+
+        if msg_type == "matrix_plan_selection_move":
+            mode = str(message.get("mode") or "sipp").strip() or "sipp"
+            raw_targets = message.get("targets") or []
+            if not isinstance(raw_targets, list) or not raw_targets:
+                raise RuntimeError("At least one selected droplet target is required.")
+            targets: list[dict[str, Any]] = []
+            for index, item in enumerate(raw_targets):
+                if not isinstance(item, dict):
+                    raise RuntimeError(f"Target {index + 1} must be an object.")
+                droplet_id = int(item.get("droplet_id", item.get("id")))
+                raw_target = item.get("target") or []
+                if not isinstance(raw_target, list) or len(raw_target) < 2:
+                    raise RuntimeError(f"Target for droplet {droplet_id} must be [row, col].")
+                targets.append(
+                    {
+                        "id": droplet_id,
+                        "target": [int(raw_target[0]), int(raw_target[1])],
+                    }
+                )
+
+            await self.record(
+                "matrix_selection_plan_requested",
+                targets=targets,
+                mode=mode,
+            )
+            result: dict[str, Any] = {
+                "ok": True,
+                "mode": mode,
+                "targets": targets,
+            }
+            target_result = mark_failed_mcp_payload(
+                await self.safe_tool(
+                    "update_droplet_targets",
+                    {
+                        "targets": targets,
+                        "include_summary": False,
+                    },
+                )
+            )
+            target_payload = compact_tool_payload(target_result)
+            target_ok = mcp_tool_call_succeeded(target_result)
+            if isinstance(target_payload, dict) and target_payload.get("ok") is False:
+                target_ok = False
+            result["target_result"] = target_payload
+            if not target_ok:
+                result.update(
+                    {
+                        "ok": False,
+                        "error": "Could not update selected droplet targets.",
+                    }
+                )
+            else:
+                plan_result = mark_failed_mcp_payload(
+                    await self.safe_tool(
+                        "plan_move",
+                        {
+                            "mode": mode,
+                            "remove_duplicate_frames": False,
+                            "planning_timeout": 120.0,
+                            "background": False,
+                            "allow_long_sync": True,
+                        },
+                    )
+                )
+                plan_payload = compact_tool_payload(plan_result)
+                plan_ok = mcp_tool_call_succeeded(plan_result)
+                result["plan_result"] = plan_payload
+                if not plan_ok:
+                    reason = "SIPP planning failed."
+                    if isinstance(plan_payload, dict):
+                        reason = str(plan_payload.get("error") or plan_payload.get("reason") or reason)
+                    result.update(
+                        {
+                            "ok": False,
+                            "error": reason,
+                        }
+                    )
+
+            await self.record(
+                "matrix_selection_plan_result",
+                ok=bool(result.get("ok")),
+                target_count=len(targets),
+                error=result.get("error"),
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "matrix_selection_plan_result",
+                        "result": result,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if self.mcp.running:
+                live = await self.collect_live_snapshot(include_state=True)
+                self.live = live
+                await self.broadcast_json({"type": "live", "live": live})
+            return
+
+        if msg_type == "matrix_trim_plan_tail":
+            keep_frames = int(message.get("keep_frames"))
+            raw_result = mark_failed_mcp_payload(
+                await self.safe_tool(
+                    "trim_plan_tail",
+                    {"keep_frames": keep_frames},
+                )
+            )
+            result = compact_tool_payload(raw_result)
+            await self.record(
+                "matrix_plan_tail_trimmed",
+                keep_frames=keep_frames,
+                ok=mcp_tool_call_succeeded(raw_result),
+                error=result.get("error") if isinstance(result, dict) else None,
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "matrix_plan_trim_result",
+                        "result": result,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if self.mcp.running:
+                live = await self.collect_live_snapshot(include_state=True)
+                self.live = live
+                await self.broadcast_json({"type": "live", "live": live})
+            return
+
+        if msg_type == "set_streamer_view":
+            max_width = self.frame_option_int(message.get("max_width"), default=720, minimum=360, maximum=3200)
+            max_height = self.frame_option_int(message.get("max_height"), default=460, minimum=240, maximum=2200)
+            self.streamer_frame_options = {
+                "max_width": max_width,
+                "max_height": max_height,
+            }
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
         if msg_type == "ask_agent":
@@ -348,6 +916,218 @@ class CockpitApp:
 
         await self.record("unknown_message", level="warning", message=message)
 
+    async def start_calibration_session(self, websocket: Any) -> None:
+        self.calibration = DashboardCalibrationSession()
+        self.streamer_frame_options = {"max_width": 3200, "max_height": 2200}
+        self.now = "Cartridge calibration"
+        await self.mcp.start()
+        self.ensure_live_polling()
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "calibration_state",
+                    "calibration": self.calibration.state(preparing=True),
+                },
+                ensure_ascii=True,
+            )
+        )
+        await self.record("calibration_started", config_path=str(self.calibration.config_path))
+
+        prepare_result = await self.safe_tool(
+            "configure_microscope_imaging",
+            {
+                "channel": "Brightfield",
+                "exposure_time": 10000,
+                "gain": 0,
+                "coaxial_intensity": 10,
+                "ring_intensity": 0,
+                "auto_exposure": False,
+                "restart_streamer": True,
+                "bring_to_front": False,
+                "stabilization_wait": 0.2,
+                "queue_timeout_seconds": 10,
+            },
+        )
+        if isinstance(prepare_result, dict) and prepare_result.get("ok") is False:
+            self.calibration.status_message = "Preparation error"
+            state = self.calibration.state(error=str(prepare_result.get("error") or prepare_result))
+        else:
+            state = self.calibration.state()
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "calibration_state",
+                    "calibration": state,
+                    "prepare_result": compact_tool_payload(prepare_result),
+                },
+                ensure_ascii=True,
+            )
+        )
+        if self.mcp.running:
+            live = await self.collect_live_snapshot(include_state=True)
+            self.live = live
+            await self.broadcast_json({"type": "live", "live": live})
+        await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+
+    async def send_calibration_state(self, websocket: Any) -> None:
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "calibration_state",
+                    "calibration": self.calibration.state() if self.calibration else {"active": False},
+                },
+                ensure_ascii=True,
+            )
+        )
+
+    async def move_calibration_to_current_target(self, wait_timeout_seconds: float = 20.0) -> dict[str, Any]:
+        if self.calibration is None:
+            raise RuntimeError("No calibration session is active.")
+        target = self.calibration.target_for_current_step()
+        if not target:
+            raise RuntimeError("No calibration target is active.")
+
+        result = compact_tool_payload(
+            await self.safe_tool(
+                "move_stage",
+                {
+                    "position": target,
+                    "wait_timeout_seconds": wait_timeout_seconds,
+                    "poll_interval": 0.1,
+                },
+            )
+        )
+        position = None
+        if isinstance(result, dict):
+            position = result.get("actual_position") or result.get("target_position") or target
+            if result.get("ok") is False or result.get("error"):
+                position = result.get("actual_position")
+                self.calibration.status_message = "Target move failed"
+            elif self.calibration.current_step:
+                self.calibration.status_message = f"Ready to adjust {self.calibration.current_step['label']}"
+        return {"result": result, "position": position}
+
+    async def apply_calibration_to_runtime(self) -> dict[str, Any] | None:
+        if self.calibration is None or not self.mcp.running:
+            return None
+        return await self.safe_tool(
+            "set_calibration",
+            {"calibration": self.calibration.config_data.get("calibration") or {}},
+        )
+
+    def frame_option_int(self, value: Any, default: int, minimum: int, maximum: int) -> int:
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(maximum, parsed))
+
+    def goal_status(self) -> dict[str, Any]:
+        return goal_status_from_events(
+            self.recorder.events_for_run(self.recorder.run_id),
+            self._agent_task is not None and not self._agent_task.done(),
+        )
+
+    def goal_pinned_context(self, goal: dict[str, Any]) -> str:
+        if goal.get("status") != "active" or not goal.get("objective"):
+            return ""
+        return "\n".join(
+            [
+                "## Active Dashboard Goal",
+                "",
+                str(goal.get("objective") or "").strip(),
+                "",
+                "Treat this as the durable objective and completion criteria for this run.",
+                "Before acting on hardware, refresh live state with `execution_status_summary()` unless a fresher tool result already proves the needed state.",
+                "For multi-step goals, verify every requested stage. A partial run is not complete if any requested branch, routing, execution, cleanup, or final state is missing.",
+                "Do not count a planned-but-unexecuted segment as completed hardware work. Do not count a tool result with `ok=false`, `primitive_validation.ok=false`, `move_validation.ok=false`, or `planning_success=false` as successful progress.",
+                f"If and only if the whole goal is complete, call `{GOAL_COMPLETE_TOOL}` with concise evidence covering the requested stages.",
+                "If progress is blocked, say what input or external state is needed.",
+            ]
+        )
+
+    def goal_completion_tool(self, goal: dict[str, Any]) -> list[dict[str, Any]]:
+        if goal.get("status") != "active" or not goal.get("objective"):
+            return []
+        return [
+            {
+                "name": GOAL_COMPLETE_TOOL,
+                "description": (
+                    "Dashboard internal: mark the active run goal complete when the objective has been satisfied. "
+                    "Only call this after checking relevant state/results, after requested hardware execution has finished, "
+                    "and when no required work remains. Do not call for partial completion."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Short user-facing summary of what was completed.",
+                        },
+                        "evidence": {
+                            "type": "string",
+                            "description": "Brief evidence that the goal is satisfied, such as observed state, files, or tests.",
+                        },
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": False,
+                },
+            }
+        ]
+
+    async def complete_goal_from_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        goal = self.goal_status()
+        if goal.get("status") != "active" or not goal.get("objective"):
+            return {"ok": False, "error": "No active goal to complete.", "isError": True}
+        summary = str(arguments.get("summary") or "").strip()
+        evidence = str(arguments.get("evidence") or "").strip()
+        if not summary:
+            return {"ok": False, "error": "summary is required.", "isError": True}
+        blocker = latest_goal_completion_blocker(
+            self.recorder.events_for_run(self.recorder.run_id)
+        )
+        missing_terms = goal_completion_missing_terms(
+            str(goal.get("objective") or ""),
+            summary,
+            evidence,
+        )
+        if blocker or missing_terms:
+            reasons = []
+            if blocker:
+                reasons.append(blocker)
+            if missing_terms:
+                reasons.append(
+                    "Completion evidence does not cover requested stage(s): "
+                    + ", ".join(missing_terms)
+                )
+            message = "Goal completion rejected: " + " ".join(reasons)
+            await self.record(
+                "goal_completion_rejected",
+                level="warning",
+                objective=goal.get("objective"),
+                summary=summary,
+                evidence=evidence,
+                reasons=reasons,
+                via="agent",
+            )
+            return {"ok": False, "error": message, "isError": True}
+        await self.record(
+            "goal_completed",
+            objective=goal.get("objective"),
+            summary=summary,
+            evidence=evidence,
+            via="agent",
+        )
+        self.now = "Goal complete"
+        await self.broadcast_json({"type": "status", "status": self.status()})
+        return {
+            "ok": True,
+            "status": "complete",
+            "summary": summary,
+            "evidence": evidence,
+            "message": "Goal marked complete and cleared from active context.",
+        }
+
     async def start_agent_task(self, websocket: Any, prompt: str, event_type: str) -> None:
         if not prompt:
             return
@@ -374,27 +1154,48 @@ class CockpitApp:
     async def run_agent_prompt(self, websocket: Any, prompt: str, event_type: str) -> None:
         current_task = asyncio.current_task()
         await self.record(event_type, prompt=prompt)
-        await self.record("agent_started", message="Thinking")
+        await self.record("agent_started", message="Thinking", ai_profile=self.ai.status().get("profile"))
         try:
             await self.mcp.start()
             self.ensure_live_polling()
             tools_result = await self.mcp.list_tools()
             tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
+            tools = filter_agent_tools(tools)
 
             async def logged_tool_call(tool: str, arguments: dict[str, Any]) -> Any:
-                call_arguments, argument_overrides = self.agent_tool_arguments(tool, arguments)
+                if tool == GOAL_COMPLETE_TOOL:
+                    call_event = await self.record(
+                        "dashboard_tool_call",
+                        tool=tool,
+                        arguments=arguments,
+                        via="agent",
+                    )
+                    result = await self.complete_goal_from_agent(arguments)
+                    await self.record(
+                        "dashboard_tool_result",
+                        tool=tool,
+                        ok=bool(result.get("ok")),
+                        result=result,
+                        call_event_id=call_event.get("t"),
+                        via="agent",
+                        **tool_context_metrics(result),
+                    )
+                    return result
+
+                call_arguments, argument_overrides = self.agent_tool_arguments(tool, arguments, prompt)
                 call_fields = {"tool": tool, "arguments": call_arguments, "via": "agent"}
                 if argument_overrides:
                     call_fields["argument_overrides"] = argument_overrides
                 call_event = await self.record("mcp_tool_call", **call_fields)
                 try:
-                    result = await self.mcp.call_tool(tool, call_arguments)
+                    result = await self.call_agent_mcp_tool(tool, call_arguments)
+                    result = mark_failed_mcp_payload(result)
                     event_result, model_result, attachment_details = self.prepare_visual_tool_result_for_model(
                         tool,
                         call_arguments,
                         result,
                     )
-                    ok = not bool(result.get("isError")) if isinstance(result, dict) else True
+                    ok = mcp_tool_call_succeeded(result)
                     result_fields = {
                         "tool": tool,
                         "ok": ok,
@@ -405,6 +1206,7 @@ class CockpitApp:
                     }
                     if attachment_details:
                         result_fields["model_attachments"] = attachment_details
+                        result_fields.update(tool_attachment_metrics(attachment_details))
                     await self.record(
                         "mcp_tool_result",
                         **result_fields,
@@ -431,6 +1233,7 @@ class CockpitApp:
                 await self.record("agent_message", text=text, round=round_index)
 
             async def logged_model_response(metrics: dict[str, Any]) -> None:
+                metrics["ai_profile"] = self.ai.status().get("profile")
                 await self.record("agent_model_response", **metrics)
 
             async def logged_provider_retry(details: dict[str, Any]) -> None:
@@ -462,6 +1265,17 @@ class CockpitApp:
                 await self.record("context_compacted", **model_context.details)
 
             pinned_context, pinned_context_metadata = self.load_pinned_context()
+            goal = self.goal_status()
+            goal_context = self.goal_pinned_context(goal)
+            if goal_context:
+                tools = [*tools, *self.goal_completion_tool(goal)]
+                pinned_context = f"{goal_context}\n\n{pinned_context}" if pinned_context else goal_context
+                await self.record(
+                    "goal_context_used",
+                    status=goal.get("status"),
+                    objective_chars=len(str(goal.get("objective") or "")),
+                    message="Active goal was sent outside the compactable event log.",
+                )
             await self.record(
                 "pinned_context_used",
                 message="Pinned operating context was sent outside the compactable event log.",
@@ -508,7 +1322,232 @@ class CockpitApp:
                 self._agent_task = None
                 await self.broadcast_json({"type": "status", "status": self.status()})
 
-    def agent_tool_arguments(self, tool: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    async def call_agent_mcp_tool(self, tool: str, call_arguments: dict[str, Any]) -> Any:
+        if tool != "execution_wait_status":
+            return await self.mcp.call_tool(tool, call_arguments)
+
+        requested_wait = parse_optional_float(call_arguments.get("wait_seconds"))
+        if requested_wait is None or requested_wait <= 0:
+            return await self.mcp.call_tool(tool, call_arguments)
+
+        effective_wait = min(
+            max(0.0, requested_wait),
+            DEFAULT_AGENT_EXECUTION_WAIT_SECONDS,
+        )
+        immediate_arguments = dict(call_arguments)
+        immediate_arguments["wait_seconds"] = 0.0
+        started_at = time.monotonic()
+
+        initial_result = await self.mcp.call_tool(tool, immediate_arguments)
+        initial_payload = compact_tool_payload(initial_result)
+        if not isinstance(initial_payload, dict) or not initial_payload.get("running"):
+            return self.add_dashboard_wait_metadata(
+                initial_result,
+                requested_wait=requested_wait,
+                effective_wait=effective_wait,
+                started_at=started_at,
+                return_reason="no_running_wait",
+            )
+
+        await asyncio.sleep(effective_wait)
+        final_result = await self.mcp.call_tool(tool, immediate_arguments)
+        final_payload = compact_tool_payload(final_result)
+        return_reason = "timer_elapsed"
+        if isinstance(final_payload, dict) and not final_payload.get("running"):
+            return_reason = "wait_completed"
+        return self.add_dashboard_wait_metadata(
+            final_result,
+            requested_wait=requested_wait,
+            effective_wait=effective_wait,
+            started_at=started_at,
+            return_reason=return_reason,
+        )
+
+    def add_dashboard_wait_metadata(
+        self,
+        result: Any,
+        requested_wait: float,
+        effective_wait: float,
+        started_at: float,
+        return_reason: str,
+    ) -> Any:
+        payload = compact_tool_payload(result)
+        if not isinstance(payload, dict):
+            return result
+        payload = dict(payload)
+        status_wait = dict(payload.get("status_wait") or {})
+        status_wait.update(
+            {
+                "requested_seconds": round(max(0.0, requested_wait), 3),
+                "effective_seconds": round(max(0.0, effective_wait), 3),
+                "elapsed_seconds": round(max(0.0, time.monotonic() - started_at), 3),
+                "return_reason": return_reason,
+                "frontend_friendly": True,
+                "mcp_lock_released_during_wait": True,
+            }
+        )
+        payload["status_wait"] = status_wait
+        return replace_mcp_text_payload(result, payload)
+
+    async def apply_matrix_erase_droplet_updates(self, updates: Any) -> list[dict[str, Any]]:
+        if not isinstance(updates, list) or not updates:
+            return []
+
+        results: list[dict[str, Any]] = []
+        for item in updates:
+            if not isinstance(item, dict):
+                results.append({"ok": False, "error": "droplet update must be an object"})
+                continue
+            try:
+                droplet_id = int(item.get("droplet_id"))
+            except Exception:
+                results.append({"ok": False, "error": "droplet_id must be an integer"})
+                continue
+
+            action = str(item.get("action") or "").strip().lower()
+            if action not in {"delete", "reshape"}:
+                results.append({"ok": False, "droplet_id": droplet_id, "error": f"unsupported action {action!r}"})
+                continue
+
+            if action == "delete":
+                delete_result = mark_failed_mcp_payload(
+                    await self.safe_tool(
+                        "delete_droplet",
+                        {
+                            "droplet_id": droplet_id,
+                            "persist_electrodes": False,
+                        },
+                    )
+                )
+                results.append(
+                    {
+                        "ok": mcp_tool_call_succeeded(delete_result),
+                        "droplet_id": droplet_id,
+                        "action": "delete",
+                        "delete_result": compact_tool_payload(delete_result),
+                    }
+                )
+                continue
+
+            try:
+                origin = self.normalize_matrix_pair(item.get("origin"), "origin")
+                target = self.normalize_matrix_pair(item.get("target") or origin, "target")
+                shape = self.normalize_matrix_shape(item.get("shape"))
+                priority = int(item.get("priority", 0) or 0)
+                vital_space = int(item.get("vital_space", 1) or 1)
+            except Exception as exc:
+                results.append(
+                    {
+                        "ok": False,
+                        "droplet_id": droplet_id,
+                        "action": "reshape",
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if not shape:
+                delete_result = mark_failed_mcp_payload(
+                    await self.safe_tool(
+                        "delete_droplet",
+                        {
+                            "droplet_id": droplet_id,
+                            "persist_electrodes": False,
+                        },
+                    )
+                )
+                results.append(
+                    {
+                        "ok": mcp_tool_call_succeeded(delete_result),
+                        "droplet_id": droplet_id,
+                        "action": "delete_empty_shape",
+                        "delete_result": compact_tool_payload(delete_result),
+                    }
+                )
+                continue
+
+            delete_result = mark_failed_mcp_payload(
+                await self.safe_tool(
+                    "delete_droplet",
+                    {
+                        "droplet_id": droplet_id,
+                        "persist_electrodes": False,
+                    },
+                )
+            )
+            delete_ok = mcp_tool_call_succeeded(delete_result)
+            entry: dict[str, Any] = {
+                "ok": delete_ok,
+                "droplet_id": droplet_id,
+                "action": "reshape",
+                "origin": origin,
+                "target": target,
+                "shape_size": len(shape),
+                "delete_result": compact_tool_payload(delete_result),
+            }
+            if delete_ok:
+                create_result = mark_failed_mcp_payload(
+                    await self.safe_tool(
+                        "create_droplet",
+                        {
+                            "droplet_id": droplet_id,
+                            "origin": origin,
+                            "target": target,
+                            "shape": shape,
+                            "priority": priority,
+                            "vital_space": vital_space,
+                        },
+                    )
+                )
+                entry["create_result"] = compact_tool_payload(create_result)
+                entry["ok"] = mcp_tool_call_succeeded(create_result)
+            results.append(entry)
+
+        await self.record(
+            "matrix_erase_droplets_updated",
+            updates=[
+                {
+                    "droplet_id": result.get("droplet_id"),
+                    "action": result.get("action"),
+                    "ok": result.get("ok"),
+                    "shape_size": result.get("shape_size"),
+                    "error": result.get("error"),
+                }
+                for result in results
+            ],
+        )
+        return results
+
+    @staticmethod
+    def normalize_matrix_pair(value: Any, label: str) -> list[int]:
+        if not isinstance(value, list) or len(value) < 2:
+            raise ValueError(f"{label} must be [row, col].")
+        return [int(value[0]), int(value[1])]
+
+    @staticmethod
+    def normalize_matrix_shape(value: Any) -> list[list[int]]:
+        if not isinstance(value, list):
+            raise ValueError("shape must be a list of [row_offset, col_offset] cells.")
+        shape: list[list[int]] = []
+        seen: set[tuple[int, int]] = set()
+        for cell in value:
+            if not isinstance(cell, list) or len(cell) < 2:
+                raise ValueError("shape cells must be [row_offset, col_offset].")
+            row = int(cell[0])
+            col = int(cell[1])
+            key = (row, col)
+            if key in seen:
+                continue
+            seen.add(key)
+            shape.append([row, col])
+        return shape
+
+    def agent_tool_arguments(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        prompt: str = "",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         call_arguments = dict(arguments or {})
         overrides: dict[str, Any] = {}
         if tool == "visualizer_frame":
@@ -518,7 +1557,65 @@ class CockpitApp:
             if not call_arguments.get("image_format"):
                 call_arguments["image_format"] = "png"
                 overrides["image_format"] = "png"
+        if tool == "plan_move":
+            if call_arguments.get("background") is not True:
+                call_arguments["background"] = True
+                overrides["background"] = True
+            if call_arguments.get("planning_timeout") is None:
+                call_arguments["planning_timeout"] = 120.0
+                overrides["planning_timeout"] = 120.0
+        if tool == "execute_segment_to_breakpoint":
+            requested_wait_mode = call_arguments.get("wait_mode")
+            if requested_wait_mode != "background":
+                call_arguments["wait_mode"] = "background"
+                overrides["wait_mode"] = {
+                    "from": requested_wait_mode,
+                    "to": "background",
+                    "reason": (
+                        "Dashboard execution should not hold the MCP call lock while "
+                        "frames are playing; wait with execution_wait_status instead."
+                    ),
+                }
+        if tool == "execution_wait_status" and call_arguments.get("wait_seconds") is None:
+            call_arguments["wait_seconds"] = DEFAULT_AGENT_EXECUTION_WAIT_SECONDS
+            overrides["wait_seconds"] = {
+                "to": DEFAULT_AGENT_EXECUTION_WAIT_SECONDS,
+                "reason": (
+                    "Execution waits should use a timer instead of repeated immediate "
+                    "status polling."
+                ),
+            }
+        if tool in FRAME_DELAY_AGENT_TOOLS and "frame_delay" in call_arguments:
+            requested_delay = call_arguments.get("frame_delay")
+            parsed_delay = parse_optional_float(requested_delay)
+            custom_delay_allowed = self.agent_prompt_allows_custom_frame_delay(prompt)
+            if parsed_delay is None or (
+                abs(parsed_delay - DEFAULT_AGENT_FRAME_DELAY_SECONDS) > 1e-9
+                and not custom_delay_allowed
+            ):
+                call_arguments["frame_delay"] = DEFAULT_AGENT_FRAME_DELAY_SECONDS
+                overrides["frame_delay"] = {
+                    "from": requested_delay,
+                    "to": DEFAULT_AGENT_FRAME_DELAY_SECONDS,
+                    "reason": "Default frame delay is 1.0s unless the user explicitly requests another value.",
+                }
         return call_arguments, overrides
+
+    def agent_prompt_allows_custom_frame_delay(self, prompt: str) -> bool:
+        goal = self.goal_status()
+        text = "\n".join(
+            [
+                str(prompt or ""),
+                str(goal.get("objective") or ""),
+            ]
+        ).lower()
+        patterns = [
+            r"\b(?:use|set|run|execute|move|play)\b[^.\n\r]{0,80}\bframe[_\s-]*delay\b[^.\n\r]{0,40}\b\d+(?:\.\d+)?\b",
+            r"\bframe[_\s-]*delay\b[^.\n\r]{0,40}\b(?:to|at|of|=)\s*\d+(?:\.\d+)?\b",
+            r"\b(?:use|set|run|execute|move|play)\b[^.\n\r]{0,80}\b\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds)\s*(?:/|per)\s*frame\b",
+            r"\b(?:use|set|run|execute|move|play)\b[^.\n\r]{0,80}\b\d+(?:\.\d+)?\s*(?:fps|hz)\b",
+        ]
+        return any(re.search(pattern, text) for pattern in patterns)
 
     def prepare_visual_tool_result_for_model(
         self,
@@ -604,277 +1701,6 @@ class CockpitApp:
             "mime_type": frame.get("mime_type") or "image/png",
         }
         return artifact, image_bytes
-
-    def should_make_ai_context_summary(self, events: list[dict[str, Any]]) -> bool:
-        if not self.config.ai.ai_context_summary_enabled:
-            return False
-        if not self.ai.configured:
-            return False
-        if not events:
-            return False
-        chars = encoded_json_length(events)
-        if chars < self.config.ai.ai_context_summary_trigger_chars:
-            return False
-        last_summary_index = None
-        for index in range(len(events) - 1, -1, -1):
-            if events[index].get("type") == "context_ai_summary":
-                last_summary_index = index
-                break
-        if last_summary_index is None:
-            return True
-        events_since_summary = len(events) - last_summary_index - 1
-        if events_since_summary >= max(20, self.config.ai.recent_event_target // 2):
-            return True
-        chars_since_summary = encoded_json_length(events[last_summary_index + 1 :])
-        return chars_since_summary >= max(20_000, self.config.ai.ai_context_summary_trigger_chars // 3)
-
-    async def ensure_context_checkpoint(
-        self,
-        events: list[dict[str, Any]],
-        on_retry: Any,
-        on_context_compacted: Any,
-    ) -> dict[str, Any] | None:
-        checkpoint = self.valid_context_checkpoint(events)
-        if not self.should_update_context_checkpoint(events, checkpoint):
-            return checkpoint
-        if not self.config.ai.ai_context_summary_enabled or not self.ai.configured:
-            return checkpoint
-
-        target_count = self.context_checkpoint_target_count(events)
-        if target_count <= 0:
-            return checkpoint
-
-        previous_summary = str((checkpoint or {}).get("summary") or "").strip()
-        previous_covered = int((checkpoint or {}).get("covered_event_count") or 0) if previous_summary else 0
-        events_to_summarize = events[previous_covered:target_count] if previous_summary else events[:target_count]
-        if not events_to_summarize and previous_summary:
-            return checkpoint
-        summary_context = build_model_context(
-            self.checkpoint_summary_events(events_to_summarize, previous_summary),
-            run_dir=self.recorder.run_dir,
-            max_chars=min(self.config.ai.max_context_chars, self.config.ai.ai_context_summary_trigger_chars),
-            target_chars=min(self.config.ai.target_context_chars, 60_000),
-            recent_event_target=min(self.config.ai.recent_event_target, 100),
-            large_event_chars=self.config.ai.large_event_chars,
-            protect_latest_tool_result=True,
-        )
-        try:
-            summary = await self.ai.summarize_context_memory(
-                summary_context.events,
-                max_chars=self.config.ai.ai_context_summary_max_chars,
-                on_retry=on_retry,
-                on_context_compacted=on_context_compacted,
-            )
-        except Exception as exc:
-            await self.record(
-                "context_compacted",
-                level="warning",
-                scope="run_context_checkpoint",
-                message=f"Context checkpoint update failed; using previous checkpoint/deterministic context: {exc}",
-            )
-            return checkpoint
-
-        new_checkpoint = {
-            "version": 1,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "run_id": self.recorder.run_id,
-            "covered_event_count": target_count,
-            "covered_until_t": events[target_count - 1].get("t") if target_count > 0 else None,
-            "covered_until_ts": events[target_count - 1].get("ts") if target_count > 0 else None,
-            "source": "ai+deterministic",
-            "summary": summary,
-            "source_event_count": target_count,
-            "new_source_event_count": len(events_to_summarize),
-            "previous_covered_event_count": previous_covered,
-            "deterministic_context_chars": encoded_json_length(summary_context.events),
-            "max_summary_chars": self.config.ai.ai_context_summary_max_chars,
-            "safety_note": (
-                "This checkpoint is narrative memory only. Before hardware actions, refresh physical state "
-                "with MCP tools; do not trust the checkpoint for live matrix, stage, temperature, droplets, or voltages."
-            ),
-        }
-        self.recorder.write_context_checkpoint(new_checkpoint)
-        await self.record(
-            "context_checkpoint_saved",
-            scope="run_context_checkpoint",
-            message="Persistent context checkpoint saved for future turns.",
-            covered_event_count=new_checkpoint["covered_event_count"],
-            covered_until_t=new_checkpoint["covered_until_t"],
-            source_event_count=new_checkpoint["source_event_count"],
-            new_source_event_count=new_checkpoint["new_source_event_count"],
-            previous_covered_event_count=new_checkpoint["previous_covered_event_count"],
-            deterministic_context_chars=new_checkpoint["deterministic_context_chars"],
-            max_summary_chars=new_checkpoint["max_summary_chars"],
-        )
-        return new_checkpoint
-
-    def valid_context_checkpoint(self, events: list[dict[str, Any]]) -> dict[str, Any] | None:
-        checkpoint = self.recorder.read_context_checkpoint()
-        if not checkpoint:
-            return None
-        covered = int(checkpoint.get("covered_event_count") or 0)
-        summary = str(checkpoint.get("summary") or "").strip()
-        if covered <= 0 or covered > len(events) or not summary:
-            return None
-        return checkpoint
-
-    def should_update_context_checkpoint(
-        self,
-        events: list[dict[str, Any]],
-        checkpoint: dict[str, Any] | None,
-    ) -> bool:
-        if not events:
-            return False
-        total_chars = encoded_json_length(events)
-        if checkpoint is None:
-            return total_chars >= self.config.ai.ai_context_summary_trigger_chars
-        covered = int(checkpoint.get("covered_event_count") or 0)
-        tail = events[covered:]
-        if len(tail) >= CHECKPOINT_NEW_EVENT_TRIGGER:
-            return True
-        if encoded_json_length(tail) >= CHECKPOINT_NEW_CHARS_TRIGGER:
-            return True
-        return False
-
-    def context_checkpoint_target_count(self, events: list[dict[str, Any]]) -> int:
-        if len(events) < 2:
-            return 0
-        # Leave the current prompt/agent_started and immediate fresh context outside the checkpoint.
-        return max(0, len(events) - 2)
-
-    def checkpoint_summary_events(self, events: list[dict[str, Any]], previous_summary: str) -> list[dict[str, Any]]:
-        events = [
-            event
-            for event in events
-            if event.get("type") not in {"context_checkpoint_used", "context_compacted", "pinned_context_used"}
-        ]
-        if not previous_summary:
-            return events
-        return [
-            {
-                "type": "previous_context_checkpoint",
-                "message": (
-                    "Previous persistent context checkpoint. Merge it with newer events and produce "
-                    "a fresh checkpoint; do not treat it as live hardware state."
-                ),
-                "text": previous_summary,
-            },
-            *events,
-        ]
-
-    def events_for_model_from_checkpoint(
-        self,
-        events: list[dict[str, Any]],
-        checkpoint: dict[str, Any] | None,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-        checkpoint = self.valid_context_checkpoint(events) if checkpoint is None else checkpoint
-        if checkpoint is None:
-            return events, None
-        covered = int(checkpoint.get("covered_event_count") or 0)
-        tail = events[covered:]
-        memory_event = {
-            "type": "run_context_checkpoint",
-            "message": (
-                "Persistent run memory checkpoint loaded. It summarizes earlier events only; "
-                "the complete events.jsonl remains on disk."
-            ),
-            "covered_event_count": covered,
-            "covered_until_t": checkpoint.get("covered_until_t"),
-            "covered_until_ts": checkpoint.get("covered_until_ts"),
-            "text": checkpoint.get("summary"),
-            "safety_note": checkpoint.get("safety_note"),
-        }
-        details = {
-            "scope": "run_context_checkpoint",
-            "message": "Persistent context checkpoint loaded for this model turn.",
-            "covered_event_count": covered,
-            "new_event_count": len(tail),
-            "checkpoint_chars": len(str(checkpoint.get("summary") or "")),
-            "estimated_chars_after": encoded_json_length([memory_event, *tail]),
-        }
-        return [memory_event, *tail], details
-
-    def ensure_live_polling(self) -> None:
-        if self._poll_task is None or self._poll_task.done():
-            self._poll_task = asyncio.create_task(self.live_poll_loop())
-
-    async def stop_live_polling(self) -> None:
-        task = self._poll_task
-        self._poll_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-    async def live_poll_loop(self) -> None:
-        last_state_poll = 0.0
-        while self.mcp.running:
-            try:
-                now = time.monotonic()
-                include_state = (
-                    not self.live
-                    or now - last_state_poll >= max(0.1, self.config.live_state_interval_seconds)
-                )
-                live = await self.collect_live_snapshot(include_state=include_state)
-                if include_state:
-                    last_state_poll = now
-                self.live = live
-                await self.broadcast_json({"type": "live", "live": live})
-            except Exception as exc:
-                await self.record("live_poll_error", level="warning", message=str(exc))
-            await asyncio.sleep(max(0.05, self.config.live_frame_interval_seconds))
-
-    async def collect_live_snapshot(self, include_state: bool = True) -> dict[str, Any]:
-        previous = self.live or {}
-        runtime = previous.get("runtime")
-        state = previous.get("state")
-        visualizer_status = previous.get("visualizers")
-        if include_state:
-            runtime = compact_tool_payload(await self.safe_tool("runtime_status"))
-            state = compact_tool_payload(await self.safe_tool("state_summary"))
-            visualizer_status = compact_tool_payload(await self.safe_tool("visualizer_status"))
-        frames = {
-            "matrix": await self.safe_frame("matrix", "snapshot", max_width=520, max_height=360),
-            "streamer": await self.safe_frame("streamer", "snapshot", max_width=720, max_height=460),
-        }
-        return {
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "runtime": runtime,
-            "state": state,
-            "visualizers": visualizer_status,
-            "frames": frames,
-        }
-
-    async def safe_tool(self, tool: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
-        try:
-            return {"ok": True, "result": await self.mcp.call_tool(tool, arguments or {})}
-        except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-
-    async def safe_frame(
-        self,
-        visualizer: str,
-        frame_source: str,
-        max_width: int,
-        max_height: int,
-    ) -> dict[str, Any]:
-        result = await self.safe_tool(
-            "visualizer_frame",
-            {
-                "visualizer": visualizer,
-                "frame_source": frame_source,
-                "image_format": "jpg",
-                "include_base64": True,
-                "max_width": max_width,
-                "max_height": max_height,
-            },
-        )
-        if not result.get("ok"):
-            return result
-        payload = compact_tool_payload(result)
-        return payload if isinstance(payload, dict) else {"ok": True, "result": payload}
 
     async def broadcast_json(self, payload: dict[str, Any]) -> None:
         message = json.dumps(payload, ensure_ascii=True)
@@ -962,81 +1788,6 @@ def main() -> None:
             asyncio.run(app.mcp.stop())
         except Exception:
             pass
-
-
-def compact_tool_payload(result: Any) -> Any:
-    if not isinstance(result, dict):
-        return result
-    if not result.get("ok", True) and "result" not in result:
-        return result
-    payload = result.get("result", result)
-    if not isinstance(payload, dict):
-        return payload
-    content = payload.get("content")
-    if isinstance(content, list) and content:
-        first = content[0]
-        text = first.get("text") if isinstance(first, dict) else None
-        if isinstance(text, str):
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return {"text": text}
-    structured = payload.get("structuredContent")
-    if structured is not None:
-        return structured
-    return payload
-
-
-def replace_mcp_text_payload(result: Any, payload: dict[str, Any]) -> Any:
-    encoded = json.dumps(payload, ensure_ascii=True, default=str)
-    if not isinstance(result, dict):
-        return payload
-    copy = dict(result)
-    if "structuredContent" in copy:
-        copy["structuredContent"] = payload
-    content = copy.get("content")
-    if isinstance(content, list) and content:
-        first = content[0]
-        if isinstance(first, dict) and "text" in first:
-            new_first = dict(first)
-            new_first["text"] = encoded
-            copy["content"] = [new_first, *content[1:]]
-            return copy
-    if "structuredContent" in copy:
-        return copy
-    return payload
-
-
-def visualizer_attachment_label(frame: dict[str, Any], artifact: dict[str, Any]) -> str:
-    visualizer = frame.get("visualizer") or artifact.get("visualizer") or "visualizer"
-    source = frame.get("frame_source") or artifact.get("frame_source") or "frame"
-    shape = frame.get("shape") or artifact.get("shape")
-    shape_text = f" shape={shape}" if shape else ""
-    return f"{visualizer}/{source}{shape_text}"
-
-
-def tool_context_metrics(result: Any) -> dict[str, Any]:
-    output = json.dumps(result, ensure_ascii=True, default=str)
-    chars = len(output)
-    return {
-        "model_output_chars": chars,
-        "estimated_model_output_tokens": max(1, (chars + 3) // 4),
-    }
-
-
-def safe_filename(value: str) -> str:
-    cleaned = []
-    for char in str(value or ""):
-        if char.isalnum() or char in {"-", "_"}:
-            cleaned.append(char)
-        else:
-            cleaned.append("_")
-    text = "".join(cleaned).strip("_")
-    return text[:64] or "item"
-
-
-def websocket_closed_ok(exc: Exception) -> bool:
-    return "received 1000 (OK)" in str(exc) or "sent 1000 (OK)" in str(exc)
 
 
 if __name__ == "__main__":

@@ -26,8 +26,8 @@
   },
   "ai": {
     "enabled": true,
-    "codex_config": "%USERPROFILE%/.codex/config.toml",
-    "codex_auth": "%USERPROFILE%/.codex/auth.json",
+    "ai_config_file": "backend/ai_config.local.json",
+    "ai_auth_file": "backend/ai_auth.local.json",
     "max_context_chars": 800000,
     "target_context_chars": 90000,
     "recent_event_target": 120,
@@ -41,5 +41,22 @@
       "cockpit-mode.md",
       "cartridge.default.json"
     ]
+  },
+  "speech": {
+    "enabled": true,
+    "engine": "faster_whisper",
+    "model": "large-v3-turbo",
+    "device": "auto",
+    "compute_type": "int8",
+    "language": null,
+    "vad_filter": true,
+    "beam_size": 5,
+    "best_of": 5,
+    "temperature": 0,
+    "condition_on_previous_text": false,
+    "initial_prompt": "DropLogic BoxMini laboratory control. Common words: BoxMini, DropLogic, dashboard, droplet, droplets, reservoir, injection, extraction, cartridge, whole cartridge, whole chip, matrix, electrodes, streamer, visualizer, Brightfield, FAM, coaxial, ring light, exposure, analog gain, stage, X axis, Y axis, Z axis, temperature, melting probes, IVT, TX TL, MCP.",
+    "hotwords": "BoxMini DropLogic droplet droplets reservoir injection extraction cartridge whole cartridge whole chip matrix electrodes streamer visualizer Brightfield FAM coaxial ring light exposure analog gain stage temperature melting probes IVT TX TL MCP",
+    "max_audio_seconds": 90,
+    "max_audio_bytes": 25000000
   }
 }
