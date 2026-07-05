@@ -3218,6 +3218,105 @@ def allowed_artifact_roots(runs_dir: Path, run_dir: Path) -> list[Path]:
     return unique
 
 
+ARTIFACT_REF_CONTAINER_KEYS = {"artifact", "artifacts", "artifact_ref", "artifact_refs", "_artifact_ref"}
+CAPTURE_REF_CONTAINER_KEYS = {"capture", "captures"}
+ARTIFACT_REF_SKIP_KEYS = {"arguments", "dashboard_actual_arguments", "argument_overrides"}
+ARTIFACT_REF_TEXT_MAX_CHARS = 60000
+
+
+def artifact_path_key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def add_recorded_artifact_path_key(
+    keys: set[str],
+    run_dir: Path,
+    value: Any,
+    allowed_roots: list[Path],
+) -> None:
+    text = unquote(str(value or "").strip())
+    if not text:
+        return
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        candidate = run_dir / text
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        return
+    if any(path_is_relative_to(resolved, root) for root in allowed_roots):
+        keys.add(artifact_path_key(resolved))
+
+
+def add_artifact_container_path_keys(
+    keys: set[str],
+    run_dir: Path,
+    container: dict[str, Any],
+    allowed_roots: list[Path],
+) -> None:
+    for field in ("path", "absolute_path"):
+        add_recorded_artifact_path_key(keys, run_dir, container.get(field), allowed_roots)
+
+
+def parsed_artifact_text(value: str) -> Any:
+    text = str(value or "").strip()
+    if not text or len(text) > ARTIFACT_REF_TEXT_MAX_CHARS or text[0] not in "{[":
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def collect_recorded_artifact_path_keys(
+    value: Any,
+    run_dir: Path,
+    allowed_roots: list[Path],
+    keys: set[str],
+    context_key: str = "",
+) -> None:
+    normalized_key = str(context_key or "").lower()
+    if normalized_key in ARTIFACT_REF_CONTAINER_KEYS and not isinstance(value, (dict, list)):
+        add_recorded_artifact_path_key(keys, run_dir, value, allowed_roots)
+        return
+    if isinstance(value, list):
+        for item in value:
+            collect_recorded_artifact_path_keys(item, run_dir, allowed_roots, keys, normalized_key)
+        return
+    if not isinstance(value, dict):
+        return
+    if normalized_key in ARTIFACT_REF_CONTAINER_KEYS or normalized_key in CAPTURE_REF_CONTAINER_KEYS:
+        add_artifact_container_path_keys(keys, run_dir, value, allowed_roots)
+    if normalized_key == "content":
+        parsed = parsed_artifact_text(value.get("text")) if isinstance(value.get("text"), str) else None
+        if parsed is not None:
+            collect_recorded_artifact_path_keys(parsed, run_dir, allowed_roots, keys)
+    for child_key, child_value in value.items():
+        child_context_key = str(child_key or "").lower()
+        if child_context_key in ARTIFACT_REF_SKIP_KEYS:
+            continue
+        collect_recorded_artifact_path_keys(child_value, run_dir, allowed_roots, keys, child_context_key)
+
+
+def recorded_run_artifact_path_keys(run_dir: Path, allowed_roots: list[Path]) -> set[str]:
+    events_path = run_dir / "events.jsonl"
+    if not events_path.exists():
+        return set()
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    keys: set[str] = set()
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            collect_recorded_artifact_path_keys(event, run_dir, allowed_roots, keys)
+    return keys
+
+
 def resolve_run_artifact_path(
     runs_dir: Path,
     run_id: str,
@@ -3241,10 +3340,16 @@ def resolve_run_artifact_path(
         candidates.append(candidate if candidate.is_absolute() else run_dir / value)
 
     allowed_roots = allowed_artifact_roots(runs_root, run_dir)
+    recorded_external_keys: set[str] | None = None
     for candidate in candidates:
         resolved = candidate.resolve()
         if not any(path_is_relative_to(resolved, root) for root in allowed_roots):
             continue
+        if not path_is_relative_to(resolved, run_dir):
+            if recorded_external_keys is None:
+                recorded_external_keys = recorded_run_artifact_path_keys(run_dir, allowed_roots)
+            if artifact_path_key(resolved) not in recorded_external_keys:
+                continue
         if resolved.exists() and resolved.is_file():
             return resolved
     raise ValueError("Artifact file not found.")
