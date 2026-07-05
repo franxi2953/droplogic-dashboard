@@ -8034,7 +8034,7 @@ function timelinePhotoMarkers(scene = null) {
         photo.source ? `Source ${photo.source}` : "",
         photo.preset ? `Preset ${photo.preset}` : "",
         photo.path ? `File ${photo.path}` : "",
-        (photo.path || photo.absolutePath) ? "Click marker to reveal file" : "",
+        (photo.path || photo.absolutePath) ? "Click to reveal the image file" : "",
         eventTimeLabel(event),
       ].filter(Boolean),
     });
@@ -8937,6 +8937,9 @@ function stagePositionFromEvent(event) {
 function photoInfoFromEvent(event) {
   const tool = String(event?.tool || "").toLowerCase();
   const type = String(event?.type || "").toLowerCase();
+  if (type === "mcp_tool_call" || type === "dashboard_tool_call" || type === "tool_call") {
+    return null;
+  }
   const roots = eventPayloadRoots(event);
   const captureLike = /photo|capture|snapshot|visualizer_frame|image/.test(tool)
     || /photo|capture|snapshot|visualizer|download/.test(type);
@@ -8950,25 +8953,31 @@ function photoInfoFromEvent(event) {
     absolutePath: "",
     mimeType: "",
   };
+  const candidates = [];
+  const addCandidate = (candidate, priority = 10) => {
+    const path = String(candidate?.path || "").trim();
+    const absolutePath = String(candidate?.absolutePath || candidate?.absolute_path || "").trim();
+    const mimeType = String(candidate?.mimeType || candidate?.mime_type || "").trim();
+    if (!path && !absolutePath) return;
+    if (!timelinePhotoLooksLikeImage({ path, absolutePath, mimeType })) return;
+    candidates.push({
+      path,
+      absolutePath,
+      mimeType,
+      priority,
+      source: candidate?.source || "",
+      preset: candidate?.preset || "",
+    });
+  };
   for (const root of roots) {
     info.source = info.source
       || getPath(root, "frame.frame_source")
+      || getPath(root, "artifact.frame_source")
       || getPath(root, "frame.visualizer")
+      || getPath(root, "artifact.visualizer")
       || getPath(root, "frame_source")
       || getPath(root, "visualizer")
       || getPath(root, "source")
-      || "";
-    info.path = info.path
-      || getPath(root, "frame.path")
-      || getPath(root, "artifact.path")
-      || getPath(root, "path")
-      || getPath(root, "file")
-      || getPath(root, "output_path")
-      || "";
-    info.absolutePath = info.absolutePath
-      || getPath(root, "frame.absolute_path")
-      || getPath(root, "artifact.absolute_path")
-      || getPath(root, "absolute_path")
       || "";
     info.mimeType = info.mimeType
       || getPath(root, "frame.mime_type")
@@ -8976,8 +8985,67 @@ function photoInfoFromEvent(event) {
       || getPath(root, "mime_type")
       || "";
     info.preset = info.preset || getPath(root, "preset.name") || getPath(root, "name") || "";
+    addCandidate({
+      path: getPath(root, "artifact.path"),
+      absolutePath: getPath(root, "artifact.absolute_path"),
+      mimeType: getPath(root, "artifact.mime_type"),
+      source: getPath(root, "artifact.frame_source") || getPath(root, "artifact.visualizer"),
+      preset: getPath(root, "artifact.preset"),
+    }, 0);
+    addCandidate({
+      path: getPath(root, "frame.artifact.path"),
+      absolutePath: getPath(root, "frame.artifact.absolute_path"),
+      mimeType: getPath(root, "frame.artifact.mime_type"),
+      source: getPath(root, "frame.artifact.frame_source") || getPath(root, "frame.artifact.visualizer"),
+      preset: getPath(root, "frame.artifact.preset"),
+    }, 0);
+    for (const attachment of root?.model_attachments || []) {
+      addCandidate({
+        path: attachment?.artifact?.path,
+        absolutePath: attachment?.artifact?.absolute_path,
+        mimeType: attachment?.artifact?.mime_type || attachment?.mime_type,
+        source: attachment?.artifact?.frame_source || attachment?.artifact?.visualizer,
+        preset: attachment?.artifact?.preset,
+      }, 1);
+    }
+    addNestedCaptureCandidates(root, addCandidate);
+    addCandidate({
+      path: getPath(root, "frame.path") || getPath(root, "path") || getPath(root, "file") || getPath(root, "output_path"),
+      absolutePath: getPath(root, "frame.absolute_path") || getPath(root, "absolute_path"),
+      mimeType: getPath(root, "frame.mime_type") || getPath(root, "mime_type"),
+      source: getPath(root, "frame.frame_source") || getPath(root, "frame.visualizer") || getPath(root, "source"),
+      preset: getPath(root, "preset.name") || getPath(root, "name"),
+    }, 5);
+  }
+  candidates.sort((a, b) => a.priority - b.priority);
+  const best = candidates[0];
+  if (!best && !configuredImaging) return null;
+  if (best) {
+    info.path = best.path;
+    info.absolutePath = best.absolutePath;
+    info.mimeType = best.mimeType || info.mimeType;
+    info.source = info.source || best.source;
+    info.preset = info.preset || best.preset;
   }
   return info;
+}
+
+function addNestedCaptureCandidates(root, addCandidate) {
+  const captures = root?.captures;
+  if (!Array.isArray(captures)) return;
+  for (const entry of captures) {
+    const nested = entry?.captures;
+    if (!Array.isArray(nested)) continue;
+    for (const capture of nested) {
+      addCandidate({
+        path: capture?.path,
+        absolutePath: capture?.absolute_path,
+        mimeType: capture?.mime_type,
+        source: capture?.channel,
+        preset: capture?.profile?.preset,
+      }, 3);
+    }
+  }
 }
 
 function eventPayloadRoots(event) {
@@ -9551,25 +9619,73 @@ function updateTimelineHover(hover) {
     tooltip.innerHTML = [
       `<strong>${escapeHtml(label)}</strong>`,
       `<span>${escapeHtml(span)}</span>`,
-      ...metaLines.map((line) => `<span>${escapeHtml(line)}</span>`),
+      ...metaLines.map((line) => timelineHoverLineHtml(line)),
       previewHtml,
     ].join("");
+    installTimelineHoverMediaHandlers(tooltip);
     state.timeline.hoverContentKey = contentKey;
     tooltip.hidden = false;
     state.timeline.hoverTooltipWidth = tooltip.offsetWidth;
     state.timeline.hoverTooltipHeight = tooltip.offsetHeight;
   }
   if (tooltip.hidden) tooltip.hidden = false;
+  positionTimelineHover(tooltip, hover);
+}
+
+function timelineHoverLineHtml(line) {
+  const text = String(line || "");
+  const clickHint = /^click\b/i.test(text) || /reveal (?:the )?(?:image )?file/i.test(text);
+  return `<span${clickHint ? ` class="timeline-click-hint"` : ""}>${escapeHtml(text)}</span>`;
+}
+
+function installTimelineHoverMediaHandlers(tooltip) {
+  for (const image of tooltip.querySelectorAll("img.timeline-photo-preview")) {
+    image.addEventListener("load", () => refreshTimelineHoverPosition(), { once: true });
+    image.addEventListener("error", () => {
+      image.replaceWith(timelinePreviewErrorNode());
+      refreshTimelineHoverPosition();
+    }, { once: true });
+  }
+}
+
+function timelinePreviewErrorNode() {
+  const node = document.createElement("span");
+  node.className = "timeline-preview-error";
+  node.textContent = "Preview unavailable";
+  return node;
+}
+
+function refreshTimelineHoverPosition() {
+  const tooltip = $("timelineHover");
+  if (!tooltip || tooltip.hidden) return;
+  state.timeline.hoverTooltipWidth = tooltip.offsetWidth;
+  state.timeline.hoverTooltipHeight = tooltip.offsetHeight;
+  if (timelineHasFiniteNumber(state.timeline.hoverX) && timelineHasFiniteNumber(state.timeline.hoverY)) {
+    positionTimelineHover(tooltip, { x: state.timeline.hoverX, y: state.timeline.hoverY });
+  }
+}
+
+function positionTimelineHover(tooltip, hover) {
   const canvas = $("planTimeline");
   const panel = canvas?.closest(".plan-timeline-panel");
+  const panelRect = panel?.getBoundingClientRect?.();
   const baseX = (canvas?.offsetLeft || 0) + hover.x;
   const baseY = (canvas?.offsetTop || 0) + hover.y;
   const tooltipWidth = state.timeline.hoverTooltipWidth || tooltip.offsetWidth || 0;
   const tooltipHeight = state.timeline.hoverTooltipHeight || tooltip.offsetHeight || 0;
-  const maxX = Math.max(8, (panel?.clientWidth || 260) - tooltipWidth - 8);
-  const maxY = Math.max(8, (panel?.clientHeight || 220) - tooltipHeight - 8);
-  tooltip.style.left = `${Math.min(maxX, Math.max(8, baseX + 12))}px`;
-  tooltip.style.top = `${Math.min(maxY, Math.max(8, baseY + 12))}px`;
+  const minX = panelRect ? 8 - panelRect.left : 8;
+  const maxX = panelRect
+    ? Math.max(minX, window.innerWidth - panelRect.left - tooltipWidth - 8)
+    : Math.max(8, (panel?.clientWidth || 260) - tooltipWidth - 8);
+  const minY = panelRect ? 8 - panelRect.top : 8;
+  const maxY = panelRect
+    ? Math.max(minY, window.innerHeight - panelRect.top - tooltipHeight - 8)
+    : Math.max(8, (panel?.clientHeight || 220) - tooltipHeight - 8);
+  const preferredY = baseY + 12;
+  const flippedY = baseY - tooltipHeight - 12;
+  const top = preferredY > maxY ? Math.min(maxY, Math.max(minY, flippedY)) : preferredY;
+  tooltip.style.left = `${Math.min(maxX, Math.max(minX, baseX + 12))}px`;
+  tooltip.style.top = `${Math.min(maxY, Math.max(minY, top))}px`;
 }
 
 function timelineHoverContentKey(event, overlay) {

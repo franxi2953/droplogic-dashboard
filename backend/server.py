@@ -7,6 +7,7 @@ import hashlib
 import http.server
 import json
 import mimetypes
+import os
 import re
 import subprocess
 import sys
@@ -3198,6 +3199,25 @@ def path_is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
+def allowed_artifact_roots(runs_dir: Path, run_dir: Path) -> list[Path]:
+    roots = [run_dir]
+    capture_root = str(os.environ.get("DROPLOGIC_CAPTURE_ROOT") or "").strip()
+    if capture_root:
+        roots.append(Path(capture_root).expanduser())
+    roots.append(Path.home() / "Documents" / "DropLogic" / "captures")
+    unique: list[Path] = []
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        if any(resolved == existing for existing in unique):
+            continue
+        if path_is_relative_to(resolved, runs_dir) or resolved.exists():
+            unique.append(resolved)
+    return unique
+
+
 def resolve_run_artifact_path(
     runs_dir: Path,
     run_id: str,
@@ -3220,9 +3240,10 @@ def resolve_run_artifact_path(
         candidate = Path(value)
         candidates.append(candidate if candidate.is_absolute() else run_dir / value)
 
+    allowed_roots = allowed_artifact_roots(runs_root, run_dir)
     for candidate in candidates:
         resolved = candidate.resolve()
-        if not path_is_relative_to(resolved, run_dir):
+        if not any(path_is_relative_to(resolved, root) for root in allowed_roots):
             continue
         if resolved.exists() and resolved.is_file():
             return resolved
