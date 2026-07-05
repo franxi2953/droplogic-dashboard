@@ -11,7 +11,12 @@ from .config import DROPLOGIC_ROOT
 
 DEFAULT_CONFIG_PATH = DROPLOGIC_ROOT / "config.json"
 DEFAULT_COAXIAL_INTENSITY = 10
-DEFAULT_EXPOSURE_US = 10000
+DEFAULT_EXPOSURE_US = 16000
+SPEEDS = {
+    "1": ("fine", 200.0, 2000.0),
+    "2": ("medium", 1000.0, 10000.0),
+    "3": ("fast", 5000.0, 100000.0),
+}
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -67,6 +72,8 @@ class DashboardCalibrationSession:
         self.guided_index = 0
         self.workflow_complete = False
         self.status_message = "Ready"
+        self.speed_key = "2"
+        self.previous_motion_params: dict[str, float] | None = None
 
     @property
     def rows(self) -> int:
@@ -83,9 +90,9 @@ class DashboardCalibrationSession:
     @property
     def guided_steps(self) -> list[dict[str, Any]]:
         return [
-            {"key": "origin", "label": "0,0", "row": 0, "column": 0},
-            {"key": "row", "label": f"{self.rows - 1},0", "row": self.rows - 1, "column": 0},
-            {"key": "column", "label": f"0,{self.columns - 1}", "row": 0, "column": self.columns - 1},
+            {"key": "origin", "label": "electrode (0,0)", "row": 0, "column": 0},
+            {"key": "row", "label": f"electrode ({self.rows - 1},0)", "row": self.rows - 1, "column": 0},
+            {"key": "column", "label": f"electrode (0,{self.columns - 1})", "row": 0, "column": self.columns - 1},
         ]
 
     @property
@@ -118,6 +125,31 @@ class DashboardCalibrationSession:
             "Y": int(round(float(origin["Y"]) + row * inter_row[1] + column * inter_column[1])),
             "Z": int(round(float(origin["Z"]) + row * inter_row[2] + column * inter_column[2])),
         }
+
+    def set_speed(self, speed_key: str) -> dict[str, Any]:
+        key = str(speed_key or "2")
+        if key not in SPEEDS:
+            key = "2"
+        self.speed_key = key
+        return self.state()
+
+    def set_previous_motion_params(self, params: dict[str, Any] | None) -> None:
+        if not isinstance(params, dict):
+            self.previous_motion_params = None
+            return
+        velocity = positive_float_or_none(params.get("velocity") or params.get("dMaxV"))
+        acceleration = positive_float_or_none(params.get("acceleration") or params.get("dMaxA"))
+        if velocity is None or acceleration is None:
+            self.previous_motion_params = None
+            return
+        self.previous_motion_params = {
+            "velocity": velocity,
+            "acceleration": acceleration,
+        }
+
+    @property
+    def speed_name(self) -> str:
+        return SPEEDS.get(self.speed_key, SPEEDS["2"])[0]
 
     def record_current_step(self, position: dict[str, Any]) -> dict[str, Any]:
         point = rounded_position(position)
@@ -195,9 +227,30 @@ class DashboardCalibrationSession:
             "reference_points": copy.deepcopy(self.reference_points),
             "workflow_complete": self.workflow_complete,
             "status": self.status_message,
+            "speed_key": self.speed_key,
+            "speed_name": self.speed_name,
+            "previous_motion_params": copy.deepcopy(self.previous_motion_params),
+            "speeds": {
+                key: {
+                    "name": name,
+                    "velocity": velocity,
+                    "acceleration": acceleration,
+                }
+                for key, (name, velocity, acceleration) in SPEEDS.items()
+            },
             "calibration": copy.deepcopy(self.config_data.get("calibration") or {}),
             "optics": {
                 "coaxial_intensity": DEFAULT_COAXIAL_INTENSITY,
                 "exposure_time": DEFAULT_EXPOSURE_US,
             },
         }
+
+
+def positive_float_or_none(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed <= 0:
+        return None
+    return parsed

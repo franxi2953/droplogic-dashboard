@@ -26,6 +26,8 @@ RETRY_PAYLOAD_MIN_TOOL_OUTPUT_CHARS = 1_500
 MODEL_ATTACHMENTS_KEY = "_cockpit_model_attachments"
 RECENT_INPUT_TOOL_PAIRS_KEEP = 4
 MAX_ACTIVE_TOOL_OUTPUT_CHARS = 4_000
+MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS = 12_000
+MIN_ACTIVE_TOOL_OUTPUT_CHARS = 800
 
 
 class AiProvider:
@@ -412,17 +414,19 @@ class AiProvider:
             outputs = []
             image_messages: list[dict[str, Any]] = []
             image_message_indices: list[int] = []
+            round_tool_output_chars = active_tool_output_chars(max_tool_output_chars, len(calls))
             for call in calls:
                 name = call["name"]
                 arguments = call["arguments"]
                 result = await call_tool(name, arguments)
                 result, attachments = pop_model_attachments(result)
-                tool_calls.append({"name": name, "arguments": arguments, "result": result})
+                compacted_result = compact_chat_tool_result(result, round_tool_output_chars)
+                tool_calls.append({"name": name, "arguments": arguments, "result": compacted_result})
                 outputs.append(
                     {
                         "type": "function_call_output",
                         "call_id": call["call_id"],
-                        "output": json.dumps(result, ensure_ascii=True, default=str),
+                        "output": json.dumps(compacted_result, ensure_ascii=True, default=str),
                     }
                 )
                 image_messages.extend(model_attachment_messages(name, call["call_id"], attachments))
@@ -579,12 +583,13 @@ class AiProvider:
                 pending_calls = calls
                 break
             messages.append(chat_assistant_message(data))
+            round_tool_output_chars = active_tool_output_chars(max_tool_output_chars, len(calls))
             for call in calls:
                 name = call["name"]
                 arguments = call["arguments"]
                 result = await call_tool(name, arguments)
                 result, _attachments = pop_model_attachments(result)
-                compacted_result = compact_chat_tool_result(result, max_tool_output_chars)
+                compacted_result = compact_chat_tool_result(result, round_tool_output_chars)
                 tool_calls.append({"name": name, "arguments": arguments, "result": compacted_result})
                 messages.append(
                     {
@@ -730,12 +735,13 @@ class AiProvider:
                 break
             messages.append(anthropic_assistant_message(data))
             tool_results = []
+            round_tool_output_chars = active_tool_output_chars(max_tool_output_chars, len(calls))
             for call in calls:
                 name = call["name"]
                 arguments = call["arguments"]
                 result = await call_tool(name, arguments)
                 result, _attachments = pop_model_attachments(result)
-                compacted_result = compact_chat_tool_result(result, max_tool_output_chars)
+                compacted_result = compact_chat_tool_result(result, round_tool_output_chars)
                 tool_calls.append({"name": name, "arguments": arguments, "result": compacted_result})
                 tool_results.append(
                     {
@@ -1596,6 +1602,9 @@ def payload_context_breakdown(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 buckets["instructions"]["chars"] += encoded_json_length(item)
                 continue
             if role == "user":
+                if is_anthropic_tool_result_message(item):
+                    buckets["tool_outputs"]["chars"] += encoded_json_length(item)
+                    continue
                 text_chars, image_chars, image_count = input_content_breakdown(item.get("content"))
                 buckets["user_context"]["chars"] += text_chars
                 buckets["images"]["chars"] += image_chars
@@ -1607,6 +1616,13 @@ def payload_context_breakdown(payload: dict[str, Any]) -> list[dict[str, Any]]:
     total = encoded_json_length(payload)
     buckets["overhead"]["chars"] += max(0, total - known)
     return [value for value in buckets.values() if int(value.get("chars") or 0) > 0 or value.get("count")]
+
+
+def is_anthropic_tool_result_message(item: dict[str, Any]) -> bool:
+    content = item.get("content")
+    if not isinstance(content, list) or not content:
+        return False
+    return all(isinstance(part, dict) and part.get("type") == "tool_result" for part in content)
 
 
 def input_content_breakdown(content: Any) -> tuple[int, int, int]:
@@ -2137,6 +2153,15 @@ def compact_chat_tool_result(result: Any, max_chars: int) -> Any:
     if encoded_json_length(compacted) <= max_chars:
         return compacted
     return force_compact_tool_output("chat_tool_result", compacted, max_chars=max_chars)
+
+
+def active_tool_output_chars(max_chars: int, batch_size: int) -> int:
+    batch_size = max(1, int(batch_size or 1))
+    per_tool_batch_budget = MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS // batch_size
+    return max(
+        MIN_ACTIVE_TOOL_OUTPUT_CHARS,
+        min(int(max_chars or MAX_ACTIVE_TOOL_OUTPUT_CHARS), MAX_ACTIVE_TOOL_OUTPUT_CHARS, per_tool_batch_budget),
+    )
 
 
 def extract_anthropic_text(data: dict[str, Any]) -> str:

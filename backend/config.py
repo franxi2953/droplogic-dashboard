@@ -104,10 +104,19 @@ class SpeechConfig:
     compute_type: str = "int8"
     language: str | None = None
     vad_filter: bool = True
-    beam_size: int = 5
-    best_of: int = 5
+    beam_size: int = 1
+    best_of: int = 1
     temperature: float = 0.0
     condition_on_previous_text: bool = False
+    preload: bool = False
+    wake_enabled: bool = True
+    wake_auto_start: bool = False
+    wake_word: str = "BoxMini"
+    wake_language: str | None = None
+    wake_auto_submit: bool = True
+    wake_command_max_seconds: int = 24
+    wake_silence_ms: int = 1200
+    wake_initial_silence_ms: int = 5000
     initial_prompt: str | None = (
         "DropLogic BoxMini laboratory control. Common words: BoxMini, DropLogic, "
         "dashboard, droplet, droplets, reservoir, injection, extraction, cartridge, "
@@ -131,6 +140,7 @@ class CockpitConfig:
     port: int = 8787
     runs_dir: str = "runs"
     live_frame_interval_seconds: float = 0.33
+    live_streamer_interval_seconds: float = 0.12
     live_state_interval_seconds: float = 1.0
     mcp: McpConfig = field(default_factory=McpConfig)
     ai: AiConfig = field(default_factory=AiConfig)
@@ -151,6 +161,7 @@ def load_config(path: str | None = None) -> CockpitConfig:
         port=int(raw.get("port", 8787)),
         runs_dir=str(raw.get("runs_dir", "runs")),
         live_frame_interval_seconds=float(raw.get("live_frame_interval_seconds", 0.33)),
+        live_streamer_interval_seconds=float(raw.get("live_streamer_interval_seconds", 0.12)),
         live_state_interval_seconds=float(raw.get("live_state_interval_seconds", 1.0)),
         mcp=McpConfig(
             command=str(mcp_raw.get("command", "py")),
@@ -198,10 +209,19 @@ def load_config(path: str | None = None) -> CockpitConfig:
             compute_type=str(speech_raw.get("compute_type", "int8")),
             language=speech_raw.get("language"),
             vad_filter=bool(speech_raw.get("vad_filter", True)),
-            beam_size=int(speech_raw.get("beam_size", 5)),
-            best_of=int(speech_raw.get("best_of", 5)),
+            beam_size=int(speech_raw.get("beam_size", 1)),
+            best_of=int(speech_raw.get("best_of", 1)),
             temperature=float(speech_raw.get("temperature", 0.0)),
             condition_on_previous_text=bool(speech_raw.get("condition_on_previous_text", False)),
+            preload=bool(speech_raw.get("preload", SpeechConfig().preload)),
+            wake_enabled=bool(speech_raw.get("wake_enabled", True)),
+            wake_auto_start=bool(speech_raw.get("wake_auto_start", False)),
+            wake_word=str(speech_raw.get("wake_word", "BoxMini")),
+            wake_language=speech_raw.get("wake_language"),
+            wake_auto_submit=bool(speech_raw.get("wake_auto_submit", True)),
+            wake_command_max_seconds=int(speech_raw.get("wake_command_max_seconds", 24)),
+            wake_silence_ms=int(speech_raw.get("wake_silence_ms", 1200)),
+            wake_initial_silence_ms=int(speech_raw.get("wake_initial_silence_ms", 5000)),
             initial_prompt=speech_raw.get("initial_prompt", SpeechConfig().initial_prompt),
             hotwords=speech_raw.get("hotwords", SpeechConfig().hotwords),
             max_audio_seconds=int(speech_raw.get("max_audio_seconds", 90)),
@@ -271,6 +291,9 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     cfg.live_frame_interval_seconds = float(
         os.environ.get("COCKPIT_LIVE_FRAME_INTERVAL_SECONDS", cfg.live_frame_interval_seconds)
     )
+    cfg.live_streamer_interval_seconds = float(
+        os.environ.get("COCKPIT_LIVE_STREAMER_INTERVAL_SECONDS", cfg.live_streamer_interval_seconds)
+    )
     cfg.live_state_interval_seconds = float(
         os.environ.get("COCKPIT_LIVE_STATE_INTERVAL_SECONDS", cfg.live_state_interval_seconds)
     )
@@ -328,6 +351,27 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
         os.environ.get("DASHBOARD_SPEECH_CONDITION_ON_PREVIOUS_TEXT"),
         cfg.speech.condition_on_previous_text,
     )
+    cfg.speech.preload = parse_bool(os.environ.get("DASHBOARD_SPEECH_PRELOAD"), cfg.speech.preload)
+    cfg.speech.wake_enabled = parse_bool(os.environ.get("DASHBOARD_SPEECH_WAKE_ENABLED"), cfg.speech.wake_enabled)
+    cfg.speech.wake_auto_start = parse_bool(
+        os.environ.get("DASHBOARD_SPEECH_WAKE_AUTO_START"),
+        cfg.speech.wake_auto_start,
+    )
+    cfg.speech.wake_word = os.environ.get("DASHBOARD_SPEECH_WAKE_WORD", cfg.speech.wake_word)
+    cfg.speech.wake_language = os.environ.get("DASHBOARD_SPEECH_WAKE_LANGUAGE", cfg.speech.wake_language)
+    cfg.speech.wake_auto_submit = parse_bool(
+        os.environ.get("DASHBOARD_SPEECH_WAKE_AUTO_SUBMIT"),
+        cfg.speech.wake_auto_submit,
+    )
+    cfg.speech.wake_command_max_seconds = int(
+        os.environ.get("DASHBOARD_SPEECH_WAKE_COMMAND_MAX_SECONDS", cfg.speech.wake_command_max_seconds)
+    )
+    cfg.speech.wake_silence_ms = int(
+        os.environ.get("DASHBOARD_SPEECH_WAKE_SILENCE_MS", cfg.speech.wake_silence_ms)
+    )
+    cfg.speech.wake_initial_silence_ms = int(
+        os.environ.get("DASHBOARD_SPEECH_WAKE_INITIAL_SILENCE_MS", cfg.speech.wake_initial_silence_ms)
+    )
     cfg.speech.initial_prompt = os.environ.get("DASHBOARD_SPEECH_INITIAL_PROMPT", cfg.speech.initial_prompt)
     cfg.speech.hotwords = os.environ.get("DASHBOARD_SPEECH_HOTWORDS", cfg.speech.hotwords)
     cfg.speech.max_audio_seconds = int(
@@ -384,7 +428,12 @@ def finalize_ai_profiles(ai: AiConfig) -> None:
 
     if not ai.active_profile:
         configured = next((profile for profile in ai.profiles if ai_profile_configured(profile)), None)
-        ai.active_profile = (configured or ai.profiles[0]).id if ai.profiles else None
+        claude = next((
+            profile for profile in ai.profiles
+            if ai_profile_configured(profile)
+            and "claude" in f"{profile.id} {profile.label} {profile.model}".lower()
+        ), None)
+        ai.active_profile = (claude or configured or ai.profiles[0]).id if ai.profiles else None
     select_ai_profile(ai, ai.active_profile, raise_on_missing=False)
 
 

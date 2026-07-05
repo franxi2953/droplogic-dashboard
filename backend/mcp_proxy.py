@@ -15,10 +15,12 @@ from mcp.server.stdio import stdio_server
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from backend.config import load_config
-    from backend.server import CockpitApp, start_http_server
+    from backend.server import CockpitApp, MCP_STATEFUL_EXECUTION_TOOLS, start_http_server
+    from backend.tool_payloads import mcp_tool_call_succeeded
 else:
     from .config import load_config
-    from .server import CockpitApp, start_http_server
+    from .server import CockpitApp, MCP_STATEFUL_EXECUTION_TOOLS, start_http_server
+    from .tool_payloads import mcp_tool_call_succeeded
 
 
 INSTRUCTIONS = """
@@ -31,13 +33,14 @@ use visualizer_status and visualizer_frame for visual feedback.
 """.strip()
 
 
-async def ensure_mcp_started(app: CockpitApp) -> None:
+async def ensure_mcp_started(app: CockpitApp) -> bool:
     if app.mcp.running:
-        return
+        return False
     await app.mcp.start()
     app.ensure_live_polling()
     app.now = "MCP server running through cockpit proxy"
     await app.record("mcp_started", command=app.mcp.command_line(), via="cockpit_proxy")
+    return True
 
 
 def as_call_tool_result(result: Any) -> types.CallToolResult:
@@ -65,7 +68,7 @@ async def run_proxy(config_path: str | None = None) -> None:
     app = CockpitApp(config)
     await app.record("cockpit_proxy_started", host=config.host, port=config.port)
 
-    httpd = start_http_server(config.host, config.port)
+    httpd = start_http_server(config.host, config.port, app.recorder.runs_dir)
     ws_port = config.port + 1
     ws_server = await websockets.serve(
         app.handle_ws,
@@ -89,11 +92,49 @@ async def run_proxy(config_path: str | None = None) -> None:
 
     @server.call_tool(validate_input=False)
     async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        await ensure_mcp_started(app)
-        call_event = await app.record("mcp_tool_call", tool=name, arguments=arguments, via="cockpit_proxy")
+        mcp_auto_started = await ensure_mcp_started(app)
+        actual_name = name
+        actual_arguments = arguments
+        routed_tool = False
+        if name == "temperature_hold" and app.should_background_temperature_hold(arguments):
+            actual_name = "start_temperature_routine"
+            actual_arguments = app.temperature_hold_as_routine_arguments(arguments)
+            routed_tool = True
+        call_event = await app.record(
+            "mcp_tool_call",
+            tool=name,
+            arguments=arguments,
+            via="cockpit_proxy",
+            **(
+                {
+                    "dashboard_actual_tool": actual_name,
+                    "dashboard_actual_arguments": actual_arguments,
+                }
+                if routed_tool
+                else {}
+            ),
+        )
         try:
-            result = await app.mcp.call_tool(name, arguments)
-            ok = not bool(result.get("isError")) if isinstance(result, dict) else True
+            if mcp_auto_started and actual_name in MCP_STATEFUL_EXECUTION_TOOLS:
+                result = app.mcp_runtime_restarted_result(actual_name, via="cockpit_proxy")
+            elif actual_name == "verify_droplets":
+                result = await app.call_verify_droplets_observed(
+                    actual_arguments,
+                    source="cockpit_proxy",
+                    call_event_id=call_event.get("t"),
+                )
+            else:
+                result = await app.mcp.call_tool(
+                    actual_name,
+                    actual_arguments,
+                    read_timeout_seconds=app.dashboard_user_tool_timeout_seconds(
+                        actual_name,
+                        actual_arguments,
+                    ),
+                )
+            if routed_tool:
+                result = app.annotate_routed_tool_result(result, name, actual_name)
+            ok = mcp_tool_call_succeeded(result)
             await app.record(
                 "mcp_tool_result",
                 tool=name,
@@ -101,6 +142,14 @@ async def run_proxy(config_path: str | None = None) -> None:
                 result=result,
                 call_event_id=call_event.get("t"),
                 via="cockpit_proxy",
+                **(
+                    {
+                        "dashboard_actual_tool": actual_name,
+                        "dashboard_actual_arguments": actual_arguments,
+                    }
+                    if routed_tool
+                    else {}
+                ),
             )
             return as_call_tool_result(result)
         except Exception as exc:
@@ -112,6 +161,14 @@ async def run_proxy(config_path: str | None = None) -> None:
                 error=str(exc),
                 call_event_id=call_event.get("t"),
                 via="cockpit_proxy",
+                **(
+                    {
+                        "dashboard_actual_tool": actual_name,
+                        "dashboard_actual_arguments": actual_arguments,
+                    }
+                    if routed_tool
+                    else {}
+                ),
             )
             return error_result(str(exc))
 

@@ -4,7 +4,11 @@
   "description": "Local dashboard for watching and driving DropLogic MCP runs.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "bench:ui": "node scripts/bench_dashboard_ui.mjs",
+    "bench:ui:stress:generate": "py -3 scripts/generate_ui_stress_run.py --activate",
+    "bench:move:sim": "py -3 scripts/bench_random_droplet_move.py",
+    "bench:move:real": "node scripts/bench_real_dashboard_move.mjs",
+    "test": "node --check scripts/bench_dashboard_ui.mjs"
   },
   "keywords": [],
   "author": "",

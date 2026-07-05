@@ -1,10 +1,32 @@
 const MATRIX_VIEW_STORAGE_KEY = "droplogic.matrixView.v1";
 const MATRIX_SCENE_STORAGE_KEY = "droplogic.matrixScene.v1";
 const STREAMER_VIEW_STORAGE_KEY = "droplogic.streamerView.v1";
+const DASHBOARD_LAYOUT_STORAGE_KEY = "droplogic.dashboardLayout.v1";
+const TEMPERATURE_HISTORY_STORAGE_PREFIX = "droplogic.temperatureHistory.v1.";
+const TIMELINE_MIN_VISIBLE_SECONDS = 1;
+const TIMELINE_RANGE_MIN_HANDLE_GAP_PX = 14;
+const TIMELINE_IDLE_GAP_SECONDS = 120;
+const TIMELINE_IDLE_GAP_VISIBLE_SECONDS = 16;
+const TIMELINE_TELEMETRY_TAIL_SECONDS = 300;
+const TIMELINE_TEMPERATURE_RENDER_MAX_POINTS = 360;
+const TIMELINE_TELEMETRY_RENDER_MS = 900;
+const TEMPERATURE_HISTORY_PERSIST_MS = 2500;
+const WAKE_RECOGNITION_RESTART_MS = 360;
+const AUDIO_AUTO_VOICE_THRESHOLD = 0.032;
+const LIVE_RENDER_MIN_INTERVAL_MS = 120;
+const TIMELINE_ACTIVE_EXECUTION_AUTO_FOLLOW_GRACE_MS = 1200;
 
 const state = {
   ws: null,
   events: [],
+  eventKeys: new Set(),
+  eventWindow: {
+    hasMore: false,
+    loading: false,
+    oldestT: null,
+    loadedEventCount: 0,
+    totalEventCount: 0,
+  },
   status: null,
   live: null,
   bottomTab: "state",
@@ -14,15 +36,23 @@ const state = {
   controlsOpen: false,
   selectedRunId: "",
   forceConversationRender: false,
+  liveRenderQueued: false,
+  liveRenderTimer: null,
+  lastLiveRenderAt: 0,
   selectedRuns: new Set(),
   namingRuns: new Set(),
   temperatureSamples: [],
+  temperatureTargetSamples: [],
+  temperatureHistoryMeta: null,
+  temperatureRevision: 0,
+  temperaturePersistTimer: null,
   temperatureHover: null,
   tokenChartHover: null,
   contextHistogramHover: null,
   matrixHover: null,
   matrixSceneHitboxes: [],
   timelineHitboxes: [],
+  timelineOverlayHitboxes: [],
   matrixSceneCache: null,
   matrixView: {
     zoom: 1,
@@ -43,6 +73,10 @@ const state = {
     edgePanVx: 0,
     edgePanVy: 0,
     minimapDragging: false,
+    lastPointerX: null,
+    lastPointerY: null,
+    lastPointerAt: 0,
+    lastCanvasPoint: null,
   },
   streamerView: {
     zoom: 1,
@@ -54,14 +88,28 @@ const state = {
     dragStartY: 0,
     dragPanX: 0,
     dragPanY: 0,
+    dragButton: null,
+    lastRectWidth: 0,
+    lastRectHeight: 0,
     lastRequestKey: "",
     requestTimer: null,
+    directUrl: "",
+    directSrc: "",
+    directActive: false,
+    directFailedAt: 0,
   },
   matrixPaths: {
     collapsed: true,
     hiddenActions: new Set(),
     hoveredActionId: "",
     revision: "",
+    actionCache: {
+      movingKey: "",
+      movingActions: [],
+      staticKey: "",
+      staticActions: [],
+    },
+    renderKey: "",
   },
   matrixPaint: {
     collapsed: true,
@@ -69,6 +117,8 @@ const state = {
     dragging: false,
     start: null,
     current: null,
+    startDisplay: null,
+    currentDisplay: null,
     overlays: [],
   },
   matrixSelection: {
@@ -76,6 +126,10 @@ const state = {
     moved: false,
     start: null,
     current: null,
+    startPoint: null,
+    currentPoint: null,
+    startDisplay: null,
+    currentDisplay: null,
     ids: new Set(),
   },
   matrixMovePreview: {
@@ -91,16 +145,66 @@ const state = {
     planning: false,
     lastError: "",
   },
+  presets: {
+    loaded: false,
+    loading: false,
+    savingKey: "",
+    savingDraftKey: "",
+    pendingSave: null,
+    applyingKey: "",
+    lastAppliedKey: "",
+    configPath: "",
+    data: {},
+    drafts: {},
+    categories: [],
+    selectedCategory: "stage",
+    error: "",
+  },
+  layout: {
+    collapsed: {
+      visuals: false,
+      streamer: false,
+      matrix: false,
+      bottom: false,
+      chat: false,
+    },
+    chatWidth: 380,
+    bottomHeight: 240,
+    streamerRatio: 0.5,
+    resizing: null,
+    renderQueued: false,
+  },
   calibration: {
     active: false,
     data: null,
     localPosition: null,
-    jogStep: 100,
+    speedKey: "2",
+    jogDirections: { X: 0, Y: 0, Z: 0 },
+    jogKeepaliveTimer: null,
+    lastJogAt: 0,
     lastMoveAt: 0,
     movePending: false,
   },
+  stageMotion: {
+    active: false,
+    start: null,
+    target: null,
+    lastPosition: null,
+    lastPositionAt: 0,
+    eventPosition: null,
+    eventPositionAt: 0,
+    startedAt: 0,
+    durationMs: 0,
+    raf: null,
+    lastRenderAt: 0,
+    callEventId: "",
+    source: "",
+  },
   timeline: {
     followLive: true,
+    liveBootstrappedRunId: "",
+    manualPreviewExecutionKey: "",
+    manualPreviewAt: 0,
     selectedFrame: null,
     selectedDropletId: null,
     dragging: false,
@@ -109,13 +213,82 @@ const state = {
     dragStartX: 0,
     dragStartY: 0,
     dragStartOffsetFrame: 0,
+    dragStartOffsetTime: 0,
     hoverFrame: null,
+    hoverTime: null,
     hoverEvent: null,
+    hoverOverlay: null,
     hoverX: 0,
     hoverY: 0,
+    hoverHitKey: "",
+    hoverContentKey: "",
+    hoverTooltipWidth: 0,
+    hoverTooltipHeight: 0,
+    hoverRaf: null,
+    pendingHover: null,
     zoom: 1,
     offsetFrame: 0,
+    timeOffset: 0,
+    selectedTime: null,
     frameDelay: 1.0,
+    overlayMenuOpen: false,
+    executorMenuOpen: false,
+    overlays: {
+      plan: true,
+      measuredTemperature: true,
+      targetTemperature: true,
+      stage: true,
+      photos: true,
+      timelineStops: true,
+    },
+    overlayCache: {
+      key: "",
+      data: null,
+    },
+    rangeCache: {
+      key: "",
+      data: null,
+    },
+    semanticTimesCache: {
+      key: "",
+      data: null,
+    },
+    timeWarpCache: {
+      key: "",
+      data: null,
+    },
+    telemetryTailCache: {
+      key: "",
+      data: null,
+    },
+    stopMarkersCache: {
+      key: "",
+      data: null,
+    },
+    eventBoundsCache: {
+      key: "",
+      data: null,
+    },
+    layoutCache: {
+      key: "",
+      layout: null,
+    },
+    canvasBaseCache: {
+      key: "",
+      bitmap: null,
+    },
+    renderQueued: false,
+    telemetryRenderTimer: null,
+    rangeDrag: {
+      active: false,
+      mode: "",
+      pointerId: null,
+      anchorTime: null,
+      start: null,
+      end: null,
+      offset: 0,
+      moved: false,
+    },
   },
   tokenChartLines: {
     request: true,
@@ -139,6 +312,9 @@ const state = {
   typewriterVersion: 0,
   conversationAtLatest: true,
   audio: {
+    modelLoadSupported: false,
+    modelLoaded: false,
+    modelLoading: false,
     recording: false,
     transcribing: false,
     recorder: null,
@@ -149,8 +325,49 @@ const state = {
     audioContext: null,
     analyser: null,
     meterData: null,
+    timeData: null,
     meterAnimation: null,
+    autoTimer: null,
+    lastRms: 0,
+    autoRecording: false,
+    autoHadVoice: false,
+    autoLastVoiceAt: 0,
+    autoSilenceStartedAt: 0,
+    autoStopping: false,
+    recordingSource: "manual",
+    pendingSource: "",
+    pendingAutoSubmit: false,
+    wakeListening: false,
+    wakeActive: false,
+    wakeSupported: false,
+    wakeAutoStart: false,
+    wakeAutoStarted: false,
+    wakeManualStart: false,
+    wakeRecognizer: null,
+    wakeRestartTimer: null,
+    wakePhrase: "BoxMini",
+    wakeLanguage: "",
+    wakeAutoSubmit: true,
+    wakeCommandMaxSeconds: 24,
+    wakeSilenceMs: 1200,
+    wakeInitialSilenceMs: 5000,
+    commandRecognizer: null,
+    commandRecognitionActive: false,
+    commandRecognitionEnabled: false,
+    commandRecognitionFailed: false,
+    commandRecognitionRestartTimer: null,
+    commandSpeechHadWords: false,
+    commandSpeechLastAt: 0,
+    commandSpeechActive: false,
+    commandSpeechEventSeen: false,
+    commandLastTranscriptKey: "",
+    commandLastTranscriptAt: 0,
+    commandSpeechLastReason: "",
   },
+};
+
+window.__droplogicDebug = {
+  state,
 };
 
 const TYPEWRITER_INTERVAL_MS = 11;
@@ -161,6 +378,7 @@ const $ = (id) => document.getElementById(id);
 restoreMatrixView();
 restoreMatrixSceneCache();
 restoreStreamerView();
+restoreDashboardLayout();
 
 function restoreMatrixView() {
   try {
@@ -228,6 +446,43 @@ function saveStreamerView() {
   }
 }
 
+function restoreDashboardLayout() {
+  try {
+    const raw = window.localStorage?.getItem(DASHBOARD_LAYOUT_STORAGE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (!saved || typeof saved !== "object") return;
+    const collapsed = saved.collapsed && typeof saved.collapsed === "object" ? saved.collapsed : {};
+    for (const key of Object.keys(state.layout.collapsed)) {
+      state.layout.collapsed[key] = Boolean(collapsed[key]);
+    }
+    const chatWidth = Number(saved.chatWidth);
+    const bottomHeight = Number(saved.bottomHeight);
+    const streamerRatio = Number(saved.streamerRatio);
+    if (Number.isFinite(chatWidth)) state.layout.chatWidth = clamp(chatWidth, 260, 900);
+    if (Number.isFinite(bottomHeight)) state.layout.bottomHeight = clamp(bottomHeight, 96, 520);
+    if (Number.isFinite(streamerRatio)) state.layout.streamerRatio = clamp(streamerRatio, 0.18, 0.82);
+  } catch {
+    // Layout persistence should never block the dashboard.
+  }
+}
+
+function saveDashboardLayout() {
+  try {
+    window.localStorage?.setItem(
+      DASHBOARD_LAYOUT_STORAGE_KEY,
+      JSON.stringify({
+        collapsed: state.layout.collapsed,
+        chatWidth: state.layout.chatWidth,
+        bottomHeight: state.layout.bottomHeight,
+        streamerRatio: state.layout.streamerRatio,
+      }),
+    );
+  } catch {
+    // Best effort only.
+  }
+}
+
 function restoreMatrixSceneCache() {
   try {
     const raw = window.localStorage?.getItem(MATRIX_SCENE_STORAGE_KEY);
@@ -235,6 +490,7 @@ function restoreMatrixSceneCache() {
     const cached = JSON.parse(raw);
     const scene = cached?.scene?.result || cached?.scene;
     if (!scene?.available) return;
+    if (!matrixSceneMatchesRuntimeSession(scene)) return;
     state.matrixSceneCache = cached;
     state.live = {
       ...(state.live || {}),
@@ -248,6 +504,7 @@ function restoreMatrixSceneCache() {
 
 function persistMatrixScene(scene, live = {}) {
   if (!scene?.available) return;
+  if (!matrixSceneMatchesRuntimeSession(scene, live)) return;
   const cached = {
     updated_at: live.updated_at || new Date().toISOString(),
     scene,
@@ -264,10 +521,22 @@ function mergeLiveWithMatrixCache(live) {
   const nextLive = live || {};
   const scene = nextLive?.scene?.result || nextLive?.scene;
   if (scene?.available) {
-    persistMatrixScene(scene, nextLive);
-    return nextLive;
+    if (matrixSceneMatchesRuntimeSession(scene, nextLive)) {
+      persistMatrixScene(scene, nextLive);
+      return nextLive;
+    }
+    return {
+      ...nextLive,
+      scene: {
+        available: false,
+        reason: "scene_session_mismatch",
+        session_id: matrixSceneSessionId(scene),
+        runtime_session_id: runtimeSessionIdFromLive(nextLive),
+      },
+    };
   }
-  if (state.matrixSceneCache?.scene) {
+  const cachedScene = state.matrixSceneCache?.scene?.result || state.matrixSceneCache?.scene;
+  if (state.matrixSceneCache?.scene && matrixSceneMatchesRuntimeSession(cachedScene, nextLive)) {
     return {
       ...nextLive,
       updated_at: nextLive.updated_at || state.matrixSceneCache.updated_at,
@@ -277,13 +546,354 @@ function mergeLiveWithMatrixCache(live) {
   return nextLive;
 }
 
+function matrixSceneMatchesRuntimeSession(scene, live = state.live || {}) {
+  const runtimeSessionId = runtimeSessionIdFromLive(live);
+  if (!runtimeSessionId) return true;
+  const sceneSessionId = matrixSceneSessionId(scene);
+  return Boolean(sceneSessionId) && sceneSessionId === runtimeSessionId;
+}
+
+function runtimeSessionIdFromLive(live = state.live || {}) {
+  return firstNonEmptyString(
+    live?.runtime?.session_id,
+    live?.runtime?.result?.session_id,
+    live?.runtime?.structuredContent?.result?.session_id,
+    state.status?.runtime?.session_id,
+  );
+}
+
+function matrixSceneSessionId(scene) {
+  return firstNonEmptyString(
+    scene?.session_id,
+    scene?.result?.session_id,
+    scene?.runtime?.session_id,
+  );
+}
+
+function firstNonEmptyString(...values) {
+  for (const value of values) {
+    if (value === null || value === undefined) continue;
+    const text = String(value).trim();
+    if (text) return text;
+  }
+  return "";
+}
+
+function rawLiveStagePosition() {
+  const root = typeof currentLiveState === "function"
+    ? currentLiveState()
+    : (state.live?.state?.value || state.live?.state?.result?.value || state.live?.state || {});
+  return normalizeStagePosition(getPath(root, "xy_stage.position"));
+}
+
+function stageMotionPosition(options = {}) {
+  const motion = state.stageMotion || {};
+  if (motion.active && motion.start && motion.target) {
+    const now = performance.now();
+    const duration = Math.max(1, Number(motion.durationMs) || 1);
+    const progress = clamp((now - Number(motion.startedAt || now)) / duration, 0, 1);
+    const eased = progress < 1
+      ? 1 - Math.pow(1 - progress, 3)
+      : 1;
+    return interpolateStagePosition(motion.start, motion.target, eased);
+  }
+  if (options.includeFreshFinal !== false && motion.lastPosition && Date.now() - Number(motion.lastPositionAt || 0) < 5000) {
+    return normalizeStagePosition(motion.lastPosition);
+  }
+  if (options.includeEvent !== false && motion.eventPosition) {
+    return normalizeStagePosition(motion.eventPosition);
+  }
+  return null;
+}
+
+function interpolateStagePosition(start, target, progress) {
+  const position = {};
+  for (const axis of ["X", "Y", "Z"]) {
+    const from = Number(start?.[axis]);
+    const to = Number(target?.[axis]);
+    if (Number.isFinite(from) && Number.isFinite(to)) {
+      position[axis] = Math.trunc(from + (to - from) * progress);
+    } else if (Number.isFinite(to)) {
+      position[axis] = Math.trunc(to);
+    } else if (Number.isFinite(from)) {
+      position[axis] = Math.trunc(from);
+    }
+  }
+  return Object.keys(position).length ? position : null;
+}
+
+function beginStageMotionFromCommand(command = {}) {
+  const target = stageMotionTargetFromPayload(command);
+  if (!target || !Number.isFinite(Number(target.X)) || !Number.isFinite(Number(target.Y))) return false;
+  const start = normalizeStagePosition(command.start_position)
+    || stageMotionPosition()
+    || rawLiveStagePosition()
+    || normalizeStagePosition(state.calibration.localPosition)
+    || target;
+  const durationMs = estimateStageMotionDurationMs(start, target, command);
+  state.stageMotion.active = true;
+  state.stageMotion.start = start;
+  state.stageMotion.target = target;
+  state.stageMotion.startedAt = performance.now();
+  state.stageMotion.durationMs = durationMs;
+  state.stageMotion.lastPosition = null;
+  state.stageMotion.lastPositionAt = 0;
+  state.stageMotion.callEventId = String(command.call_event_id || command.callEventId || "");
+  state.stageMotion.source = String(command.source || command.via || "");
+  state.stageMotion.lastRenderAt = 0;
+  scheduleStageMotionAnimation();
+  renderMatrixPanel(state.live || {});
+  return true;
+}
+
+function finishStageMotionFromPayload(payload = {}) {
+  if (stageMotionPayloadIsQueuedOnly(payload)) return;
+  const actual = stagePositionFromToolPayload(payload)
+    || stageMotionTargetFromPayload(payload)
+    || normalizeStagePosition(state.stageMotion.target);
+  if (actual) {
+    state.stageMotion.lastPosition = actual;
+    state.stageMotion.lastPositionAt = Date.now();
+    state.stageMotion.eventPosition = actual;
+    state.stageMotion.eventPositionAt = Date.now();
+  }
+  state.stageMotion.active = false;
+  state.stageMotion.start = null;
+  state.stageMotion.target = null;
+  if (state.stageMotion.raf !== null) {
+    cancelAnimationFrame(state.stageMotion.raf);
+    state.stageMotion.raf = null;
+  }
+  renderMatrixPanel(state.live || {});
+  renderStateGrid(state.live || {});
+}
+
+function scheduleStageMotionAnimation() {
+  if (state.stageMotion.raf !== null) return;
+  const step = () => {
+    state.stageMotion.raf = null;
+    if (!state.stageMotion.active) return;
+    const now = performance.now();
+    if (now - Number(state.stageMotion.lastRenderAt || 0) >= 80) {
+      state.stageMotion.lastRenderAt = now;
+      renderMatrixPanel(state.live || {});
+    }
+    const elapsed = now - Number(state.stageMotion.startedAt || now);
+    if (elapsed >= Math.max(1, Number(state.stageMotion.durationMs) || 1)) {
+      finishStageMotionFromPayload({
+        actual_position: state.stageMotion.target,
+        motion_complete: true,
+      });
+      return;
+    }
+    state.stageMotion.raf = requestAnimationFrame(step);
+  };
+  state.stageMotion.raf = requestAnimationFrame(step);
+}
+
+function estimateStageMotionDurationMs(start, target, payload = {}) {
+  const explicit = firstFiniteNumber(payload.duration_seconds, payload.estimated_seconds, payload.estimate_seconds);
+  const timeout = firstFiniteNumber(payload.wait_timeout_seconds, payload.arguments?.wait_timeout_seconds);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return Math.round(clamp(explicit, 0.25, Math.max(0.3, timeout || 12)) * 1000);
+  }
+  const dx = Number(target?.X) - Number(start?.X);
+  const dy = Number(target?.Y) - Number(start?.Y);
+  const dz = Number.isFinite(Number(target?.Z)) && Number.isFinite(Number(start?.Z))
+    ? Number(target.Z) - Number(start.Z)
+    : 0;
+  const distance = Math.hypot(Number.isFinite(dx) ? dx : 0, Number.isFinite(dy) ? dy : 0) + Math.abs(dz) * 0.25;
+  const seconds = distance > 0 ? distance / 35000 : 0.35;
+  const capped = Number.isFinite(timeout) && timeout > 0 ? Math.min(seconds, timeout) : seconds;
+  return Math.round(clamp(capped, 0.35, 12) * 1000);
+}
+
+function stageMotionTargetFromPayload(payload = {}) {
+  const args = payload.arguments && typeof payload.arguments === "object" ? payload.arguments : payload;
+  return stagePositionFromToolPayload(payload, { preferTarget: true })
+    || normalizeStagePosition(payload.target_position)
+    || normalizeStagePosition(payload.position)
+    || normalizeStagePosition(args.target_position)
+    || normalizeStagePosition(args.position)
+    || presetStagePosition(args.preset || payload.preset, payload.category || args.category);
+}
+
+function stagePositionFromToolPayload(payload, options = {}) {
+  const roots = toolPayloadRoots(payload);
+  const targetFirst = options.preferTarget === true;
+  for (const root of roots) {
+    const position = targetFirst
+      ? normalizeStagePosition(
+        getPath(root, "target_position")
+        || getPath(root, "position")
+        || getPath(root, "actual_position")
+        || getPath(root, "result.target_position")
+        || getPath(root, "result.position")
+        || getPath(root, "result.actual_position"),
+      )
+      : normalizeStagePosition(
+        getPath(root, "actual_position")
+        || getPath(root, "target_position")
+        || getPath(root, "position")
+        || getPath(root, "result.actual_position")
+        || getPath(root, "result.target_position")
+        || getPath(root, "result.position"),
+      );
+    if (position) return position;
+  }
+  return null;
+}
+
+function stageMotionPayloadIsQueuedOnly(payload) {
+  for (const root of toolPayloadRoots(payload)) {
+    if (getPath(root, "queued_only") === true || getPath(root, "result.queued_only") === true) return true;
+    if (getPath(root, "motion_complete") === false || getPath(root, "result.motion_complete") === false) return true;
+  }
+  return false;
+}
+
+function toolPayloadRoots(payload) {
+  const roots = [];
+  const push = (value) => {
+    if (value && typeof value === "object" && !roots.includes(value)) roots.push(value);
+  };
+  push(payload);
+  push(payload?.result);
+  push(payload?.structuredContent);
+  push(payload?.structuredContent?.result);
+  push(payload?.result?.structuredContent);
+  push(payload?.result?.structuredContent?.result);
+  for (const root of [payload, payload?.result]) {
+    if (!Array.isArray(root?.content)) continue;
+    for (const part of root.content) {
+      push(part?.structuredContent);
+      push(part?.structuredContent?.result);
+      if (typeof part?.text === "string") {
+        const parsed = parseJsonMaybe(part.text);
+        push(parsed);
+        push(parsed?.result);
+      }
+    }
+  }
+  return roots;
+}
+
+function presetStagePosition(name, category = "") {
+  const presetName = String(name || "").trim();
+  if (!presetName) return null;
+  const categories = category ? [String(category)] : ["stage", "imaging"];
+  for (const item of categories) {
+    const preset = state.presets.data?.[item]?.[presetName];
+    const position = normalizeStagePosition(preset?.position || preset?.stage_position);
+    if (position) return position;
+  }
+  return null;
+}
+
+function beginStageMotionFromEvent(event) {
+  if (event?.type !== "mcp_tool_call" || String(event.tool || "").toLowerCase() !== "move_stage") return;
+  beginStageMotionFromCommand({
+    arguments: event.arguments || {},
+    call_event_id: event.t,
+    source: event.via || "event",
+    wait_timeout_seconds: event.arguments?.wait_timeout_seconds,
+  });
+}
+
+function finishStageMotionFromEvent(event) {
+  if (event?.type === "stage_position") {
+    finishStageMotionFromPayload({
+      actual_position: event.actual_position || event.position,
+      target_position: event.target_position || event.position,
+      position: event.position || event.actual_position || event.target_position,
+      call_event_id: event.parent_call_event_id || event.t,
+    });
+    return;
+  }
+  if (event?.type !== "mcp_tool_result" || String(event.tool || "").toLowerCase() !== "move_stage") return;
+  finishStageMotionFromPayload({
+    ...(event.result && typeof event.result === "object" ? event.result : {}),
+    call_event_id: event.call_event_id,
+  });
+}
+
+function rehydrateStageMotionFromEvents(events = state.events || []) {
+  let latest = null;
+  for (const event of events || []) {
+    const position = stagePositionFromEvent(event);
+    if (position) latest = position;
+  }
+  if (!latest) return;
+  state.stageMotion.eventPosition = latest;
+  state.stageMotion.eventPositionAt = Date.now();
+  state.stageMotion.lastPosition = latest;
+  state.stageMotion.lastPositionAt = Date.now();
+}
+
+function handleStageMotionMessage(data) {
+  if (data.phase === "start") {
+    beginStageMotionFromCommand(data);
+  } else if (data.phase === "queued") {
+    return;
+  } else if (data.phase === "end" || data.phase === "done" || data.phase === "stop") {
+    finishStageMotionFromPayload(data);
+  }
+}
+
+function syncStageMotionWithLive() {
+  const livePosition = rawLiveStagePosition();
+  if (!livePosition) return;
+  if (state.stageMotion.active && stagePositionsClose(livePosition, state.stageMotion.target)) {
+    finishStageMotionFromPayload({ actual_position: livePosition });
+    return;
+  }
+  if (state.stageMotion.lastPosition && stagePositionsClose(livePosition, state.stageMotion.lastPosition)) {
+    state.stageMotion.eventPosition = livePosition;
+    state.stageMotion.eventPositionAt = Date.now();
+    state.stageMotion.lastPosition = null;
+    state.stageMotion.lastPositionAt = 0;
+    return;
+  }
+  if (state.stageMotion.lastPosition && Date.now() - Number(state.stageMotion.lastPositionAt || 0) < 5000) {
+    return;
+  }
+  state.stageMotion.eventPosition = livePosition;
+  state.stageMotion.eventPositionAt = Date.now();
+}
+
+function stagePositionsClose(a, b) {
+  if (!a || !b) return false;
+  const dx = Math.abs(Number(a.X) - Number(b.X));
+  const dy = Math.abs(Number(a.Y) - Number(b.Y));
+  const dz = Number.isFinite(Number(a.Z)) && Number.isFinite(Number(b.Z))
+    ? Math.abs(Number(a.Z) - Number(b.Z))
+    : 0;
+  return dx <= 2 && dy <= 2 && dz <= 2;
+}
+
 function appendEvent(event, options = {}) {
+  if (isFrontendTelemetryOnlyEvent(event)) {
+    ingestFrontendTelemetryEvent(event);
+    return;
+  }
   const key = eventKey(event);
-  if (state.events.some((item) => eventKey(item) === key)) return;
+  if (state.eventKeys.has(key) || state.events.some((item) => eventKey(item) === key)) return;
+  state.eventKeys.add(key);
   state.events.push(event);
+  state.eventWindow.loadedEventCount = Math.max(
+    Number(state.eventWindow.loadedEventCount || 0),
+    state.events.length,
+  );
+  if (options.replay !== true) {
+    beginStageMotionFromEvent(event);
+    finishStageMotionFromEvent(event);
+  }
   if (isAudioTerminalEvent(event)) {
     state.audio.transcribing = false;
     setAudioStatus(event.type === "audio_transcript" ? "Transcript ready" : "Transcription error", event.type !== "audio_transcript");
+  }
+  if (event?.type === "temperature_sample") {
+    ingestTemperatureHistoryEvent(event);
   }
   if ((event.type === "context_compacted" || event.type === "context_ai_summary") && options.replay !== true) {
     state.compactingUntil = Date.now() + 2600;
@@ -292,8 +902,217 @@ function appendEvent(event, options = {}) {
   render();
 }
 
+function isFrontendTelemetryOnlyEvent(event) {
+  return event?.type === "temperature_sample";
+}
+
+function ingestFrontendTelemetryEvent(event) {
+  if (event?.type === "temperature_sample") {
+    ingestTemperatureHistoryEvent(event);
+    renderTemperatureChart();
+    scheduleTimelineTelemetryRender();
+  }
+}
+
+function scheduleTimelineTelemetryRender() {
+  if (!isTimelinePanelVisible()) return;
+  if (state.timeline.telemetryRenderTimer !== null) return;
+  state.timeline.telemetryRenderTimer = window.setTimeout(() => {
+    state.timeline.telemetryRenderTimer = null;
+    schedulePlanTimelineRender();
+  }, TIMELINE_TELEMETRY_RENDER_MS);
+}
+
+function schedulePlanTimelineRender() {
+  if (!isTimelinePanelVisible()) return;
+  if (state.timeline.renderQueued) return;
+  state.timeline.renderQueued = true;
+  requestAnimationFrame(() => {
+    state.timeline.renderQueued = false;
+    renderPlanTimeline();
+  });
+}
+
+function timelineLayoutCacheKey(scene, count, width, height) {
+  return [
+    timelineDataCacheKey(scene),
+    Math.round(Number(width) || 0),
+    Math.round(Number(height) || 0),
+    Number(count) || 0,
+    Number(state.timeline.zoom || 1).toFixed(4),
+    Number(state.timeline.timeOffset || 0).toFixed(3),
+  ].join("|");
+}
+
+function timelineCanvasBaseKey(scene, count, width, height) {
+  const executor = scene?.executor || {};
+  const overlays = state.timeline.overlays || {};
+  return [
+    timelineLayoutCacheKey(scene, count, width, height),
+    timelineHasFiniteNumber(scene?.frame?.index) ? Math.trunc(Number(scene.frame.index)) : "",
+    timelineHasFiniteNumber(executor?.current_frame) ? Math.trunc(Number(executor.current_frame)) : "",
+    timelineHasFiniteNumber(executor?.last_applied_frame?.index) ? Math.trunc(Number(executor.last_applied_frame.index)) : "",
+    Boolean(executor?.is_executing || executor?.running),
+    Boolean(state.matrixCommands.planning),
+    Object.keys(overlays).sort().map((key) => `${key}:${overlays[key] !== false ? 1 : 0}`).join(","),
+  ].join("|");
+}
+
+function cachedTimelineLayout(canvas, scene, count) {
+  if (!canvas || !count) return null;
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width || canvas.clientWidth || canvas.width));
+  const height = Math.max(1, Math.round(rect.height || canvas.clientHeight || canvas.height));
+  const key = timelineLayoutCacheKey(scene, count, width, height);
+  if (state.timeline.layoutCache.key === key && state.timeline.layoutCache.layout) {
+    return state.timeline.layoutCache.layout;
+  }
+  const timeline = effectiveTimeline(scene);
+  const layout = timelineLayout(width, height, count, scene, timeline);
+  state.timeline.layoutCache = { key, layout };
+  return layout;
+}
+
+function cacheTimelineCanvasBase(canvas, ctx, layout, key) {
+  if (!canvas || !ctx || !layout || !key) return;
+  try {
+    state.timeline.canvasBaseCache = {
+      key,
+      width: canvas.width,
+      height: canvas.height,
+      cssWidth: layout.width,
+      cssHeight: layout.height,
+      layout,
+      imageData: ctx.getImageData(0, 0, canvas.width, canvas.height),
+    };
+  } catch {
+    state.timeline.canvasBaseCache = { key: "", imageData: null };
+  }
+}
+
+function restoreTimelineCanvasBase(canvas, ctx, key) {
+  const cache = state.timeline.canvasBaseCache;
+  if (!canvas || !ctx || !cache?.imageData || cache.key !== key) return false;
+  if (cache.width !== canvas.width || cache.height !== canvas.height) return false;
+  try {
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.putImageData(cache.imageData, 0, 0);
+    ctx.restore();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function renderTimelineHoverCursorFast(scene = state.live?.scene?.result || state.live?.scene, options = {}) {
+  const canvas = $("planTimeline");
+  const count = timelineFrameCount(scene);
+  if (!canvas || !count || !isTimelinePanelVisible()) return false;
+  const { ctx, width, height } = prepareCanvas(canvas);
+  const key = timelineCanvasBaseKey(scene, count, width, height);
+  const cache = state.timeline.canvasBaseCache;
+  const layout = cache?.key === key && cache.layout
+    ? cache.layout
+    : (state.timeline.layoutCache.layout || cachedTimelineLayout(canvas, scene, count));
+  if (!layout || !restoreTimelineCanvasBase(canvas, ctx, key)) return false;
+  drawTimelineDynamicCursors(ctx, layout, scene);
+  if (options.updateControls === true) updateTimelineLightweightControls(scene);
+  return true;
+}
+
+function drawTimelineDynamicCursors(ctx, layout, scene) {
+  const selected = selectedTimelineFrame(scene);
+  if (Number.isFinite(selected) && !state.timeline.followLive) {
+    drawTimelineTimeCursor(
+      ctx,
+      layout,
+      timelineHasFiniteNumber(state.timeline.selectedTime)
+        ? Number(state.timeline.selectedTime)
+        : timelineTimeForFrame(layout, selected),
+      "rgba(100, 210, 255, 0.98)",
+      true,
+      "preview",
+    );
+  }
+  if (timelineHasFiniteNumber(state.timeline.hoverTime)) {
+    drawTimelineTimeCursor(ctx, layout, Number(state.timeline.hoverTime), "rgba(245, 245, 247, 0.22)", false);
+  }
+}
+
+function updateTimelineLightweightControls(scene = state.live?.scene?.result || state.live?.scene) {
+  const label = $("timelineFrameLabel");
+  if (label) label.textContent = timelineFrameLabel(scene);
+  const liveButton = $("timelineLive");
+  if (liveButton) {
+    liveButton.classList.toggle("active", state.timeline.followLive);
+    liveButton.textContent = state.timeline.followLive ? "Live" : "Go Live";
+  }
+  const trimButton = $("timelineTrimTail");
+  if (trimButton) trimButton.disabled = !canTrimTimelineTail(scene) || Boolean(state.matrixCommands.planning);
+}
+
+function resetRunEvents(events = [], eventWindow = {}) {
+  state.events = [];
+  state.eventKeys = new Set();
+  for (const event of events || []) {
+    if (isFrontendTelemetryOnlyEvent(event)) {
+      ingestFrontendTelemetryEvent(event);
+      continue;
+    }
+    const key = eventKey(event);
+    if (state.eventKeys.has(key)) continue;
+    state.eventKeys.add(key);
+    state.events.push(event);
+  }
+  state.eventWindow = {
+    hasMore: Boolean(eventWindow?.has_more),
+    loading: false,
+    oldestT: eventWindow?.oldest_t ?? (state.events[0]?.t ?? null),
+    loadedEventCount: Number(eventWindow?.loaded_event_count || state.events.length) || state.events.length,
+    totalEventCount: Number(eventWindow?.total_event_count || state.events.length) || state.events.length,
+  };
+}
+
+function prependOlderRunEvents(events = [], eventWindow = {}) {
+  const incoming = [];
+  for (const event of events || []) {
+    if (isFrontendTelemetryOnlyEvent(event)) continue;
+    const key = eventKey(event);
+    if (state.eventKeys.has(key)) continue;
+    state.eventKeys.add(key);
+    incoming.push(event);
+  }
+  state.events = [...incoming, ...state.events];
+  state.eventWindow = {
+    ...state.eventWindow,
+    hasMore: Boolean(eventWindow?.has_more),
+    loading: false,
+    oldestT: eventWindow?.oldest_t ?? (state.events[0]?.t ?? null),
+    loadedEventCount: state.events.length,
+    totalEventCount: Number(eventWindow?.total_event_count || state.eventWindow.totalEventCount || state.events.length) || state.events.length,
+  };
+  state.lastRenderedConversationKey = "";
+}
+
+function loadOlderConversationEvents() {
+  if (state.eventWindow.loading || !state.eventWindow.hasMore) return;
+  state.eventWindow.loading = true;
+  state.lastRenderedConversationKey = "";
+  renderConversation();
+  send({
+    type: "load_older_events",
+    run_id: state.selectedRunId || state.status?.run_id || "",
+    before_t: state.eventWindow.oldestT ?? state.events[0]?.t ?? null,
+  });
+}
+
 function eventKey(event) {
-  return `${event.t || ""}|${event.type || ""}|${event.tool || ""}|${event.text || event.prompt || event.message || event.error || ""}`;
+  if (event?.t !== undefined && event?.t !== null) {
+    return `${event.t}|${event.type || ""}|${event.tool || ""}|${event.call_event_id || ""}`;
+  }
+  const text = String(event?.text || event?.prompt || event?.message || event?.error || "");
+  return `${event?.ts || ""}|${event?.type || ""}|${event?.tool || ""}|${text.slice(0, 160)}`;
 }
 
 function isAudioTerminalEvent(event) {
@@ -309,6 +1128,29 @@ function audioTranscriptionPending(events) {
   return pending;
 }
 
+function syncSpeechConfig(speech) {
+  if (!speech || typeof speech !== "object") return;
+  const supportsManualLoad = Object.prototype.hasOwnProperty.call(speech, "loaded")
+    || Object.prototype.hasOwnProperty.call(speech, "loading");
+  state.audio.modelLoadSupported = supportsManualLoad;
+  state.audio.modelLoaded = supportsManualLoad ? speech.loaded === true : true;
+  state.audio.modelLoading = supportsManualLoad ? speech.loading === true : false;
+  state.audio.wakePhrase = String(speech.wake_word || state.audio.wakePhrase || "BoxMini").trim() || "BoxMini";
+  state.audio.wakeLanguage = String(speech.wake_language || speech.language || "").trim();
+  state.audio.wakeAutoSubmit = speech.wake_auto_submit !== false;
+  state.audio.wakeAutoStart = speech.wake_auto_start === true;
+  state.audio.wakeCommandMaxSeconds = Math.max(2, Number(speech.wake_command_max_seconds || 24));
+  state.audio.wakeSilenceMs = Math.max(250, Number(speech.wake_silence_ms || 1200));
+  state.audio.wakeInitialSilenceMs = Math.max(1000, Number(speech.wake_initial_silence_ms || 5000));
+  state.audio.wakeSupported = Boolean(wakeRecognitionClass());
+  if (speech.enabled === false || speech.wake_enabled === false || !state.audio.modelLoaded) {
+    stopWakeListening();
+  } else if (state.audio.wakeAutoStart && !state.audio.wakeAutoStarted && !state.audio.wakeListening) {
+    state.audio.wakeAutoStarted = true;
+    window.setTimeout(() => startWakeListening({ automatic: true }), 250);
+  }
+}
+
 function render() {
   setText("runId", state.status?.run_id || "-");
   setText("runIdAdvanced", state.status?.run_id || "-");
@@ -322,12 +1164,22 @@ function render() {
   const askButton = $("askAgent");
   if (askButton) {
     askButton.disabled = false;
-    askButton.textContent = state.agentBusy ? "Steer" : "Ask";
+    askButton.textContent = state.agentBusy ? "Steer" : "Send";
+  }
+  const queueButton = $("queueAgent");
+  if (queueButton) {
+    const queueLength = Math.max(0, Number(state.status?.agent_queue_length || 0));
+    queueButton.disabled = false;
+    queueButton.textContent = queueLength ? `Queue ${queueLength}` : "Queue";
+    queueButton.title = queueLength
+      ? `${queueLength} prompt${queueLength === 1 ? "" : "s"} waiting`
+      : "Queue this prompt after the current agent turn";
   }
   const stopButton = $("stopAgent");
   if (stopButton) stopButton.disabled = !state.agentBusy;
   const cancelButton = $("cancelAgent");
   if (cancelButton) cancelButton.disabled = !state.agentBusy;
+  applyDashboardLayout({ repaint: false });
   updateAudioUi();
   renderLive();
   renderConversation();
@@ -341,7 +1193,10 @@ function render() {
   renderGoalStrip();
   renderCalibrationOverlay();
   renderBottomTabs();
+  renderPresetsPanel();
   renderPlanTimeline();
+  renderTimelineOverlayMenu();
+  renderTimelineExecutorMenu();
   renderAiProfilePicker();
   renderControlsPopover();
 
@@ -376,6 +1231,169 @@ function renderControlsPopover() {
   popover.hidden = !state.controlsOpen;
 }
 
+function initializeDashboardLayoutControls() {
+  for (const button of document.querySelectorAll("[data-collapse-panel]")) {
+    button.addEventListener("click", () => toggleDashboardPanel(button.getAttribute("data-collapse-panel")));
+  }
+  for (const resizer of document.querySelectorAll("[data-resizer]")) {
+    resizer.addEventListener("pointerdown", (event) => startDashboardResize(event, resizer));
+    resizer.addEventListener("keydown", (event) => nudgeDashboardResizer(event, resizer));
+  }
+  document.addEventListener("pointermove", updateDashboardResize);
+  document.addEventListener("pointerup", endDashboardResize);
+  document.addEventListener("pointercancel", endDashboardResize);
+  applyDashboardLayout();
+}
+
+function toggleDashboardPanel(panel) {
+  if (!(panel in state.layout.collapsed)) return;
+  state.layout.collapsed[panel] = !state.layout.collapsed[panel];
+  saveDashboardLayout();
+  applyDashboardLayout();
+}
+
+function applyDashboardLayout(options = {}) {
+  const main = $("mainLayout");
+  if (!main) return;
+  clampDashboardLayoutToViewport();
+  const collapsed = state.layout.collapsed;
+  main.style.setProperty("--chat-width", `${Math.round(state.layout.chatWidth)}px`);
+  main.style.setProperty("--bottom-height", `${Math.round(state.layout.bottomHeight)}px`);
+  main.style.setProperty("--streamer-width", `${Math.round(state.layout.streamerRatio * 1000) / 10}%`);
+  main.classList.toggle("layout-collapse-streamer", collapsed.streamer);
+  main.classList.toggle("layout-collapse-matrix", collapsed.matrix);
+  main.classList.toggle("layout-collapse-visuals", collapsed.visuals || (collapsed.streamer && collapsed.matrix));
+  main.classList.toggle("layout-collapse-bottom", collapsed.bottom);
+  main.classList.toggle("layout-collapse-chat", collapsed.chat);
+  document.querySelector(".streamer-panel")?.classList.toggle("collapsed", collapsed.streamer);
+  document.querySelector(".matrix-panel")?.classList.toggle("collapsed", collapsed.matrix);
+  document.querySelector(".conversation-panel")?.classList.toggle("collapsed", collapsed.chat);
+  updateDashboardCollapseButtons();
+  if (options.repaint !== false) scheduleDashboardLayoutRender();
+}
+
+function clampDashboardLayoutToViewport() {
+  const main = $("mainLayout");
+  const control = document.querySelector(".control-surface");
+  const visual = document.querySelector(".visual-grid");
+  const mainWidth = main?.getBoundingClientRect().width || window.innerWidth || 1200;
+  const controlHeight = control?.getBoundingClientRect().height || Math.max(360, window.innerHeight - 90);
+  state.layout.chatWidth = clamp(Number(state.layout.chatWidth) || 380, 260, Math.max(280, mainWidth - 430));
+  state.layout.bottomHeight = clamp(Number(state.layout.bottomHeight) || 240, 96, Math.max(118, controlHeight - 150));
+  state.layout.streamerRatio = clamp(Number(state.layout.streamerRatio) || 0.5, 0.18, 0.82);
+  if (visual && visual.getBoundingClientRect().width < 520) {
+    state.layout.streamerRatio = clamp(state.layout.streamerRatio, 0.28, 0.72);
+  }
+}
+
+function updateDashboardCollapseButtons() {
+  const labels = {
+    streamer: "streamer",
+    matrix: "matrix",
+    visuals: "visual panels",
+    bottom: "bottom panels",
+    chat: "conversation",
+  };
+  for (const button of document.querySelectorAll("[data-collapse-panel]")) {
+    const panel = button.getAttribute("data-collapse-panel");
+    if (!(panel in state.layout.collapsed)) continue;
+    const expanded = !state.layout.collapsed[panel];
+    const label = labels[panel] || panel;
+    button.setAttribute("aria-expanded", String(expanded));
+    button.title = `${expanded ? "Fold" : "Unfold"} ${label}`;
+    button.setAttribute("aria-label", button.title);
+  }
+}
+
+function startDashboardResize(event, resizer) {
+  if (event.button !== 0) return;
+  const kind = resizer.getAttribute("data-resizer");
+  if (!canResizeDashboardKind(kind)) return;
+  event.preventDefault();
+  resizer.setPointerCapture?.(event.pointerId);
+  resizer.classList.add("active");
+  state.layout.resizing = {
+    kind,
+    resizer,
+    pointerId: event.pointerId,
+  };
+  document.body.classList.add("resizing-layout");
+  document.body.dataset.resizingAxis = kind === "bottom" ? "y" : "x";
+}
+
+function canResizeDashboardKind(kind) {
+  const collapsed = state.layout.collapsed;
+  if (kind === "chat") return !collapsed.chat;
+  if (kind === "bottom") return !collapsed.bottom && !collapsed.visuals && !(collapsed.streamer && collapsed.matrix);
+  if (kind === "visual") return !collapsed.visuals && !collapsed.streamer && !collapsed.matrix;
+  return false;
+}
+
+function updateDashboardResize(event) {
+  const resizing = state.layout.resizing;
+  if (!resizing) return;
+  if (resizing.kind === "chat") {
+    const rect = $("mainLayout")?.getBoundingClientRect();
+    if (rect) {
+      state.layout.chatWidth = clamp(rect.right - event.clientX, 260, Math.max(280, rect.width - 430));
+    }
+  } else if (resizing.kind === "bottom") {
+    const rect = document.querySelector(".control-surface")?.getBoundingClientRect();
+    if (rect) {
+      state.layout.bottomHeight = clamp(rect.bottom - event.clientY, 96, Math.max(118, rect.height - 150));
+    }
+  } else if (resizing.kind === "visual") {
+    const rect = document.querySelector(".visual-grid")?.getBoundingClientRect();
+    if (rect) {
+      state.layout.streamerRatio = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0.18, 0.82);
+    }
+  }
+  applyDashboardLayout();
+}
+
+function endDashboardResize(event) {
+  const resizing = state.layout.resizing;
+  if (!resizing) return;
+  if (event?.pointerId !== undefined && resizing.pointerId !== undefined && event.pointerId !== resizing.pointerId) return;
+  resizing.resizer?.releasePointerCapture?.(resizing.pointerId);
+  resizing.resizer?.classList.remove("active");
+  state.layout.resizing = null;
+  document.body.classList.remove("resizing-layout");
+  delete document.body.dataset.resizingAxis;
+  saveDashboardLayout();
+  scheduleDashboardLayoutRender();
+}
+
+function nudgeDashboardResizer(event, resizer) {
+  const kind = resizer.getAttribute("data-resizer");
+  const horizontal = kind === "chat" || kind === "visual";
+  const negativeKey = horizontal ? "ArrowLeft" : "ArrowUp";
+  const positiveKey = horizontal ? "ArrowRight" : "ArrowDown";
+  if (event.key !== negativeKey && event.key !== positiveKey) return;
+  if (!canResizeDashboardKind(kind)) return;
+  event.preventDefault();
+  const step = event.shiftKey ? 36 : 12;
+  const direction = event.key === positiveKey ? 1 : -1;
+  if (kind === "chat") state.layout.chatWidth -= direction * step;
+  if (kind === "bottom") state.layout.bottomHeight -= direction * step;
+  if (kind === "visual") state.layout.streamerRatio += direction * 0.025;
+  applyDashboardLayout();
+  saveDashboardLayout();
+}
+
+function scheduleDashboardLayoutRender() {
+  if (state.layout.renderQueued) return;
+  state.layout.renderQueued = true;
+  requestAnimationFrame(() => {
+    state.layout.renderQueued = false;
+    renderLiveOnly();
+    refreshStreamerViewForLayout();
+    renderTemperatureChart();
+    renderTokenAnalytics();
+    renderPresetsPanel();
+  });
+}
+
 function setText(id, text) {
   const node = $(id);
   if (node) node.textContent = text;
@@ -385,7 +1403,17 @@ function renderConversation() {
   const list = $("conversation");
   if (!list) return;
   const events = conversationRenderItems();
-  const renderKey = `${state.selectedRunId || state.status?.run_id || ""}::${state.events.length}::${events.map(eventKey).join("||")}::${JSON.stringify(state.conversationFilters)}::${state.typewriterVersion}`;
+  const renderKey = [
+    state.selectedRunId || state.status?.run_id || "",
+    state.events.length,
+    events.length,
+    eventKey(events[0] || {}),
+    eventKey(events[events.length - 1] || {}),
+    state.eventWindow.hasMore ? "more" : "start",
+    state.eventWindow.loading ? "loading" : "idle",
+    JSON.stringify(state.conversationFilters),
+    state.typewriterVersion,
+  ].join("::");
   if (renderKey === state.lastRenderedConversationKey) return;
   if (!state.forceConversationRender && hasTextSelectionInside(list)) return;
   const shouldFollowLatest = state.conversationAtLatest;
@@ -393,6 +1421,9 @@ function renderConversation() {
   state.forceConversationRender = false;
   state.lastRenderedConversationKey = renderKey;
   list.innerHTML = "";
+  if (state.eventWindow.hasMore || state.eventWindow.loading) {
+    list.appendChild(renderConversationHistoryLoader());
+  }
   for (const event of events) {
     const li = document.createElement("li");
     if (event.level) li.classList.add(event.level);
@@ -446,6 +1477,22 @@ function renderConversation() {
   }
   state.conversationAtLatest = isConversationAtLatest();
   updateJumpToBottomButton();
+}
+
+function renderConversationHistoryLoader() {
+  const item = document.createElement("li");
+  item.className = "conversation-load-more";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.disabled = Boolean(state.eventWindow.loading);
+  button.textContent = state.eventWindow.loading ? "Loading previous..." : "Load previous";
+  const loaded = Number(state.eventWindow.loadedEventCount || state.events.length) || state.events.length;
+  const total = Number(state.eventWindow.totalEventCount || 0);
+  const meta = document.createElement("code");
+  meta.textContent = total > loaded ? `${loaded}/${total} events` : `${loaded} events`;
+  button.addEventListener("click", loadOlderConversationEvents);
+  item.append(button, meta);
+  return item;
 }
 
 function conversationEvents() {
@@ -1753,9 +2800,21 @@ function prepareCanvas(canvas) {
     canvas.width = pixelWidth;
     canvas.height = pixelHeight;
   }
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.id === "planTimeline"
+    ? canvas.getContext("2d", { willReadFrequently: true })
+    : canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { ctx, width, height };
+}
+
+function syncMatrixViewerSize() {
+  const canvas = $("matrixScene");
+  const viewer = canvas?.closest(".viewer.matrix");
+  const panel = viewer?.closest(".visual-panel");
+  if (!viewer || !panel || panel.classList.contains("collapsed")) return;
+
+  viewer.style.removeProperty("width");
+  viewer.style.removeProperty("height");
 }
 
 function drawGrid(ctx, width, height) {
@@ -1858,6 +2917,7 @@ function connect() {
     const data = JSON.parse(message.data);
     if (data.type === "status") {
       state.status = data.status;
+      syncSpeechConfig(data.status?.speech);
       if (data.status?.run_id) state.selectedRunId = data.status.run_id;
       state.agentBusy = Boolean(data.status?.agent_busy);
       if (data.status?.calibration?.active) {
@@ -1877,7 +2937,13 @@ function connect() {
       });
     } else if (data.type === "live") {
       state.live = mergeLiveWithMatrixCache(data.live);
-      renderLiveOnly();
+      bootstrapTimelineLiveFromScene(state.live?.scene?.result || state.live?.scene);
+      syncStageMotionWithLive();
+      scheduleLiveOnlyRender();
+    } else if (data.type === "live_frame") {
+      applyLiveFrame(data);
+    } else if (data.type === "stage_motion") {
+      handleStageMotionMessage(data);
     } else if (data.type === "matrix_paint_result") {
       const result = data.result?.result || data.result;
       if (result?.ok === false || result?.error) {
@@ -1930,7 +2996,7 @@ function connect() {
       }
       renderMatrixPanel(state.live || {});
       renderMatrixCommandPanel();
-      renderPlanTimeline();
+      schedulePlanTimelineRender();
     } else if (data.type === "matrix_selection_plan_result") {
       state.matrixCommands.planning = false;
       const result = data.result || {};
@@ -1949,7 +3015,7 @@ function connect() {
       }
       renderMatrixPanel(state.live || {});
       renderMatrixCommandPanel();
-      renderPlanTimeline();
+      schedulePlanTimelineRender();
     } else if (data.type === "matrix_plan_trim_result") {
       const result = data.result || {};
       if (result.ok === false || result.error) {
@@ -1962,13 +3028,15 @@ function connect() {
       } else {
         state.timeline.followLive = true;
         state.timeline.selectedFrame = null;
+        state.timeline.selectedTime = null;
       }
       renderMatrixPanel(state.live || {});
-      renderPlanTimeline();
+      schedulePlanTimelineRender();
     } else if (data.type === "calibration_state") {
       state.calibration.data = data.calibration || null;
       state.calibration.active = Boolean(data.calibration?.active);
       if (data.calibration?.position) state.calibration.localPosition = data.calibration.position;
+      if (data.calibration?.speed_key) state.calibration.speedKey = String(data.calibration.speed_key);
       renderCalibrationOverlay();
     } else if (data.type === "calibration_move_result") {
       state.calibration.movePending = false;
@@ -1984,9 +3052,49 @@ function connect() {
         });
       }
       renderCalibrationOverlay();
+    } else if (data.type === "calibration_jog_result") {
+      const result = data.result?.result || data.result;
+      const actual = result?.actual_position || result?.position || data.position;
+      if (actual) state.calibration.localPosition = actual;
+      renderCalibrationOverlay();
+    } else if (data.type === "presets_state") {
+      applyPresetState(data.presets);
+      renderPresetsPanel();
+    } else if (data.type === "preset_save_result") {
+      const result = data.result || {};
+      const failed = result.ok === false || result.error;
+      state.presets.error = failed ? (result.error || "Preset save failed") : "";
+      if (!failed) applySuccessfulPresetSave(result);
+      state.presets.savingKey = "";
+      state.presets.savingDraftKey = "";
+      state.presets.pendingSave = null;
+      renderPresetsPanel();
+    } else if (data.type === "preset_apply_result") {
+      state.presets.applyingKey = "";
+      const result = data.result || {};
+      const failed = result.ok === false || result.error;
+      state.presets.error = failed ? (result.error || "Preset apply failed") : "";
+      state.presets.lastAppliedKey = failed ? "" : `${result.category || ""}.${result.name || ""}`;
+      renderPresetsPanel();
     } else if (data.type === "runs") {
       state.runs = data.runs || [];
       renderRuns();
+    } else if (data.type === "older_events") {
+      if (data.run_id && data.run_id !== (state.selectedRunId || state.status?.run_id || "")) return;
+      const list = $("conversation");
+      const previousHeight = list?.scrollHeight || 0;
+      const previousTop = list?.scrollTop || 0;
+      prependOlderRunEvents(data.events || [], data.event_window || {});
+      state.forceConversationRender = true;
+      state.conversationAtLatest = false;
+      render();
+      requestAnimationFrame(() => {
+        const conversation = $("conversation");
+        if (!conversation) return;
+        conversation.scrollTop = Math.max(0, conversation.scrollHeight - previousHeight + previousTop);
+        state.conversationAtLatest = isConversationAtLatest();
+        updateJumpToBottomButton();
+      });
     } else if (data.type === "run_naming") {
       if (data.busy) state.namingRuns.add(data.run_id);
       else state.namingRuns.delete(data.run_id);
@@ -1998,11 +3106,15 @@ function connect() {
       render();
     } else if (data.type === "run_loaded") {
       state.status = data.status;
+      syncSpeechConfig(data.status?.speech);
       state.runs = data.runs || [];
       state.selectedRunId = data.status?.run_id || "";
-      state.events = data.events || [];
+      resetTimelineLiveBootstrap();
+      resetTimelineLiveState();
+      resetRunEvents(data.events || [], data.event_window || {});
+      rehydrateStageMotionFromEvents(state.events);
       state.audio.transcribing = audioTranscriptionPending(state.events);
-      state.temperatureSamples = [];
+      applyTemperatureHistory(data.temperature_history);
       state.temperatureHover = null;
       state.typewriter.clear();
       stopTypewriterAnimation();
@@ -2013,8 +3125,15 @@ function connect() {
       render();
     } else if (data.type === "tool_result") {
       $("toolResult").textContent = JSON.stringify(data.result, null, 2);
+      if ((data.result?.error || data.event?.ok === false) && typeof clearPendingMetricEdit === "function") {
+        clearPendingMetricEdit();
+      }
+    } else if (data.type === "artifact_reveal_result") {
+      handleArtifactRevealResult(data.result);
     } else if (data.type === "visualizer_download") {
       handleVisualizerDownload(data);
+    } else if (data.type === "audio_model_load") {
+      handleAudioModelLoad(data);
     } else if (data.type === "audio_transcription") {
       handleAudioTranscription(data);
     } else if (data.type === "agent_result") {
@@ -2030,9 +3149,10 @@ window.addEventListener("DOMContentLoaded", () => {
   for (const tab of document.querySelectorAll(".tab")) {
     tab.onclick = () => setActiveTab(tab.dataset.tab);
   }
-  for (const tab of document.querySelectorAll(".bottom-tab")) {
+  for (const tab of document.querySelectorAll(".bottom-tab[data-bottom-tab]")) {
     tab.onclick = () => setBottomTab(tab.dataset.bottomTab);
   }
+  initializeDashboardLayoutControls();
   const temperatureChart = $("temperatureChart");
   if (temperatureChart) {
     temperatureChart.addEventListener("mousemove", (event) => {
@@ -2087,21 +3207,38 @@ window.addEventListener("DOMContentLoaded", () => {
   }
   const streamerFrame = $("streamerFrame");
   const streamerViewer = streamerFrame?.closest(".viewer.streamer");
+  streamerFrame?.addEventListener("load", () => {
+    applyStreamerView();
+    requestStreamerResolutionUpdate();
+    updateCalibrationOverlayGeometry();
+  });
+  streamerFrame?.addEventListener("error", () => {
+    if (!state.streamerView.directActive) return;
+    state.streamerView.directFailedAt = Date.now();
+    state.streamerView.directActive = false;
+    state.streamerView.directSrc = "";
+    renderFrame("streamer", state.live?.frames?.streamer);
+  });
   if (streamerViewer) {
     streamerViewer.addEventListener("wheel", (event) => {
       event.preventDefault();
       zoomStreamerFrame(event);
     }, { passive: false });
+    streamerViewer.addEventListener("auxclick", (event) => {
+      if (event.button === 1) event.preventDefault();
+    });
     streamerViewer.addEventListener("dblclick", () => {
       resetStreamerView();
       applyStreamerView();
       requestStreamerResolutionUpdate();
     });
     streamerViewer.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 && event.button !== 1) return;
+      event.preventDefault();
       streamerViewer.setPointerCapture?.(event.pointerId);
       state.streamerView.dragging = true;
       state.streamerView.moved = false;
+      state.streamerView.dragButton = event.button;
       state.streamerView.dragStartX = event.clientX;
       state.streamerView.dragStartY = event.clientY;
       state.streamerView.dragPanX = state.streamerView.panX;
@@ -2119,10 +3256,12 @@ window.addEventListener("DOMContentLoaded", () => {
       applyStreamerView();
     });
     streamerViewer.addEventListener("pointerup", (event) => {
-      if (event.button !== 0) return;
+      if (event.button !== state.streamerView.dragButton) return;
+      event.preventDefault();
       streamerViewer.releasePointerCapture?.(event.pointerId);
       const wasDragging = state.streamerView.dragging;
       state.streamerView.dragging = false;
+      state.streamerView.dragButton = null;
       streamerViewer.classList.remove("dragging");
       if (wasDragging) saveStreamerView();
     });
@@ -2130,6 +3269,7 @@ window.addEventListener("DOMContentLoaded", () => {
       const wasDragging = state.streamerView.dragging;
       state.streamerView.dragging = false;
       state.streamerView.moved = false;
+      state.streamerView.dragButton = null;
       streamerViewer.classList.remove("dragging");
       if (wasDragging) saveStreamerView();
     });
@@ -2137,10 +3277,13 @@ window.addEventListener("DOMContentLoaded", () => {
       const wasDragging = state.streamerView.dragging;
       state.streamerView.dragging = false;
       state.streamerView.moved = false;
+      state.streamerView.dragButton = null;
       streamerViewer.classList.remove("dragging");
       if (wasDragging) saveStreamerView();
     });
   }
+  $("calibrationStreamerFrame")?.addEventListener("load", updateCalibrationOverlayGeometry);
+  window.addEventListener("resize", updateCalibrationOverlayGeometry);
   const matrixScene = $("matrixScene");
   if (matrixScene) {
     matrixScene.addEventListener("wheel", (event) => {
@@ -2153,17 +3296,23 @@ window.addEventListener("DOMContentLoaded", () => {
       renderMatrixPanel(state.live || {});
     });
     matrixScene.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 && event.button !== 1) return;
       hideMatrixContextMenu();
       stopMatrixEdgePan();
+      if (event.button === 1 || event.ctrlKey) {
+        startMatrixManualPan(event);
+        return;
+      }
       if (activeMatrixPaintValue() !== null) {
-        const electrode = matrixElectrodeFromPointerEvent(event);
-        if (!electrode) return;
+        const pointer = matrixPointerInfoFromEvent(event, { clampToGrid: true });
+        if (!pointer) return;
         event.preventDefault();
         matrixScene.setPointerCapture?.(event.pointerId);
         state.matrixPaint.dragging = true;
-        state.matrixPaint.start = electrode;
-        state.matrixPaint.current = electrode;
+        state.matrixPaint.start = pointer.electrode;
+        state.matrixPaint.current = pointer.electrode;
+        state.matrixPaint.startDisplay = pointer.display;
+        state.matrixPaint.currentDisplay = pointer.display;
         matrixScene.classList.add("dragging");
         renderMatrixPanel(state.live || {});
         return;
@@ -2172,24 +3321,25 @@ window.addEventListener("DOMContentLoaded", () => {
     });
     matrixScene.addEventListener("pointermove", (event) => {
       const rect = matrixScene.getBoundingClientRect();
-      state.matrixHover = {
-        x: event.clientX - rect.left,
-        y: event.clientY - rect.top,
-      };
+      const pointer = matrixPointerInfoFromEvent(event, { clampToGrid: true, magnetic: true, rect });
+      state.matrixHover = pointer?.hover || null;
       updateMatrixEdgePan(event, rect);
+      if (state.matrixView.dragging) {
+        updateMatrixManualPan(event);
+        updateMatrixHover(state.matrixHover);
+        updateMatrixCursorHud(state.matrixHover);
+        updateMatrixPaintCursor(state.matrixHover);
+        return;
+      }
       if (state.matrixPaint.dragging) {
-        const electrode = matrixElectrodeFromPointerEvent(event);
-        if (electrode) {
-          state.matrixPaint.current = electrode;
-          renderMatrixPanel(state.live || {});
-        }
+        updateMatrixPaintDragFromPointer(pointer);
         updateMatrixHover(state.matrixHover);
         updateMatrixCursorHud(state.matrixHover);
         updateMatrixPaintCursor(state.matrixHover);
         return;
       }
       if (state.matrixSelection.dragging) {
-        updateMatrixSelectionDrag(event);
+        updateMatrixSelectionDrag(pointer);
         updateMatrixHover(state.matrixHover);
         updateMatrixCursorHud(state.matrixHover);
         updateMatrixPaintCursor(state.matrixHover);
@@ -2201,15 +3351,24 @@ window.addEventListener("DOMContentLoaded", () => {
       updateMatrixPaintCursor(state.matrixHover);
     });
     matrixScene.addEventListener("pointerup", (event) => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 && event.button !== 1) return;
+      if (event.button === 1) event.preventDefault();
       matrixScene.releasePointerCapture?.(event.pointerId);
+      if (state.matrixView.dragging) {
+        endMatrixManualPan();
+        matrixScene.classList.remove("dragging");
+        return;
+      }
       if (state.matrixPaint.dragging) {
+        updateMatrixPaintDragFromPointer(matrixPointerInfoFromEvent(event, { clampToGrid: true }));
         endMatrixPaintDrag();
+        stopMatrixEdgePan();
         matrixScene.classList.remove("dragging");
         return;
       }
       if (state.matrixSelection.dragging) {
         endMatrixSelectionDrag(event);
+        stopMatrixEdgePan();
         matrixScene.classList.remove("dragging");
         return;
       }
@@ -2219,11 +3378,18 @@ window.addEventListener("DOMContentLoaded", () => {
     matrixScene.addEventListener("pointercancel", () => {
       if (state.matrixPaint.dragging) {
         cancelMatrixPaintDrag();
+        stopMatrixEdgePan();
         matrixScene.classList.remove("dragging");
         return;
       }
       if (state.matrixSelection.dragging) {
         cancelMatrixSelectionDrag();
+        stopMatrixEdgePan();
+        matrixScene.classList.remove("dragging");
+        return;
+      }
+      if (state.matrixView.dragging) {
+        cancelMatrixManualPan();
         matrixScene.classList.remove("dragging");
         return;
       }
@@ -2232,19 +3398,11 @@ window.addEventListener("DOMContentLoaded", () => {
       matrixScene.classList.remove("dragging");
     });
     matrixScene.addEventListener("mouseleave", () => {
+      if (state.matrixPaint.dragging || state.matrixSelection.dragging) return;
       state.matrixHover = null;
       state.matrixMovePreview.hover = null;
       stopMatrixEdgePan();
-      if (state.matrixPaint.dragging) {
-        cancelMatrixPaintDrag();
-        matrixScene.classList.remove("dragging");
-      }
-      if (state.matrixSelection.dragging) {
-        cancelMatrixSelectionDrag();
-        matrixScene.classList.remove("dragging");
-      }
-      state.matrixView.dragging = false;
-      state.matrixView.moved = false;
+      if (state.matrixView.dragging) cancelMatrixManualPan();
       matrixScene.classList.remove("dragging");
       updateMatrixHover(null);
       updateMatrixCursorHud(null);
@@ -2255,6 +3413,9 @@ window.addEventListener("DOMContentLoaded", () => {
       if (activeMatrixPaintValue() !== null) return;
       if (queueMatrixWaypointFromContext(event)) return;
       openMatrixContextMenu(event);
+    });
+    matrixScene.addEventListener("auxclick", (event) => {
+      if (event.button === 1) event.preventDefault();
     });
   }
   const matrixMinimap = $("matrixMinimap");
@@ -2306,7 +3467,7 @@ window.addEventListener("DOMContentLoaded", () => {
       renderMatrixPaintPanel();
       updateMatrixPaintCursor(state.matrixHover);
       renderMatrixPanel(state.live || {});
-      renderPlanTimeline();
+      schedulePlanTimelineRender();
     });
   }
   const planTimeline = $("planTimeline");
@@ -2317,9 +3478,10 @@ window.addEventListener("DOMContentLoaded", () => {
       if (!count) return;
       event.preventDefault();
       if (event.shiftKey || Math.abs(event.deltaX) > Math.abs(event.deltaY)) {
-        const visible = timelineVisibleFrames(count);
-        const delta = (event.deltaX || event.deltaY) / Math.max(24, planTimeline.clientWidth || 1);
-        panTimelineFrames(delta * visible);
+        const rect = planTimeline.getBoundingClientRect();
+        const layout = timelineLayout(rect.width || planTimeline.clientWidth || 1, rect.height || planTimeline.clientHeight || 1, count, scene);
+        const delta = (event.deltaX || event.deltaY) / Math.max(24, layout.trackWidth || planTimeline.clientWidth || 1);
+        panTimelineTime(delta * layout.visibleTimeRange.duration);
       } else {
         zoomTimelineAtEvent(event);
       }
@@ -2328,47 +3490,75 @@ window.addEventListener("DOMContentLoaded", () => {
       if (state.matrixCommands.planning) return;
       planTimeline.setPointerCapture?.(event.pointerId);
       state.timeline.dragging = true;
+      state.timeline.moved = false;
+      state.timeline.dragStartX = event.clientX;
+      state.timeline.dragStartY = event.clientY;
       if (event.shiftKey) {
         state.timeline.dragMode = "pan";
-        state.timeline.dragStartX = event.clientX;
         state.timeline.dragStartOffsetFrame = Number(state.timeline.offsetFrame) || 0;
+        state.timeline.dragStartOffsetTime = Number(state.timeline.timeOffset) || 0;
         planTimeline.classList.add("panning");
+      } else if (timelinePhotoOverlayFromPointerEvent(event)) {
+        state.timeline.dragMode = "photo-marker";
       } else {
         state.timeline.dragMode = "scrub";
         selectTimelineFrameFromEvent(event);
       }
     });
     planTimeline.addEventListener("pointermove", (event) => {
-      updateTimelineHoverFromEvent(event);
+      scheduleTimelineHoverFromEvent(event);
       if (!state.timeline.dragging) return;
+      if (Math.hypot(event.clientX - state.timeline.dragStartX, event.clientY - state.timeline.dragStartY) >= 4) {
+        state.timeline.moved = true;
+      }
       if (state.timeline.dragMode === "pan") {
         dragPanTimeline(event);
+      } else if (state.timeline.dragMode === "photo-marker") {
+        return;
       } else {
         selectTimelineFrameFromEvent(event);
       }
     });
     planTimeline.addEventListener("pointerup", (event) => {
       planTimeline.releasePointerCapture?.(event.pointerId);
+      const canOpenMarker = !state.timeline.moved && state.timeline.dragMode === "photo-marker";
       state.timeline.dragging = false;
       state.timeline.dragMode = "";
       planTimeline.classList.remove("panning");
+      if (canOpenMarker) handleTimelineMarkerClick(event);
     });
     planTimeline.addEventListener("pointercancel", () => {
       state.timeline.dragging = false;
+      state.timeline.moved = false;
       state.timeline.dragMode = "";
+      state.timeline.hoverTime = null;
       state.timeline.hoverEvent = null;
+      state.timeline.hoverOverlay = null;
+      cancelScheduledTimelineHover();
       planTimeline.classList.remove("panning");
       updateTimelineHover(null);
+      if (!renderTimelineHoverCursorFast()) schedulePlanTimelineRender();
     });
     planTimeline.addEventListener("mouseleave", () => {
       state.timeline.hoverFrame = null;
+      state.timeline.hoverTime = null;
       state.timeline.hoverEvent = null;
+      state.timeline.hoverOverlay = null;
+      cancelScheduledTimelineHover();
       state.timeline.dragging = false;
+      state.timeline.moved = false;
       state.timeline.dragMode = "";
       planTimeline.classList.remove("panning");
       updateTimelineHover(null);
-      renderPlanTimeline();
+      if (!renderTimelineHoverCursorFast()) schedulePlanTimelineRender();
     });
+  }
+  const timelineRangeTrack = $("timelineRangeTrack");
+  if (timelineRangeTrack) {
+    timelineRangeTrack.addEventListener("pointerdown", startTimelineRangeDrag);
+    document.addEventListener("pointermove", updateTimelineRangeDrag);
+    document.addEventListener("pointerup", endTimelineRangeDrag);
+    document.addEventListener("pointercancel", endTimelineRangeDrag);
   }
   $("startMcp").onclick = () => send({ type: "start_mcp" });
   $("stopMcp").onclick = () => send({ type: "stop_mcp" });
@@ -2377,14 +3567,19 @@ window.addEventListener("DOMContentLoaded", () => {
   $("calibrationClose").onclick = () => closeCalibrationOverlay();
   $("calibrationAccept").onclick = () => acceptCalibrationStep();
   $("calibrationSave").onclick = () => send({ type: "calibration_save" });
-  $("calibrationMoveTarget").onclick = () => send({ type: "calibration_move_to_target" });
-  for (const button of document.querySelectorAll("[data-calibration-step]")) {
+  $("calibrationMoveTarget").onclick = () => {
+    stopAllCalibrationJogs();
+    send({ type: "calibration_move_to_target" });
+  };
+  for (const button of document.querySelectorAll("[data-calibration-speed]")) {
     button.addEventListener("click", () => {
-      state.calibration.jogStep = Number(button.getAttribute("data-calibration-step")) || 100;
+      setCalibrationSpeed(String(button.getAttribute("data-calibration-speed") || "2"));
       renderCalibrationOverlay();
     });
   }
   document.addEventListener("keydown", handleCalibrationKeydown);
+  document.addEventListener("keyup", handleCalibrationKeyup);
+  window.addEventListener("blur", () => stopAllCalibrationJogs());
   document.addEventListener("keydown", handleSelectedDropletKeydown);
   $("downloadStreamer").onclick = () => downloadVisualizerFrame("streamer");
   $("downloadMatrix").onclick = () => downloadVisualizerFrame("matrix");
@@ -2392,13 +3587,40 @@ window.addEventListener("DOMContentLoaded", () => {
     state.matrixPaths.collapsed = !state.matrixPaths.collapsed;
     renderMatrixPathPanel(matrixSceneForTimeline(state.live?.scene?.result || state.live?.scene));
   };
+  $("matrixLiveBadge").onclick = () => followLiveTimeline();
   $("timelineLive").onclick = () => followLiveTimeline();
-  $("timelineZoomIn").onclick = () => zoomTimelineButton(1.4);
-  $("timelineZoomOut").onclick = () => zoomTimelineButton(1 / 1.4);
+  const timelineZoomIn = $("timelineZoomIn");
+  const timelineZoomOut = $("timelineZoomOut");
+  if (timelineZoomIn) timelineZoomIn.onclick = () => zoomTimelineButton(1.4);
+  if (timelineZoomOut) timelineZoomOut.onclick = () => zoomTimelineButton(1 / 1.4);
   $("timelineTrimTail").onclick = () => trimTimelineTailAfterSelectedFrame();
   $("timelinePlay").onclick = () => playTimelineExecution();
   $("timelinePause").onclick = () => callTimelineExecutionTool("pause_plan", {});
   $("timelineRewind").onclick = () => rewindTimelineExecution();
+  $("timelineStopToggle").onclick = () => toggleLogicalTimeline();
+  $("timelineOverlayToggle").onclick = () => {
+    state.timeline.overlayMenuOpen = !state.timeline.overlayMenuOpen;
+    if (state.timeline.overlayMenuOpen) state.timeline.executorMenuOpen = false;
+    renderTimelineOverlayMenu();
+    renderTimelineExecutorMenu();
+  };
+  $("timelineExecutorToggle").onclick = () => {
+    state.timeline.executorMenuOpen = !state.timeline.executorMenuOpen;
+    if (state.timeline.executorMenuOpen) state.timeline.overlayMenuOpen = false;
+    renderTimelineExecutorMenu();
+    renderTimelineOverlayMenu();
+  };
+  for (const input of document.querySelectorAll("[data-timeline-overlay]")) {
+    input.addEventListener("change", () => {
+      const key = input.getAttribute("data-timeline-overlay");
+      if (!key || !(key in state.timeline.overlays)) return;
+      state.timeline.overlays[key] = Boolean(input.checked);
+      renderTimelineOverlayMenu();
+      schedulePlanTimelineRender();
+    });
+  }
+  $("refreshPresets").onclick = () => requestPresets();
+  $("addPreset").onclick = () => addPresetDraft();
   const frameDelayInput = $("timelineFrameDelay");
   if (frameDelayInput) {
     frameDelayInput.addEventListener("change", () => commitTimelineFrameDelay());
@@ -2429,6 +3651,22 @@ window.addEventListener("DOMContentLoaded", () => {
       state.controlsOpen = false;
       renderControlsPopover();
     }
+    if (
+      state.timeline.overlayMenuOpen
+      && !event.target.closest?.("#timelineOverlayMenu")
+      && !event.target.closest?.("#timelineOverlayToggle")
+    ) {
+      state.timeline.overlayMenuOpen = false;
+      renderTimelineOverlayMenu();
+    }
+    if (
+      state.timeline.executorMenuOpen
+      && !event.target.closest?.("#timelineExecutorMenu")
+      && !event.target.closest?.("#timelineExecutorToggle")
+    ) {
+      state.timeline.executorMenuOpen = false;
+      renderTimelineExecutorMenu();
+    }
     if (!state.runsOpen) return;
     const drawer = $("runsDrawer");
     const button = $("runsBtn");
@@ -2442,7 +3680,7 @@ window.addEventListener("DOMContentLoaded", () => {
     renderRuns();
   };
   $("refreshRuns").onclick = () => send({ type: "list_runs" });
-  $("newRun").onclick = () => send({ type: "new_run" });
+  $("newRun").onclick = () => createAndJoinNewRun();
   $("selectAllRuns").onclick = () => toggleSelectAllRuns();
   $("deleteSelectedRuns").onclick = () => deleteSelectedRuns();
   $("copyOutput").onclick = () => copyLastOutput();
@@ -2451,7 +3689,9 @@ window.addEventListener("DOMContentLoaded", () => {
   $("clearGoal").onclick = () => clearGoal();
   $("stopAgent").onclick = () => stopAgent();
   $("cancelAgent").onclick = () => stopAgent();
+  $("loadAudio").onclick = () => loadAudioModel();
   $("audioInput").onclick = () => toggleAudioInput();
+  $("wakeInput").onclick = () => toggleWakeListening();
   $("jumpToBottom").onclick = () => jumpConversationToLatest();
   $("conversation").addEventListener("scroll", () => {
     state.conversationAtLatest = isConversationAtLatest();
@@ -2484,6 +3724,7 @@ window.addEventListener("DOMContentLoaded", () => {
     send({ type: "mcp_tool", tool: $("toolName").value.trim(), arguments: args });
   };
   $("askAgent").onclick = () => sendAgentPrompt();
+  $("queueAgent").onclick = () => queueAgentPrompt();
   $("agentPrompt").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -2491,7 +3732,12 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
   $("clearLocal").onclick = () => {
-    state.events = [];
+    resetRunEvents([], {
+      has_more: false,
+      loaded_event_count: 0,
+      total_event_count: 0,
+      oldest_t: null,
+    });
     state.typewriter.clear();
     stopTypewriterAnimation();
     render();
@@ -2501,9 +3747,18 @@ window.addEventListener("DOMContentLoaded", () => {
   renderFilters();
 });
 
+document.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented) return;
+  if (!event.ctrlKey || !event.altKey || event.shiftKey || event.metaKey) return;
+  if (String(event.key || "").toLowerCase() !== "n") return;
+  event.preventDefault();
+  createAndJoinNewRun();
+});
+
 window.addEventListener("resize", () => {
   state.live = mergeLiveWithMatrixCache(state.live || {});
   renderMatrixPanel(state.live || {});
+  refreshStreamerViewForLayout();
   renderTemperatureChart();
   renderTokenAnalytics();
 });
@@ -2533,34 +3788,112 @@ function sendAgentPrompt() {
   input.value = "";
 }
 
+function queueAgentPrompt() {
+  const input = $("agentPrompt");
+  const prompt = input.value.trim();
+  if (!prompt) return;
+  send({
+    type: "queue_agent",
+    prompt,
+    run_id: state.selectedRunId || state.status?.run_id || "",
+  });
+  input.value = "";
+}
+
+function createAndJoinNewRun() {
+  try {
+    state.runsOpen = false;
+    resetTimelineLiveBootstrap();
+    resetTimelineLiveState();
+    renderRuns();
+    send({ type: "new_run" });
+  } catch (error) {
+    appendEvent({
+      ts: new Date().toISOString(),
+      type: "ui_error",
+      level: "warning",
+      message: error?.message || String(error),
+    });
+  }
+}
+
 function stopAgent() {
   if (!state.agentBusy) return;
   send({ type: "cancel_agent" });
+}
+
+function audioModelReady() {
+  return state.status?.speech?.enabled !== false && (!state.audio.modelLoadSupported || state.audio.modelLoaded === true);
+}
+
+function loadAudioModel() {
+  if (state.audio.modelLoaded) {
+    setAudioStatus("Audio ready");
+    return;
+  }
+  if (state.audio.modelLoading) return;
+  try {
+    state.audio.modelLoading = true;
+    setAudioStatus("Loading audio model");
+    updateAudioUi();
+    send({ type: "load_audio_model" });
+  } catch (error) {
+    state.audio.modelLoading = false;
+    setAudioStatus(`Audio load error: ${error.message || error}`, true);
+    updateAudioUi();
+  }
 }
 
 async function toggleAudioInput() {
   if (state.audio.transcribing) return;
   if (state.audio.recording) {
     stopAudioRecording();
+  } else if (!audioModelReady()) {
+    setAudioStatus(state.audio.modelLoading ? "Audio model is loading" : "Click Load Audio first", true);
+    updateAudioUi();
   } else {
-    await startAudioRecording();
+    await startAudioRecording({ source: "manual" });
   }
 }
 
-async function startAudioRecording() {
+async function startAudioRecording(options = {}) {
+  if (!audioModelReady()) {
+    setAudioStatus(state.audio.modelLoading ? "Audio model is loading" : "Click Load Audio first", true);
+    updateAudioUi();
+    return;
+  }
   if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
     setAudioStatus("Audio capture is not available in this browser.", true);
     return;
   }
+  if (state.audio.recording || state.audio.transcribing) return;
+  stopWakeRecognizer({ keepEnabled: true });
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     const mimeType = pickAudioMimeType();
     const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    const source = String(options.source || "manual");
     state.audio.stream = stream;
     state.audio.recorder = recorder;
     state.audio.chunks = [];
     state.audio.mimeType = recorder.mimeType || mimeType || "audio/webm";
     state.audio.startedAt = Date.now();
+    state.audio.recordingSource = source;
+    state.audio.autoRecording = Boolean(options.auto);
+    state.audio.autoHadVoice = false;
+    state.audio.autoLastVoiceAt = 0;
+    state.audio.autoSilenceStartedAt = 0;
+    state.audio.autoStopping = false;
+    state.audio.lastRms = 0;
+    state.audio.commandRecognitionEnabled = false;
+    state.audio.commandRecognitionFailed = false;
+    state.audio.commandSpeechHadWords = false;
+    state.audio.commandSpeechLastAt = 0;
+    state.audio.commandSpeechActive = false;
+    state.audio.commandSpeechEventSeen = false;
+    state.audio.commandLastTranscriptKey = "";
+    state.audio.commandLastTranscriptAt = 0;
+    state.audio.commandSpeechLastReason = "";
     setupAudioMeter(stream);
     recorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) state.audio.chunks.push(event.data);
@@ -2568,16 +3901,26 @@ async function startAudioRecording() {
     recorder.onstop = () => submitAudioRecording();
     recorder.start();
     state.audio.recording = true;
-    setAudioStatus("Recording");
+    if (state.audio.autoRecording) {
+      startCommandSpeechRecognizer();
+      startAutoRecordingTimer();
+    }
+    setAudioStatus(state.audio.autoRecording ? "Command listening" : "Recording");
     updateAudioUi();
   } catch (error) {
     cleanupAudioStream();
+    state.audio.recording = false;
+    state.audio.autoRecording = false;
     setAudioStatus(`Microphone error: ${error.message || error}`, true);
     updateAudioUi();
+    scheduleWakeRestart();
   }
 }
 
 function stopAudioRecording() {
+  state.audio.autoStopping = true;
+  stopAutoRecordingTimer();
+  stopCommandSpeechRecognizer({ reset: false });
   const recorder = state.audio.recorder;
   if (recorder && recorder.state !== "inactive") {
     recorder.stop();
@@ -2590,11 +3933,31 @@ async function submitAudioRecording() {
   const chunks = state.audio.chunks.slice();
   state.audio.chunks = [];
   const mimeType = state.audio.mimeType || "audio/webm";
+  const durationMs = Date.now() - state.audio.startedAt;
+  const source = state.audio.recordingSource || "manual";
+  const autoSubmit = state.audio.autoRecording && source === "wake_word" && state.audio.wakeAutoSubmit;
+  state.audio.pendingSource = source;
+  state.audio.pendingAutoSubmit = autoSubmit;
+  stopAutoRecordingTimer();
+  stopCommandSpeechRecognizer({ reset: true });
   cleanupAudioStream();
   state.audio.recording = false;
+  state.audio.autoRecording = false;
+  state.audio.autoHadVoice = false;
+  state.audio.autoLastVoiceAt = 0;
+  state.audio.autoSilenceStartedAt = 0;
+  state.audio.lastRms = 0;
+  state.audio.commandSpeechActive = false;
+  state.audio.commandSpeechEventSeen = false;
+  state.audio.commandLastTranscriptKey = "";
+  state.audio.commandLastTranscriptAt = 0;
+  state.audio.commandSpeechLastReason = "";
+  state.audio.autoStopping = false;
+  state.audio.recordingSource = "manual";
   if (!chunks.length) {
     setAudioStatus("No audio captured.", true);
     updateAudioUi();
+    scheduleWakeRestart();
     return;
   }
   state.audio.transcribing = true;
@@ -2607,17 +3970,22 @@ async function submitAudioRecording() {
       type: "transcribe_audio",
       audio_base64: audioBase64,
       mime_type: mimeType,
-      duration_ms: Date.now() - state.audio.startedAt,
+      duration_ms: durationMs,
+      source,
       run_id: state.selectedRunId || state.status?.run_id || "",
     });
   } catch (error) {
     state.audio.transcribing = false;
+    state.audio.pendingSource = "";
+    state.audio.pendingAutoSubmit = false;
     setAudioStatus(`Audio send error: ${error.message || error}`, true);
     updateAudioUi();
+    scheduleWakeRestart();
   }
 }
 
 function cleanupAudioStream() {
+  stopAutoRecordingTimer();
   stopAudioMeter();
   if (state.audio.stream) {
     for (const track of state.audio.stream.getTracks()) track.stop();
@@ -2636,6 +4004,356 @@ function pickAudioMimeType() {
   return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate)) || "";
 }
 
+function wakeRecognitionClass() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
+function wakePhrases() {
+  const configured = String(state.audio.wakePhrase || "BoxMini")
+    .split(/[,\n|]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return configured.length ? configured : ["BoxMini"];
+}
+
+function normalizeWakeText(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+async function toggleWakeListening() {
+  if (state.audio.wakeListening) {
+    stopWakeListening();
+  } else {
+    await startWakeListening();
+  }
+}
+
+async function startWakeListening(options = {}) {
+  if (state.status?.speech?.enabled === false || state.status?.speech?.wake_enabled === false) {
+    if (!options.automatic) setAudioStatus("Wake word is disabled in speech config.", true);
+    return;
+  }
+  if (!audioModelReady()) {
+    if (!options.automatic) setAudioStatus(state.audio.modelLoading ? "Audio model is loading" : "Click Load Audio first", true);
+    updateAudioUi();
+    return;
+  }
+  const Recognition = wakeRecognitionClass();
+  state.audio.wakeSupported = Boolean(Recognition);
+  if (!Recognition) {
+    if (!options.automatic) setAudioStatus("Wake word is not supported by this browser.", true);
+    updateAudioUi();
+    return;
+  }
+  state.audio.wakeListening = true;
+  state.audio.wakeManualStart = !options.automatic;
+  clearWakeRestart();
+  const started = startWakeRecognizer();
+  if (started) {
+    setAudioStatus(`Wake ready: say "${wakePhrases()[0]}"`);
+  } else if (!options.automatic) {
+    setAudioStatus("Wake word could not start. Check microphone permission.", true);
+  }
+  updateAudioUi();
+}
+
+function stopWakeListening() {
+  state.audio.wakeListening = false;
+  clearWakeRestart();
+  stopWakeRecognizer({ keepEnabled: false });
+  setAudioStatus("");
+  updateAudioUi();
+}
+
+function startWakeRecognizer() {
+  if (!state.audio.wakeListening || state.audio.recording || state.audio.transcribing) return false;
+  const Recognition = wakeRecognitionClass();
+  if (!Recognition) return false;
+  stopWakeRecognizer({ keepEnabled: true });
+  const recognizer = new Recognition();
+  recognizer.continuous = true;
+  recognizer.interimResults = true;
+  recognizer.maxAlternatives = 3;
+  if (state.audio.wakeLanguage) recognizer.lang = state.audio.wakeLanguage;
+  recognizer.onstart = () => {
+    state.audio.wakeActive = true;
+    setAudioStatus(`Wake ready: say "${wakePhrases()[0]}"`);
+    updateAudioUi();
+  };
+  recognizer.onresult = (event) => {
+    for (let index = event.resultIndex; index < event.results.length; index += 1) {
+      const result = event.results[index];
+      const alternatives = Array.from(result || []);
+      for (const alternative of alternatives) {
+        if (wakeTranscriptMatches(alternative?.transcript)) {
+          handleWakePhrase();
+          return;
+        }
+      }
+    }
+  };
+  recognizer.onerror = (event) => {
+    state.audio.wakeActive = false;
+    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+      state.audio.wakeListening = false;
+      setAudioStatus("Microphone permission is needed for wake word.", true);
+      updateAudioUi();
+      return;
+    }
+    if (state.audio.wakeListening) scheduleWakeRestart();
+  };
+  recognizer.onend = () => {
+    state.audio.wakeActive = false;
+    if (state.audio.wakeListening) scheduleWakeRestart();
+    updateAudioUi();
+  };
+  state.audio.wakeRecognizer = recognizer;
+  try {
+    recognizer.start();
+    return true;
+  } catch (error) {
+    state.audio.wakeRecognizer = null;
+    state.audio.wakeActive = false;
+    if (state.audio.wakeManualStart && state.audio.wakeListening) {
+      scheduleWakeRestart();
+    } else {
+      state.audio.wakeListening = false;
+      updateAudioUi();
+    }
+    return false;
+  }
+}
+
+function wakeTranscriptMatches(transcript) {
+  const normalized = normalizeWakeText(transcript);
+  if (!normalized) return false;
+  return wakePhrases().some((phrase) => {
+    const target = normalizeWakeText(phrase);
+    return target && normalized.includes(target);
+  });
+}
+
+function handleWakePhrase() {
+  if (!state.audio.wakeListening || state.audio.recording || state.audio.transcribing) return;
+  stopWakeRecognizer({ keepEnabled: true });
+  setAudioStatus("Wake heard. Speak command.");
+  startAudioRecording({ auto: true, source: "wake_word" });
+}
+
+function commandTranscriptHasWords(transcript) {
+  return /[\p{L}\p{N}]/u.test(String(transcript || ""));
+}
+
+function commandTranscriptKey(transcript) {
+  return String(transcript || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function commandTranscriptWordCount(key) {
+  if (!key) return 0;
+  return key.split(/\s+/).filter((word) => /[\p{L}\p{N}]/u.test(word)).length;
+}
+
+function markCommandSpeechActivity(reason = "speech") {
+  const now = Date.now();
+  state.audio.commandSpeechHadWords = true;
+  state.audio.commandSpeechLastAt = now;
+  state.audio.autoHadVoice = true;
+  state.audio.autoLastVoiceAt = now;
+  state.audio.autoSilenceStartedAt = 0;
+  state.audio.commandSpeechLastReason = reason;
+}
+
+function acceptCommandTranscriptActivity(result, transcript) {
+  const key = commandTranscriptKey(transcript);
+  if (!commandTranscriptHasWords(key)) return false;
+  const now = Date.now();
+  const confidence = Number(result?.[0]?.confidence);
+  const isFinal = Boolean(result?.isFinal);
+  const wordCount = commandTranscriptWordCount(key);
+  const changed = key !== state.audio.commandLastTranscriptKey;
+  const grew = changed && (
+    !state.audio.commandLastTranscriptKey
+    || key.length >= state.audio.commandLastTranscriptKey.length + 3
+    || wordCount > commandTranscriptWordCount(state.audio.commandLastTranscriptKey)
+  );
+  const highConfidence = Number.isFinite(confidence) && confidence >= 0.55;
+  const usefulInterim = grew && (
+    state.audio.commandSpeechEventSeen
+      ? (wordCount >= 3 && key.length >= 12)
+      : wordCount >= 2
+  );
+  if (!isFinal && !highConfidence && !usefulInterim) return false;
+  if (!changed && now - (state.audio.commandLastTranscriptAt || 0) < 1200) return false;
+  state.audio.commandLastTranscriptKey = key;
+  state.audio.commandLastTranscriptAt = now;
+  markCommandSpeechActivity(isFinal ? "final_text" : highConfidence ? "confident_text" : "interim_text");
+  return true;
+}
+
+function startCommandSpeechRecognizer() {
+  const Recognition = wakeRecognitionClass();
+  state.audio.commandRecognitionEnabled = Boolean(Recognition);
+  state.audio.commandRecognitionFailed = !Recognition;
+  state.audio.commandRecognitionActive = false;
+  clearCommandSpeechRestart();
+  if (!Recognition || !state.audio.autoRecording || !state.audio.recording) return false;
+
+  stopCommandSpeechRecognizer({ reset: false });
+  state.audio.commandRecognitionEnabled = true;
+  state.audio.commandRecognitionFailed = false;
+  const recognizer = new Recognition();
+  recognizer.continuous = true;
+  recognizer.interimResults = true;
+  recognizer.maxAlternatives = 1;
+  if (state.audio.wakeLanguage) recognizer.lang = state.audio.wakeLanguage;
+  recognizer.onstart = () => {
+    state.audio.commandRecognitionActive = true;
+  };
+  recognizer.onspeechstart = () => {
+    state.audio.commandSpeechEventSeen = true;
+    state.audio.commandSpeechActive = true;
+    markCommandSpeechActivity("speech_start");
+  };
+  recognizer.onspeechend = () => {
+    state.audio.commandSpeechEventSeen = true;
+    state.audio.commandSpeechActive = false;
+    markCommandSpeechActivity("speech_end");
+  };
+  recognizer.onresult = (event) => {
+    for (let index = event.resultIndex; index < event.results.length; index += 1) {
+      const result = event.results[index];
+      const transcript = result?.[0]?.transcript || "";
+      acceptCommandTranscriptActivity(result, transcript);
+    }
+  };
+  recognizer.onerror = (event) => {
+    state.audio.commandRecognitionActive = false;
+    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+      state.audio.commandRecognitionEnabled = false;
+      state.audio.commandRecognitionFailed = true;
+      setAudioStatus("Command listening uses audio-level fallback.");
+      return;
+    }
+    if (state.audio.autoRecording && state.audio.recording && !state.audio.autoStopping) {
+      scheduleCommandSpeechRestart();
+    }
+  };
+  recognizer.onend = () => {
+    state.audio.commandRecognitionActive = false;
+    state.audio.commandSpeechActive = false;
+    if (state.audio.autoRecording && state.audio.recording && !state.audio.autoStopping) {
+      scheduleCommandSpeechRestart();
+    }
+  };
+  state.audio.commandRecognizer = recognizer;
+  try {
+    recognizer.start();
+    return true;
+  } catch {
+    state.audio.commandRecognizer = null;
+    state.audio.commandRecognitionActive = false;
+    state.audio.commandRecognitionEnabled = false;
+    state.audio.commandRecognitionFailed = true;
+    return false;
+  }
+}
+
+function stopWakeRecognizer({ keepEnabled = true } = {}) {
+  clearWakeRestart();
+  const recognizer = state.audio.wakeRecognizer;
+  state.audio.wakeRecognizer = null;
+  state.audio.wakeActive = false;
+  if (!keepEnabled) state.audio.wakeListening = false;
+  if (recognizer) {
+    recognizer.onstart = null;
+    recognizer.onresult = null;
+    recognizer.onerror = null;
+    recognizer.onend = null;
+    try {
+      recognizer.stop();
+    } catch {
+      try {
+        recognizer.abort();
+      } catch {
+        // Browser recognizers can throw if already stopped.
+      }
+    }
+  }
+}
+
+function stopCommandSpeechRecognizer({ reset = true } = {}) {
+  clearCommandSpeechRestart();
+  const recognizer = state.audio.commandRecognizer;
+  state.audio.commandRecognizer = null;
+  state.audio.commandRecognitionActive = false;
+  if (recognizer) {
+    recognizer.onstart = null;
+    recognizer.onresult = null;
+    recognizer.onerror = null;
+    recognizer.onend = null;
+    try {
+      recognizer.stop();
+    } catch {
+      try {
+        recognizer.abort();
+      } catch {
+        // Browser recognizers can throw if already stopped.
+      }
+    }
+  }
+  if (reset) {
+    state.audio.commandRecognitionEnabled = false;
+    state.audio.commandRecognitionFailed = false;
+    state.audio.commandSpeechHadWords = false;
+    state.audio.commandSpeechLastAt = 0;
+    state.audio.commandSpeechActive = false;
+    state.audio.commandSpeechEventSeen = false;
+    state.audio.commandLastTranscriptKey = "";
+    state.audio.commandLastTranscriptAt = 0;
+    state.audio.commandSpeechLastReason = "";
+  }
+}
+
+function clearWakeRestart() {
+  if (state.audio.wakeRestartTimer !== null) {
+    window.clearTimeout(state.audio.wakeRestartTimer);
+    state.audio.wakeRestartTimer = null;
+  }
+}
+
+function clearCommandSpeechRestart() {
+  if (state.audio.commandRecognitionRestartTimer !== null) {
+    window.clearTimeout(state.audio.commandRecognitionRestartTimer);
+    state.audio.commandRecognitionRestartTimer = null;
+  }
+}
+
+function scheduleWakeRestart() {
+  clearWakeRestart();
+  if (!state.audio.wakeListening || state.audio.recording || state.audio.transcribing) return;
+  state.audio.wakeRestartTimer = window.setTimeout(() => {
+    state.audio.wakeRestartTimer = null;
+    startWakeRecognizer();
+  }, WAKE_RECOGNITION_RESTART_MS);
+}
+
+function scheduleCommandSpeechRestart() {
+  clearCommandSpeechRestart();
+  if (!state.audio.autoRecording || !state.audio.recording || state.audio.autoStopping) return;
+  if (!state.audio.commandRecognitionEnabled || state.audio.commandRecognitionFailed) return;
+  state.audio.commandRecognitionRestartTimer = window.setTimeout(() => {
+    state.audio.commandRecognitionRestartTimer = null;
+    if (state.audio.autoRecording && state.audio.recording && !state.audio.autoStopping) {
+      startCommandSpeechRecognizer();
+    }
+  }, WAKE_RECOGNITION_RESTART_MS);
+}
+
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -2648,9 +4366,30 @@ function blobToBase64(blob) {
   });
 }
 
+function handleAudioModelLoad(data) {
+  if (data.status) {
+    state.audio.modelLoaded = data.status.loaded === true;
+    state.audio.modelLoading = data.busy === true || data.status.loading === true;
+  } else {
+    state.audio.modelLoading = data.busy === true;
+  }
+  if (data.busy) {
+    setAudioStatus("Loading audio model");
+  } else if (data.ok) {
+    state.audio.modelLoaded = true;
+    state.audio.modelLoading = false;
+    setAudioStatus("Audio ready");
+  } else {
+    state.audio.modelLoading = false;
+    setAudioStatus(`Audio load error: ${data.error || "unknown error"}`, true);
+  }
+  updateAudioUi();
+}
+
 function handleAudioTranscription(data) {
   if (data.busy) {
     state.audio.transcribing = true;
+    state.audio.pendingSource = data.source || state.audio.pendingSource;
     setAudioStatus("Transcribing");
     updateAudioUi();
     return;
@@ -2658,12 +4397,21 @@ function handleAudioTranscription(data) {
   state.audio.transcribing = false;
   if (data.ok) {
     const text = (data.text || "").trim();
-    if (text) appendTranscriptToPrompt(text);
-    setAudioStatus(text ? "Transcript added" : "No speech detected", !text);
+    const autoSubmit = Boolean(state.audio.pendingAutoSubmit);
+    if (text) {
+      appendTranscriptToPrompt(text);
+      if (autoSubmit) sendAgentPrompt();
+    }
+    const elapsed = Number(data.elapsed_seconds || 0);
+    const timing = elapsed > 0 ? ` (${formatCompactSeconds(elapsed)})` : "";
+    setAudioStatus(text ? (autoSubmit ? `Command sent${timing}` : `Transcript added${timing}`) : "No speech detected", !text);
   } else {
     setAudioStatus(`Transcription error: ${data.error || "unknown error"}`, true);
   }
+  state.audio.pendingSource = "";
+  state.audio.pendingAutoSubmit = false;
   updateAudioUi();
+  scheduleWakeRestart();
 }
 
 function appendTranscriptToPrompt(text) {
@@ -2674,6 +4422,13 @@ function appendTranscriptToPrompt(text) {
   input.focus();
 }
 
+function formatCompactSeconds(value) {
+  const seconds = Number(value || 0);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0s";
+  if (seconds < 9.95) return `${seconds.toFixed(1)}s`;
+  return `${Math.round(seconds)}s`;
+}
+
 function setAudioStatus(message, isError = false) {
   const node = $("audioStatus");
   if (!node) return;
@@ -2682,19 +4437,55 @@ function setAudioStatus(message, isError = false) {
 }
 
 function updateAudioUi() {
+  const loadButton = $("loadAudio");
   const button = $("audioInput");
-  if (!button) return;
-  const composer = button.closest(".composer");
+  const wakeButton = $("wakeInput");
+  if (!loadButton && !button && !wakeButton) return;
+  const composer = (button || wakeButton || loadButton)?.closest(".composer");
+  const speechEnabled = state.status?.speech?.enabled !== false;
+  const ready = audioModelReady();
   composer?.classList.toggle("recording-audio", state.audio.recording);
   composer?.classList.toggle("transcribing-audio", state.audio.transcribing);
-  button.classList.toggle("recording", state.audio.recording);
-  button.classList.toggle("transcribing", state.audio.transcribing);
-  button.disabled = state.audio.transcribing;
-  button.setAttribute(
-    "aria-label",
-    state.audio.recording ? "Stop audio recording" : "Record audio"
-  );
-  button.title = state.audio.recording ? "Stop and transcribe audio" : "Record local speech-to-text audio";
+  composer?.classList.toggle("wake-listening", state.audio.wakeListening);
+  composer?.classList.toggle("audio-model-loading", state.audio.modelLoading);
+  composer?.classList.toggle("audio-model-ready", ready);
+  if (loadButton) {
+    loadButton.hidden = !state.audio.modelLoadSupported;
+    loadButton.disabled = !speechEnabled || state.audio.modelLoading || state.audio.recording || state.audio.transcribing || ready;
+    loadButton.classList.toggle("loading", state.audio.modelLoading);
+    loadButton.classList.toggle("ready", ready);
+    loadButton.textContent = state.audio.modelLoading ? "..." : ready ? "Ready" : "Load";
+    loadButton.title = ready
+      ? "Audio model is loaded"
+      : state.audio.modelLoading
+        ? "Loading local audio model"
+        : "Load local audio model";
+  }
+  if (button) {
+    button.classList.toggle("recording", state.audio.recording);
+    button.classList.toggle("transcribing", state.audio.transcribing);
+    button.disabled = state.audio.transcribing || (!ready && !state.audio.recording);
+    button.setAttribute(
+      "aria-label",
+      state.audio.recording ? "Stop audio recording" : "Record audio"
+    );
+    button.title = !ready && !state.audio.recording
+      ? "Load audio first"
+      : state.audio.recording
+        ? "Stop and transcribe audio"
+        : "Record local speech-to-text audio";
+  }
+  if (wakeButton) {
+    const supported = Boolean(wakeRecognitionClass());
+    const enabled = speechEnabled && state.status?.speech?.wake_enabled !== false;
+    wakeButton.disabled = !supported || !enabled || !ready;
+    wakeButton.classList.toggle("active", state.audio.wakeListening);
+    wakeButton.classList.toggle("listening", state.audio.wakeActive);
+    wakeButton.setAttribute("aria-pressed", state.audio.wakeListening ? "true" : "false");
+    wakeButton.title = supported
+      ? (!ready ? "Load audio first" : (state.audio.wakeListening ? `Stop wake word: ${wakePhrases()[0]}` : `Listen for wake word: ${wakePhrases()[0]}`))
+      : "Wake word is not supported by this browser";
+  }
 }
 
 function setupAudioMeter(stream) {
@@ -2710,6 +4501,7 @@ function setupAudioMeter(stream) {
   state.audio.audioContext = audioContext;
   state.audio.analyser = analyser;
   state.audio.meterData = new Uint8Array(analyser.frequencyBinCount);
+  state.audio.timeData = new Uint8Array(analyser.fftSize);
   drawAudioMeter();
 }
 
@@ -2718,16 +4510,32 @@ function stopAudioMeter() {
   state.audio.meterAnimation = null;
   state.audio.analyser = null;
   state.audio.meterData = null;
+  state.audio.timeData = null;
   if (state.audio.audioContext) {
     state.audio.audioContext.close().catch(() => {});
   }
   state.audio.audioContext = null;
 }
 
+function startAutoRecordingTimer() {
+  stopAutoRecordingTimer();
+  state.audio.autoTimer = window.setInterval(() => {
+    updateAutoRecordingVad(Number(state.audio.lastRms) || 0);
+  }, 160);
+}
+
+function stopAutoRecordingTimer() {
+  if (state.audio.autoTimer !== null) {
+    window.clearInterval(state.audio.autoTimer);
+    state.audio.autoTimer = null;
+  }
+}
+
 function drawAudioMeter() {
   const canvas = $("audioMeter");
   const analyser = state.audio.analyser;
   const data = state.audio.meterData;
+  const timeData = state.audio.timeData;
   if (!canvas || !analyser || !data || !state.audio.recording) return;
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -2740,6 +4548,9 @@ function drawAudioMeter() {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   analyser.getByteFrequencyData(data);
+  const rms = audioRms(analyser, timeData);
+  state.audio.lastRms = rms;
+  updateAutoRecordingVad(rms);
   ctx.clearRect(0, 0, width, height);
   const gradient = ctx.createLinearGradient(0, 0, width, 0);
   gradient.addColorStop(0, "rgba(100, 210, 255, 0.45)");
@@ -2769,8 +4580,67 @@ function drawAudioMeter() {
   ctx.font = `${11 * dpr}px -apple-system, BlinkMacSystemFont, Segoe UI`;
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
-  ctx.fillText("Listening", 12 * dpr, height / 2);
+  const label = state.audio.autoRecording
+    ? (commandSpeechSilenceActive() ? "Words" : "Command")
+    : "Listening";
+  ctx.fillText(label, 12 * dpr, height / 2);
   state.audio.meterAnimation = requestAnimationFrame(drawAudioMeter);
+}
+
+function audioRms(analyser, data) {
+  if (!analyser || !data) return 0;
+  analyser.getByteTimeDomainData(data);
+  let sum = 0;
+  for (let index = 0; index < data.length; index += 1) {
+    const centered = (data[index] - 128) / 128;
+    sum += centered * centered;
+  }
+  return Math.sqrt(sum / data.length);
+}
+
+function commandSpeechSilenceActive() {
+  return Boolean(state.audio.commandRecognitionEnabled && !state.audio.commandRecognitionFailed);
+}
+
+function updateAutoRecordingVad(rms) {
+  if (!state.audio.autoRecording || !state.audio.recording || state.audio.autoStopping) return;
+  const now = Date.now();
+  const elapsedMs = now - state.audio.startedAt;
+  if (elapsedMs >= state.audio.wakeCommandMaxSeconds * 1000) {
+    stopAudioRecording();
+    return;
+  }
+  if (commandSpeechSilenceActive()) {
+    if (!state.audio.commandSpeechHadWords) {
+      if (elapsedMs >= state.audio.wakeInitialSilenceMs) stopAudioRecording();
+      return;
+    }
+    const textActivityAt = Number(state.audio.commandLastTranscriptAt) || 0;
+    const speechActivityAt = Number(state.audio.commandSpeechLastAt) || state.audio.startedAt;
+    const silenceBase = textActivityAt || speechActivityAt;
+    if (state.audio.commandSpeechEventSeen && state.audio.commandSpeechActive) {
+      const activeSpeechGraceMs = Math.max(state.audio.wakeSilenceMs * 2, 3000);
+      if (now - silenceBase >= activeSpeechGraceMs) stopAudioRecording();
+      return;
+    }
+    if (now - silenceBase >= state.audio.wakeSilenceMs) {
+      stopAudioRecording();
+    }
+    return;
+  }
+  if (rms >= AUDIO_AUTO_VOICE_THRESHOLD) {
+    state.audio.autoHadVoice = true;
+    state.audio.autoLastVoiceAt = now;
+    state.audio.autoSilenceStartedAt = 0;
+    return;
+  }
+  if (!state.audio.autoHadVoice) {
+    if (elapsedMs >= state.audio.wakeInitialSilenceMs) stopAudioRecording();
+    return;
+  }
+  if (!state.audio.autoSilenceStartedAt) state.audio.autoSilenceStartedAt = now;
+  const silenceSince = Math.max(state.audio.autoLastVoiceAt || 0, state.audio.autoSilenceStartedAt || 0);
+  if (now - silenceSince >= state.audio.wakeSilenceMs) stopAudioRecording();
 }
 
 function toggleFilters() {
@@ -2793,7 +4663,10 @@ function updateThinkingOverlay() {
   const compacting = Date.now() < state.compactingUntil;
   const active = state.agentBusy || compacting || state.audio.recording || state.audio.transcribing;
   line.classList.toggle("active", active);
+  line.classList.toggle("idle", !active);
   line.classList.toggle("compacting", compacting);
+  line.classList.toggle("recording", state.audio.recording);
+  line.classList.toggle("transcribing", state.audio.transcribing);
   line.classList.remove("error");
   if (!active) {
     stopThinkingAnimation();
@@ -2807,12 +4680,13 @@ function updateThinkingOverlay() {
       const node = $("agentStatusLine");
       if (node) {
         const isCompacting = Date.now() < state.compactingUntil;
+        const isActive = state.agentBusy || isCompacting || state.audio.recording || state.audio.transcribing;
         node.textContent = agentStatusText(isCompacting);
         node.classList.toggle("compacting", isCompacting);
-        node.classList.toggle(
-          "active",
-          state.agentBusy || isCompacting || state.audio.recording || state.audio.transcribing
-        );
+        node.classList.toggle("active", isActive);
+        node.classList.toggle("idle", !isActive);
+        node.classList.toggle("recording", state.audio.recording);
+        node.classList.toggle("transcribing", state.audio.transcribing);
       }
       if (!state.agentBusy && Date.now() >= state.compactingUntil) updateThinkingOverlay();
     }, 420);
@@ -2837,11 +4711,34 @@ function stopThinkingAnimation() {
 }
 
 function renderLiveOnly() {
+  state.lastLiveRenderAt = performance.now();
   setText("liveState", state.live?.updated_at || state.status?.live?.updated_at || "-");
   setText("liveStateAdvanced", state.live?.updated_at || state.status?.live?.updated_at || "-");
   renderLive();
-  renderPlanTimeline();
-  compactStatePanel();
+}
+
+function scheduleLiveOnlyRender() {
+  if (state.liveRenderQueued || state.liveRenderTimer !== null) return;
+  const now = performance.now();
+  const nextAt = Number(state.lastLiveRenderAt || 0) + LIVE_RENDER_MIN_INTERVAL_MS;
+  const delay = Math.max(0, nextAt - now);
+  if (delay > 1) {
+    state.liveRenderTimer = window.setTimeout(() => {
+      state.liveRenderTimer = null;
+      queueLiveOnlyRenderFrame();
+    }, delay);
+    return;
+  }
+  queueLiveOnlyRenderFrame();
+}
+
+function queueLiveOnlyRenderFrame() {
+  if (state.liveRenderQueued) return;
+  state.liveRenderQueued = true;
+  requestAnimationFrame(() => {
+    state.liveRenderQueued = false;
+    renderLiveOnly();
+  });
 }
 
 function copyLastOutput() {
@@ -2905,6 +4802,8 @@ function renderRuns() {
     main.onclick = () => {
       state.selectedRunId = run.run_id;
       state.conversationAtLatest = true;
+      resetTimelineLiveBootstrap();
+      resetTimelineLiveState();
       send({ type: "select_run", run_id: run.run_id });
     };
 
@@ -3012,20 +4911,156 @@ function renderLive() {
   const live = mergeLiveWithMatrixCache(state.live || {});
   state.live = live;
   syncTimelineSelection(live?.scene?.result || live?.scene);
-  renderMatrixPanel(live);
-  renderFrame("streamer", live.frames?.streamer);
-  renderCalibrationFrame(live.frames?.streamer);
+  if (shouldRenderMatrixPanel()) renderMatrixPanel(live);
+  const directStreamer = configureDirectStreamer(live);
+  if (!directStreamer) {
+    renderFrame("streamer", live.frames?.streamer);
+    renderCalibrationFrame(live.frames?.streamer);
+  }
   updateTemperatureHistory(live);
-  renderStateGrid(live);
-  renderTemperatureChart();
-  renderPlanTimeline();
+  if (isStatePanelVisible()) {
+    renderStateGrid(live);
+    renderTemperatureChart();
+    compactStatePanel();
+  }
+  schedulePlanTimelineRender();
+}
+
+function isMatrixPanelVisible() {
+  if (!shouldRenderMatrixPanel()) return false;
+  const canvas = $("matrixScene");
+  if (!canvas) return false;
+  const rect = canvas.getBoundingClientRect();
+  return rect.width > 1 && rect.height > 1;
+}
+
+function shouldRenderMatrixPanel() {
+  if (state.layout.collapsed.visuals || state.layout.collapsed.matrix) return false;
+  const canvas = $("matrixScene");
+  if (!canvas) return false;
+  return true;
+}
+
+function isStatePanelVisible() {
+  return state.bottomTab === "state" && !state.layout.collapsed.bottom;
+}
+
+function applyLiveFrame(data) {
+  const visualizer = String(data?.visualizer || "").trim();
+  const frame = data?.frame;
+  if (!visualizer || !frame) return;
+  if (visualizer === "streamer" && state.streamerView.directActive) return;
+  const live = state.live && typeof state.live === "object" ? { ...state.live } : {};
+  live.frames = { ...(live.frames || {}), [visualizer]: frame };
+  live.updated_at = data.updated_at || live.updated_at || new Date().toISOString();
+  state.live = live;
+  setText("liveState", live.updated_at || state.status?.live?.updated_at || "-");
+  setText("liveStateAdvanced", live.updated_at || state.status?.live?.updated_at || "-");
+  renderFrame(visualizer, frame);
+  if (visualizer === "streamer") renderCalibrationFrame(frame);
+}
+
+function configureDirectStreamer(live) {
+  const url = directStreamerUrlFromLive(live);
+  const view = state.streamerView;
+  if (!url) {
+    view.directUrl = "";
+    view.directSrc = "";
+    view.directActive = false;
+    return false;
+  }
+  if (Date.now() - Number(view.directFailedAt || 0) < 4000) return false;
+  view.directUrl = url;
+  view.directActive = true;
+  refreshDirectStreamerSrc();
+  return true;
+}
+
+function directStreamerUrlFromLive(live) {
+  const visualizers = live?.visualizers?.result || live?.visualizers?.value || live?.visualizers || {};
+  const candidates = [
+    getPath(visualizers, "streamer.stream.url"),
+    getPath(visualizers, "result.streamer.stream.url"),
+    getPath(visualizers, "structuredContent.result.streamer.stream.url"),
+  ];
+  for (const candidate of candidates) {
+    const value = String(candidate || "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+function refreshDirectStreamerSrc() {
+  const view = state.streamerView;
+  const img = $("streamerFrame");
+  if (!view.directActive || !view.directUrl || !img) return false;
+  const resolution = streamerResolutionForZoom();
+  const url = directStreamerUrlWithOptions(view.directUrl, resolution);
+  if (url !== view.directSrc) {
+    view.directSrc = url;
+    img.src = url;
+    const calibrationImg = $("calibrationStreamerFrame");
+    if (calibrationImg) {
+      calibrationImg.src = url;
+      calibrationImg.closest(".calibration-streamer")?.classList.add("has-frame");
+      window.requestAnimationFrame(updateCalibrationOverlayGeometry);
+    }
+  }
+  img.closest(".viewer")?.classList.add("has-frame");
+  const meta = $("streamerMeta");
+  if (meta) {
+    meta.dataset.baseText = "direct stream";
+    meta.textContent = streamerMetaText(meta.dataset.baseText);
+  }
+  applyStreamerView();
+  return true;
+}
+
+function directStreamerUrlWithOptions(baseUrl, resolution) {
+  const options = resolution || streamerResolutionForZoom();
+  const fullResolution = Boolean(options.full_resolution);
+  try {
+    const url = new URL(baseUrl, window.location.href);
+    url.searchParams.set("source", "processed");
+    url.searchParams.set("fresh", "true");
+    url.searchParams.set("fps", "24");
+    url.searchParams.set("quality", fullResolution ? "92" : "84");
+    if (fullResolution) {
+      url.searchParams.delete("max_width");
+      url.searchParams.delete("max_height");
+    } else {
+      url.searchParams.set("max_width", String(options.max_width));
+      url.searchParams.set("max_height", String(options.max_height));
+    }
+    return url.toString();
+  } catch {
+    const separator = String(baseUrl).includes("?") ? "&" : "?";
+    const params = [`source=processed`, `fresh=true`, `fps=24`, `quality=${fullResolution ? 92 : 84}`];
+    if (!fullResolution) {
+      params.push(`max_width=${options.max_width}`, `max_height=${options.max_height}`);
+    }
+    return `${baseUrl}${separator}${params.join("&")}`;
+  }
 }
 
 function renderMatrixPanel(live) {
   const effectiveLive = mergeLiveWithMatrixCache(live || {});
   const scene = effectiveLive?.scene?.result || effectiveLive?.scene;
   if (scene?.available) {
-    renderMatrixScene(matrixSceneForTimeline(scene));
+    try {
+      renderMatrixScene(matrixSceneForTimeline(scene));
+    } catch (error) {
+      renderMatrixSceneError(error);
+    }
+    return;
+  }
+  const cartridgeScene = matrixSceneFromCartridge(scene);
+  if (cartridgeScene) {
+    try {
+      renderMatrixScene(cartridgeScene);
+    } catch (error) {
+      renderMatrixSceneError(error);
+    }
     return;
   }
   const viewer = $("matrixScene")?.closest(".viewer");
@@ -3037,7 +5072,76 @@ function renderMatrixPanel(live) {
   renderMatrixPathPanel(null);
   renderMatrixMinimap(null);
   renderMatrixCommandPanel();
+  updateMatrixLiveBadge(null);
   renderFrame("matrix", effectiveLive.frames?.matrix);
+}
+
+function renderMatrixSceneError(error) {
+  const meta = $("matrixMeta");
+  const canvas = $("matrixScene");
+  const viewer = canvas?.closest(".viewer");
+  const message = error?.message || String(error || "Matrix render failed");
+  if (meta) meta.textContent = `render error: ${message}`;
+  if (!canvas || !viewer) return;
+  viewer.classList.add("has-scene");
+  const { ctx, width, height } = prepareCanvas(canvas);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#050607";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#ff9f0a";
+  ctx.font = "600 13px -apple-system, BlinkMacSystemFont, Segoe UI";
+  ctx.fillText("Matrix render error", 14, 28);
+  ctx.fillStyle = "#a1a1a6";
+  ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI";
+  ctx.fillText(message.slice(0, 120), 14, 48);
+}
+
+function updateMatrixLiveBadge(scene) {
+  const badge = $("matrixLiveBadge");
+  if (!badge) return;
+  const show = Boolean(scene?.available && !state.timeline.followLive);
+  badge.hidden = !show;
+  if (!show) return;
+  const label = badge.querySelector("span");
+  const selected = selectedTimelineFrame(scene);
+  const count = timelineFrameCount(scene);
+  const details = [];
+  if (timelineHasFiniteNumber(selected) && count) {
+    details.push(`Frame ${Math.trunc(Number(selected)) + 1}/${count}`);
+  }
+  const selectedTime = timelineHasFiniteNumber(state.timeline.selectedTime)
+    ? Number(state.timeline.selectedTime)
+    : timelineTimeForFrameFromScene(scene, selected);
+  if (timelineHasFiniteNumber(selectedTime) && count) {
+    const range = timelineDisplayTimeRange(scene, effectiveTimeline(scene), count);
+    if (timelineHasFiniteNumber(range?.start)) {
+      details.push(`+${formatRelativeSeconds(Number(selectedTime) - Number(range.start))}`);
+    }
+  }
+  if (label) label.textContent = details.length ? details.join(" - ") : "Matrix is paused";
+}
+
+function matrixSceneFromCartridge(scene) {
+  const cartridge = cartridgeMetadata(scene);
+  if (!cartridge) return null;
+  const matrix = cartridge.matrix && typeof cartridge.matrix === "object" ? cartridge.matrix : {};
+  const rows = Math.max(1, Number(matrix.rows || matrix.row_count || 128));
+  const cols = Math.max(1, Number(matrix.columns || matrix.cols || matrix.column_count || 128));
+  return {
+    ...(scene || {}),
+    available: true,
+    cartridge,
+    matrix: { shape: [rows, cols], rows: {}, active_count: 0 },
+    frame: {
+      ...(scene?.frame || {}),
+      index: 0,
+      count: 1,
+      source: "cartridge",
+      summary: { shape: [rows, cols], rows: {}, active_count: 0 },
+    },
+    plan: { ...(scene?.plan || {}), actions: [] },
+    droplets: [],
+  };
 }
 
 function renderBottomTabs() {
@@ -3048,25 +5152,433 @@ function renderBottomTabs() {
   }
   $("stateBottomPanel")?.classList.toggle("active", state.bottomTab === "state");
   $("timelineBottomPanel")?.classList.toggle("active", state.bottomTab === "timeline");
+  $("presetsBottomPanel")?.classList.toggle("active", state.bottomTab === "presets");
 }
 
 function setBottomTab(name) {
-  state.bottomTab = name === "timeline" ? "timeline" : "state";
+  state.bottomTab = ["state", "timeline", "presets"].includes(name) ? name : "state";
+  if (state.bottomTab === "presets" && !state.presets.loaded && !state.presets.loading) requestPresets();
   renderBottomTabs();
   requestAnimationFrame(() => {
     renderTemperatureChart();
-    renderPlanTimeline();
+    schedulePlanTimelineRender();
+    renderPresetsPanel();
   });
+}
+
+function requestPresets() {
+  if (state.presets.loading) return;
+  state.presets.loading = true;
+  state.presets.error = "";
+  try {
+    send({ type: "presets_get" });
+  } catch (error) {
+    state.presets.loading = false;
+    state.presets.error = error.message;
+  }
+  renderPresetsPanel();
+}
+
+function applyPresetState(payload) {
+  const data = payload && typeof payload === "object" ? payload : {};
+  state.presets.loading = false;
+  state.presets.loaded = Boolean(data.ok !== false);
+  state.presets.error = data.ok === false ? (data.error || "Could not load presets") : "";
+  state.presets.configPath = data.config_path || "";
+  state.presets.data = data.presets && typeof data.presets === "object" ? data.presets : {};
+  state.presets.categories = presetCategoriesFromState(data);
+  if (!state.presets.categories.some((item) => item.name === state.presets.selectedCategory)) {
+    state.presets.selectedCategory = state.presets.categories[0]?.name || "stage";
+  }
+}
+
+function presetCategoriesFromState(data) {
+  const fromBackend = Array.isArray(data?.categories) ? data.categories : [];
+  const seen = new Set();
+  const categories = [];
+  for (const item of fromBackend) {
+    const name = String(item?.name || "").trim();
+    if (!name || seen.has(name)) continue;
+    const entries = state.presets.data?.[name];
+    const count = entries && typeof entries === "object" ? Object.keys(entries).length : Number(item.count || 0);
+    seen.add(name);
+    categories.push({ name, label: item.label || presetCategoryLabel(name), count });
+  }
+  for (const [name, entries] of Object.entries(state.presets.data || {})) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    categories.push({
+      name,
+      label: presetCategoryLabel(name),
+      count: entries && typeof entries === "object" ? Object.keys(entries).length : 0,
+    });
+  }
+  for (const name of ["stage", "imaging"]) {
+    if (!seen.has(name)) categories.push({ name, label: presetCategoryLabel(name), count: 0 });
+  }
+  return categories;
+}
+
+function renderPresetsPanel() {
+  const status = $("presetStatus");
+  const categoriesNode = $("presetCategories");
+  const list = $("presetList");
+  if (!status || !categoriesNode || !list) return;
+  if (state.presets.loading) status.textContent = "loading";
+  else if (state.presets.error) status.textContent = state.presets.error;
+  else status.textContent = state.presets.configPath ? compactPath(state.presets.configPath) : "config";
+  if (presetEditorHasFocus() && !state.presets.savingKey && !state.presets.applyingKey) return;
+
+  categoriesNode.replaceChildren();
+  for (const category of state.presets.categories) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "preset-category";
+    button.classList.toggle("active", category.name === state.presets.selectedCategory);
+    button.addEventListener("click", () => {
+      document.activeElement?.blur?.();
+      state.presets.selectedCategory = category.name;
+      renderPresetsPanel();
+    });
+    const label = document.createElement("strong");
+    label.textContent = category.label || presetCategoryLabel(category.name);
+    const count = document.createElement("code");
+    count.textContent = String(category.count || 0);
+    button.append(label, count);
+    categoriesNode.appendChild(button);
+  }
+
+  list.replaceChildren();
+  const category = state.presets.selectedCategory;
+  const entries = state.presets.data?.[category] && typeof state.presets.data[category] === "object"
+    ? state.presets.data[category]
+    : {};
+  const names = Object.keys(entries).sort((a, b) => a.localeCompare(b));
+  if (!names.length) {
+    const empty = document.createElement("div");
+    empty.className = "preset-empty";
+    empty.textContent = "No presets in this category";
+    list.appendChild(empty);
+  }
+  for (const name of names) {
+    list.appendChild(renderPresetCard(category, name, entries[name]));
+  }
+}
+
+function presetEditorHasFocus() {
+  const active = document.activeElement;
+  return Boolean(active?.closest?.(".preset-card") && active.matches?.(".preset-name-input, .preset-json"));
+}
+
+function renderPresetCard(category, name, value) {
+  const card = document.createElement("section");
+  card.className = "preset-card";
+  const key = `${category}.${name}`;
+  const draft = presetDraft(category, name, value);
+  const busy = Boolean(state.presets.applyingKey || state.presets.savingKey);
+  const saving = state.presets.savingDraftKey === key || state.presets.savingKey === key;
+  const applicable = presetCanApply(category, value);
+  card.classList.toggle("applicable", applicable);
+  card.classList.toggle("applied", state.presets.lastAppliedKey === key);
+  if (applicable) {
+    card.tabIndex = 0;
+    card.title = `Use ${category}.${name}`;
+    card.addEventListener("click", (event) => {
+      if (busy || presetCardControlClicked(event.target)) return;
+      applyPreset(category, name);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (busy || event.defaultPrevented || event.target !== card) return;
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      applyPreset(category, name);
+    });
+  }
+  const header = document.createElement("header");
+  const nameInput = document.createElement("input");
+  nameInput.className = "preset-name-input";
+  nameInput.value = draft.name;
+  nameInput.disabled = busy;
+  nameInput.spellcheck = false;
+  nameInput.setAttribute("aria-label", "Preset name");
+  nameInput.addEventListener("input", () => updatePresetDraft(category, name, { name: nameInput.value }));
+  const actions = document.createElement("div");
+  actions.className = "preset-card-actions";
+  const apply = document.createElement("button");
+  apply.type = "button";
+  apply.className = "preset-use-button";
+  if (state.presets.applyingKey === key) apply.replaceChildren(presetSpinnerNode(), document.createTextNode("Using"));
+  else apply.textContent = state.presets.lastAppliedKey === key ? "In use" : "Use";
+  apply.disabled = busy || !applicable;
+  apply.title = applicable ? `Apply ${category}.${name} without the LLM` : "This preset category can be saved but not applied yet";
+  apply.addEventListener("click", () => applyPreset(category, name));
+  const save = document.createElement("button");
+  save.type = "button";
+  if (saving) save.replaceChildren(presetSpinnerNode());
+  else save.textContent = "Save";
+  save.disabled = busy;
+  actions.append(apply, save);
+  header.append(nameInput, actions);
+
+  const textarea = document.createElement("textarea");
+  textarea.className = "preset-json";
+  textarea.spellcheck = false;
+  textarea.value = draft.json;
+  textarea.disabled = busy;
+  textarea.setAttribute("aria-label", `${category}.${name} JSON`);
+  textarea.addEventListener("input", () => updatePresetDraft(category, name, { json: textarea.value }));
+  save.addEventListener("click", () => savePreset(category, name, nameInput.value, textarea.value));
+
+  const summary = document.createElement("div");
+  summary.className = "preset-summary";
+  summary.textContent = presetSummary(category, value);
+  const actionPlan = document.createElement("div");
+  actionPlan.className = "preset-action-plan";
+  for (const item of presetActionPlan(category, value)) {
+    const chip = document.createElement("span");
+    chip.textContent = item;
+    actionPlan.appendChild(chip);
+  }
+  card.append(header, summary, actionPlan, textarea);
+  return card;
+}
+
+function presetCanApply(category, value) {
+  if (!value || typeof value !== "object") return false;
+  return category === "stage" || category === "imaging";
+}
+
+function presetCardControlClicked(target) {
+  return Boolean(target?.closest?.("button, input, textarea, select, a, label"));
+}
+
+function presetActionPlan(category, value) {
+  if (!value || typeof value !== "object") return ["Save only"];
+  if (category === "stage") return ["Move stage"];
+  if (category !== "imaging") return ["Save only"];
+
+  const actions = [];
+  const source = String(value.streamer_source || "").trim().toLowerCase();
+  const hasCamera = source === "camera" || Boolean(value.camera_settings);
+  if (value.position || value.stage_position) actions.push("Move stage");
+  if (hasCamera) {
+    actions.push("Streamer camera");
+    actions.push("Camera settings");
+  } else {
+    actions.push(`Microscope ${value.channel || value.microscope_settings?.current_channel || "channel"}`);
+  }
+  if (value.light_settings) actions.push("Light");
+  return actions.length ? actions : ["Apply imaging"];
+}
+
+function presetDraftKey(category, name) {
+  return `${category}.${name}`;
+}
+
+function presetDraft(category, name, value) {
+  const key = presetDraftKey(category, name);
+  const existing = state.presets.drafts[key];
+  if (existing) return existing;
+  const draft = {
+    category,
+    originalName: name,
+    name,
+    json: prettyJson(value || {}),
+    dirty: false,
+  };
+  state.presets.drafts[key] = draft;
+  return draft;
+}
+
+function updatePresetDraft(category, name, patch) {
+  const key = presetDraftKey(category, name);
+  const draft = presetDraft(category, name, state.presets.data?.[category]?.[name] || {});
+  state.presets.drafts[key] = {
+    ...draft,
+    ...patch,
+    dirty: true,
+  };
+}
+
+function presetSpinnerNode() {
+  const spinner = document.createElement("span");
+  spinner.className = "preset-spinner";
+  spinner.setAttribute("aria-label", "Saving");
+  return spinner;
+}
+
+function applySuccessfulPresetSave(result = {}) {
+  const pending = state.presets.pendingSave;
+  if (!pending) return;
+  const category = String(result.category || pending.category || "").trim();
+  const name = String(result.name || pending.name || "").trim();
+  if (!category || !name) return;
+  if (!state.presets.data[category] || typeof state.presets.data[category] !== "object") {
+    state.presets.data[category] = {};
+  }
+  if (
+    pending.originalCategory
+    && pending.originalName
+    && (pending.originalCategory !== category || pending.originalName !== name)
+    && state.presets.data[pending.originalCategory]
+  ) {
+    delete state.presets.data[pending.originalCategory][pending.originalName];
+    delete state.presets.drafts[presetDraftKey(pending.originalCategory, pending.originalName)];
+  }
+  state.presets.data[category][name] = pending.value;
+  delete state.presets.drafts[pending.draftKey];
+  state.presets.selectedCategory = category;
+  state.presets.categories = presetCategoriesFromState({ categories: state.presets.categories });
+}
+
+function savePreset(category, originalName, nextName, rawJson) {
+  let value;
+  try {
+    value = JSON.parse(rawJson || "{}");
+  } catch (error) {
+    state.presets.error = `Invalid JSON: ${error.message}`;
+    renderPresetsPanel();
+    return;
+  }
+  const name = String(nextName || "").trim();
+  if (!name) {
+    state.presets.error = "Preset name cannot be empty";
+    renderPresetsPanel();
+    return;
+  }
+  state.presets.savingKey = `${category}.${originalName}`;
+  state.presets.savingDraftKey = presetDraftKey(category, originalName);
+  state.presets.pendingSave = {
+    draftKey: presetDraftKey(category, originalName),
+    originalCategory: category,
+    originalName,
+    category,
+    name,
+    value,
+  };
+  state.presets.error = "";
+  send({
+    type: "preset_save",
+    category,
+    name,
+    original_category: category,
+    original_name: originalName,
+    value,
+  });
+  renderPresetsPanel();
+}
+
+function applyPreset(category, name) {
+  const preset = state.presets.data?.[category]?.[name];
+  if (!presetCanApply(category, preset)) {
+    state.presets.error = `Preset category '${category}' can be saved but not applied yet.`;
+    renderPresetsPanel();
+    return;
+  }
+  state.presets.applyingKey = `${category}.${name}`;
+  state.presets.error = "";
+  const position = presetStagePosition(name, category);
+  if (position) {
+    beginStageMotionFromCommand({
+      position,
+      source: `preset.${category}`,
+      wait_timeout_seconds: 20,
+    });
+  }
+  send({ type: "preset_apply", category, name });
+  renderPresetsPanel();
+}
+
+function addPresetDraft() {
+  const categoryInput = $("newPresetCategory");
+  const typedCategory = String(categoryInput?.value || "").trim();
+  const category = typedCategory || state.presets.selectedCategory || "stage";
+  if (!state.presets.data[category] || typeof state.presets.data[category] !== "object") {
+    state.presets.data[category] = {};
+  }
+  let index = 1;
+  let name = "new_preset";
+  while (state.presets.data[category][name]) {
+    index += 1;
+    name = `new_preset_${index}`;
+  }
+  state.presets.data[category][name] = defaultPresetForCategory(category);
+  state.presets.selectedCategory = category;
+  if (categoryInput) categoryInput.value = "";
+  state.presets.loaded = true;
+  state.presets.categories = presetCategoriesFromState({ categories: state.presets.categories });
+  renderPresetsPanel();
+}
+
+function defaultPresetForCategory(category) {
+  if (category === "stage") {
+    return {
+      position: { X: 0, Y: 0, Z: 0 },
+      notes: "",
+    };
+  }
+  if (category === "imaging") {
+    return {
+      streamer_source: "microscope",
+      channel: "Brightfield",
+      microscope_settings: { auto_exposure: false, exposure_time: 72000, gain: 0 },
+      light_settings: { coaxial_intensity: 4, ring_intensity: 0 },
+      notes: "",
+    };
+  }
+  return { notes: "" };
+}
+
+function presetCategoryLabel(category) {
+  const text = String(category || "Presets").replace(/[_-]/g, " ");
+  return text.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function presetSummary(category, value) {
+  if (!value || typeof value !== "object") return "";
+  const parts = [];
+  const position = value.position;
+  if (position && typeof position === "object") {
+    parts.push(`XYZ ${formatStageCoordinate(position.X)}, ${formatStageCoordinate(position.Y)}, ${formatStageCoordinate(position.Z)}`);
+  }
+  const source = value.streamer_source;
+  if (source) parts.push(String(source));
+  const channel = value.channel || value.microscope_settings?.current_channel;
+  if (channel) parts.push(String(channel));
+  const camera = value.camera_settings;
+  const microscope = value.microscope_settings;
+  const exposure = camera?.exposure_time ?? microscope?.exposure_time ?? value.exposure_time;
+  if (exposure !== undefined) parts.push(`exp ${exposure}`);
+  const light = value.light_settings;
+  if (light && typeof light === "object") parts.push(`light ${light.coaxial_intensity ?? 0}/${light.ring_intensity ?? 0}`);
+  if (value.notes) parts.push(String(value.notes));
+  return parts.join(" - ") || presetCategoryLabel(category);
+}
+
+function prettyJson(value) {
+  try {
+    return JSON.stringify(value ?? {}, null, 2);
+  } catch {
+    return "{}";
+  }
+}
+
+function compactPath(path) {
+  const value = String(path || "");
+  const parts = value.split(/[\\/]+/);
+  return parts.length > 2 ? `${parts.at(-2)}/${parts.at(-1)}` : value;
 }
 
 function syncTimelineSelection(scene) {
   if (!state.timeline.followLive) return;
   const liveFrame = liveFrameIndex(scene);
   state.timeline.selectedFrame = liveFrame;
+  state.timeline.selectedTime = timelineTimeForFrameFromScene(scene, liveFrame);
   ensureTimelineFrameVisible(liveFrame, timelineFrameCount(scene));
 }
 
 function liveFrameIndex(scene) {
+  if (!timelineExecutorBelongsToRun(scene) && !timelineHasExecutionEventsThisRun()) return null;
   const index = scene?.frame?.index;
   if (index !== null && index !== undefined && Number.isFinite(Number(index))) {
     return Number(index);
@@ -3080,16 +5592,25 @@ function liveFrameIndex(scene) {
 }
 
 function timelineFrameCount(scene) {
+  const runFrameCount = timelineRunPlanEventFrameCount();
+  if (!timelineSceneIsRunRelevant(scene) && !runFrameCount) return 0;
   const count = effectiveTimeline(scene)?.frame_count ?? scene?.frame?.count ?? scene?.plan?.frame_count;
-  const number = Number(count);
+  const number = Math.max(Number(count) || 0, runFrameCount);
   return Number.isFinite(number) && number > 0 ? Math.trunc(number) : 0;
 }
 
 function effectiveTimeline(scene) {
-  if (scene?.timeline?.available) return scene.timeline;
+  const runFrameCount = timelineRunPlanEventFrameCount();
+  if (!timelineSceneIsRunRelevant(scene) && !runFrameCount) return null;
+  if (scene?.timeline?.available) {
+    const frameCount = Math.max(Number(scene.timeline.frame_count || 0), runFrameCount);
+    return frameCount > Number(scene.timeline.frame_count || 0)
+      ? { ...scene.timeline, frame_count: frameCount }
+      : scene.timeline;
+  }
   const actions = matrixTimelineActions(scene);
-  if (!actions.length) return scene?.timeline || null;
-  const frameCount = Number(scene?.plan?.frame_count || scene?.frame?.count || 0);
+  if (!actions.length && !runFrameCount) return scene?.timeline || null;
+  const frameCount = Math.max(Number(scene?.plan?.frame_count || scene?.frame?.count || 0), runFrameCount);
   const lastFrame = actions.reduce((max, action) => {
     const span = action?.frame_span;
     return Array.isArray(span) ? Math.max(max, Number(span[1]) || 0) : max;
@@ -3112,6 +5633,73 @@ function effectiveTimeline(scene) {
     })),
     frames: [],
   };
+}
+
+function timelineSceneIsRunRelevant(scene) {
+  if (!scene) return false;
+  if (timelineHasPlanOrExecutionEventsThisRun()) return true;
+  if (timelineExecutorBelongsToRun(scene)) return true;
+  const runStart = timelineRunStartTime();
+  if (!Number.isFinite(runStart)) return true;
+  const planUpdated = timelineSecondsFromValue(scene?.plan?.updated_at)
+    ?? timelineSecondsFromValue(scene?.timeline?.updated_at)
+    ?? timelineSecondsFromValue(scene?.frame?.updated_at);
+  return Number.isFinite(planUpdated) && planUpdated >= runStart - 0.5;
+}
+
+function timelineHasPlanOrExecutionEventsThisRun() {
+  return (state.events || []).some((event) => {
+    const tool = String(event?.tool || "").toLowerCase();
+    const type = String(event?.type || "").toLowerCase();
+    return timelineToolIsPlanOrExecution(tool)
+      || type.startsWith("matrix_selection_plan")
+      || type.startsWith("matrix_waypoint_plan")
+      || type === "matrix_plan_tail_trimmed";
+  });
+}
+
+function timelineRunPlanEventFrameCount() {
+  let maxFrame = -1;
+  for (const event of state.events || []) {
+    const tool = String(event?.tool || "").toLowerCase();
+    if (!timelineToolIsPlanOrExecution(tool)) continue;
+    if (event?.type !== "mcp_tool_result" && event?.type !== "dashboard_tool_result") continue;
+    const extent = timelineRunEventFrameExtent(event);
+    if (Number.isFinite(extent)) maxFrame = Math.max(maxFrame, extent);
+  }
+  return maxFrame >= 0 ? maxFrame + 1 : 0;
+}
+
+function timelineRunEventFrameExtent(event) {
+  let maxFrame = -1;
+  for (const root of eventPayloadRoots(event)) {
+    const span = getPath(root, "frame_span") || getPath(root, "result.frame_span");
+    if (Array.isArray(span) && span.length >= 2) {
+      const start = Number(span[0]);
+      const end = Number(span[1]);
+      if (Number.isFinite(start)) maxFrame = Math.max(maxFrame, start);
+      if (Number.isFinite(end)) maxFrame = Math.max(maxFrame, end);
+    }
+    const frame = firstFiniteNumber(
+      getPath(root, "executor.last_frame.index"),
+      getPath(root, "executor_status.last_frame.index"),
+      getPath(root, "wait_status.executor_status.last_frame.index"),
+      getPath(root, "status.executor.last_frame.index"),
+      getPath(root, "status.executor_status.last_frame.index"),
+      getPath(root, "frame.index"),
+      getPath(root, "frame_idx"),
+      getPath(root, "frame_index"),
+      getPath(root, "target_frame"),
+      getPath(root, "plan.frame_count") !== undefined ? Number(getPath(root, "plan.frame_count")) - 1 : null,
+      getPath(root, "failed_plan.frame_count") !== undefined ? Number(getPath(root, "failed_plan.frame_count")) - 1 : null,
+    );
+    if (Number.isFinite(frame)) maxFrame = Math.max(maxFrame, Number(frame));
+  }
+  const argFrame = firstFiniteNumber(event?.arguments?.frame_number, event?.arguments?.frame_idx, event?.arguments?.frame_index);
+  if (Number.isFinite(argFrame)) maxFrame = Math.max(maxFrame, Number(argFrame));
+  const fallback = eventFrameIndex(event);
+  if (Number.isFinite(fallback)) maxFrame = Math.max(maxFrame, Number(fallback));
+  return maxFrame >= 0 ? Math.trunc(maxFrame) : null;
 }
 
 function matrixTimelineActions(scene) {
@@ -3449,9 +6037,14 @@ function pathPointForFrame(path, span, frameIndex) {
   return path[Math.max(0, Math.min(path.length - 1, Math.round(progress * (path.length - 1))))];
 }
 
+function isTimelinePanelVisible() {
+  return state.bottomTab === "timeline" && !state.layout.collapsed.bottom;
+}
+
 function renderPlanTimeline() {
   const canvas = $("planTimeline");
   if (!canvas) return;
+  if (!isTimelinePanelVisible()) return;
   const scene = state.live?.scene?.result || state.live?.scene;
   const timeline = effectiveTimeline(scene);
   const count = timelineFrameCount(scene);
@@ -3463,8 +6056,12 @@ function renderPlanTimeline() {
   const rewindButton = $("timelineRewind");
   const trimButton = $("timelineTrimTail");
   const delayInput = $("timelineFrameDelay");
+  const executorToggle = $("timelineExecutorToggle");
+  const stopToggle = $("timelineStopToggle");
   const executing = Boolean(scene?.executor?.is_executing || scene?.executor?.running);
   const processing = Boolean(state.matrixCommands.planning);
+  const timelineControl = timelineControlStatus(scene, timeline);
+  const timelinePaused = Boolean(timelineControl?.paused);
   if (liveButton) {
     liveButton.classList.toggle("active", state.timeline.followLive);
     liveButton.disabled = !count || processing;
@@ -3480,6 +6077,22 @@ function renderPlanTimeline() {
   if (pauseButton) pauseButton.disabled = !count || processing;
   if (rewindButton) rewindButton.disabled = !count || processing;
   if (trimButton) trimButton.disabled = !canTrimTimelineTail(scene) || processing;
+  if (executorToggle) {
+    executorToggle.classList.toggle("active", state.timeline.executorMenuOpen || executing);
+    executorToggle.disabled = processing;
+    executorToggle.textContent = executing ? "Plan Executor running" : "Plan Executor";
+    executorToggle.setAttribute("aria-expanded", String(state.timeline.executorMenuOpen));
+  }
+  if (stopToggle) {
+    stopToggle.classList.toggle("active", timelinePaused);
+    stopToggle.disabled = processing || (!timelineControl && !count) || timelineControl?.system_loaded === false;
+    stopToggle.textContent = timelinePaused ? "Start Recording" : "Stop Recording";
+    stopToggle.title = timelinePaused
+      ? (timelineControl?.system_loaded === false
+          ? "Recording is stopped until a DropLogic system is loaded"
+          : "Resume timeline recording")
+      : "Stop timeline recording without pausing hardware";
+  }
   if (delayInput && document.activeElement !== delayInput) {
     const reportedDelay = Number(scene?.executor?.frame_delay);
     if (Number.isFinite(reportedDelay) && reportedDelay > 0) state.timeline.frameDelay = reportedDelay;
@@ -3492,44 +6105,237 @@ function renderPlanTimeline() {
   ctx.fillStyle = "#111216";
   ctx.fillRect(0, 0, width, height);
 
-  const layout = timelineLayout(width, height, count);
+  const layout = timelineLayout(width, height, count, scene, timeline);
+  const layoutKey = timelineLayoutCacheKey(scene, count, width, height);
+  const canvasBaseKey = timelineCanvasBaseKey(scene, count, width, height);
+  state.timeline.layoutCache = { key: layoutKey, layout };
   drawTimelineRuler(ctx, layout, count);
   if (!timeline?.available || !count) {
     state.timelineHitboxes = [];
+    state.timelineOverlayHitboxes = [];
     updateTimelineHover(null);
     renderTimelineDropletPanel(null);
+    renderTimelineRangeSelector(null);
     ctx.fillStyle = "#8e8e93";
     ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI";
     ctx.fillText("waiting for plan frames", layout.left, Math.max(38, height / 2));
     if (processing) drawTimelineProcessing(ctx, width, height, "Processing SIPP plan...");
     return;
   }
-
   drawTimelineExecutedRegion(ctx, layout, scene);
-  drawTimelineEvents(ctx, layout, timeline.events || [], count);
-  drawSelectedDropletTimeline(ctx, layout, scene);
-  drawTimelineActiveTicks(ctx, layout, timeline.frames || [], count);
+  if (timelineOverlayEnabled("plan")) drawTimelineEvents(ctx, layout, timelinePlanEvents(scene, timeline, count), count);
+  else state.timelineHitboxes = [];
+  if (timelineOverlayEnabled("plan")) drawSelectedDropletTimeline(ctx, layout, scene);
+  drawTimelineOverlays(ctx, layout, scene, timeline, count);
   drawTimelineCursor(ctx, layout, count - 1, "rgba(191, 90, 242, 0.96)", true, "planned");
   const executed = liveFrameIndex(scene);
   if (Number.isFinite(Number(executed))) {
     drawTimelineCursor(ctx, layout, Number(executed), "rgba(48, 209, 88, 0.98)", true, "executed");
   }
-  if (Number.isFinite(Number(state.timeline.hoverFrame))) {
-    drawTimelineCursor(ctx, layout, Number(state.timeline.hoverFrame), "rgba(245, 245, 247, 0.22)", false);
-  }
-  const selected = selectedTimelineFrame(scene);
-  if (Number.isFinite(selected) && !state.timeline.followLive) {
-    drawTimelineCursor(
-      ctx,
-      layout,
-      selected,
-      "rgba(100, 210, 255, 0.98)",
-      true,
-      "preview",
-    );
-  }
   if (processing) drawTimelineProcessing(ctx, width, height, "Processing SIPP plan...");
+  cacheTimelineCanvasBase(canvas, ctx, layout, canvasBaseKey);
+  drawTimelineDynamicCursors(ctx, layout, scene);
   renderTimelineDropletPanel(scene);
+  renderTimelineRangeSelector(layout);
+}
+
+function renderTimelineOverlayMenu() {
+  const menu = $("timelineOverlayMenu");
+  const toggle = $("timelineOverlayToggle");
+  if (!menu || !toggle) return;
+  menu.hidden = !state.timeline.overlayMenuOpen;
+  toggle.classList.toggle("active", state.timeline.overlayMenuOpen);
+  toggle.setAttribute("aria-expanded", String(state.timeline.overlayMenuOpen));
+  const activeCount = Object.values(state.timeline.overlays || {}).filter(Boolean).length;
+  toggle.textContent = `Overlays ${activeCount}`;
+  for (const input of menu.querySelectorAll("[data-timeline-overlay]")) {
+    const key = input.getAttribute("data-timeline-overlay");
+    input.checked = timelineOverlayEnabled(key);
+  }
+}
+
+function renderTimelineExecutorMenu() {
+  const menu = $("timelineExecutorMenu");
+  const toggle = $("timelineExecutorToggle");
+  if (!menu || !toggle) return;
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const executing = Boolean(scene?.executor?.is_executing || scene?.executor?.running);
+  const processing = Boolean(state.matrixCommands.planning);
+  menu.hidden = !state.timeline.executorMenuOpen;
+  toggle.classList.toggle("active", state.timeline.executorMenuOpen || executing);
+  toggle.disabled = processing;
+  toggle.textContent = executing ? "Plan Executor running" : "Plan Executor";
+  toggle.setAttribute("aria-expanded", String(state.timeline.executorMenuOpen));
+}
+
+function renderTimelineRangeSelector(layout = null) {
+  const selector = $("timelineRangeSelector");
+  const windowEl = $("timelineRangeWindow");
+  const startLabel = $("timelineRangeStart");
+  const endLabel = $("timelineRangeEnd");
+  if (!selector || !windowEl || !startLabel || !endLabel) return;
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const count = timelineFrameCount(scene);
+  if (!layout && count) {
+    const timeline = effectiveTimeline(scene);
+    const fullTimeRange = timelineDisplayTimeRange(scene, timeline, count);
+    syncTimelineViewport(count, fullTimeRange);
+    layout = {
+      fullTimeRange,
+      visibleTimeRange: timelineVisibleTimeRange(fullTimeRange),
+    };
+  }
+  const full = layout?.fullTimeRange;
+  const visible = layout?.visibleTimeRange;
+  if (!count || !full?.duration || !visible?.duration) {
+    selector.classList.add("disabled");
+    windowEl.style.left = "0%";
+    windowEl.style.width = "100%";
+    startLabel.textContent = "+0s";
+    endLabel.textContent = "+0s";
+    return;
+  }
+  selector.classList.remove("disabled");
+  const left = clamp((visible.start - full.start) / full.duration, 0, 1);
+  const width = clamp(visible.duration / full.duration, 0, 1 - left);
+  windowEl.style.left = `${left * 100}%`;
+  windowEl.style.width = `${Math.max(0.2, width * 100)}%`;
+  startLabel.textContent = `+${formatRelativeSeconds(visible.start - full.start)}`;
+  endLabel.textContent = `+${formatRelativeSeconds(visible.end - full.start)}`;
+  selector.title = `Visible range ${startLabel.textContent} to ${endLabel.textContent}`;
+  windowEl.classList.toggle("dragging", Boolean(state.timeline.rangeDrag.active));
+}
+
+function startTimelineRangeDrag(event) {
+  if (event.button !== 0) return;
+  const track = $("timelineRangeTrack");
+  if (!track || state.matrixCommands.planning) return;
+  const metrics = timelineRangeSelectorMetrics();
+  if (!metrics) return;
+  event.preventDefault();
+  track.setPointerCapture?.(event.pointerId);
+  const handle = event.target.closest?.("[data-timeline-range-handle]");
+  const inWindow = event.target.closest?.("#timelineRangeWindow");
+  const time = timelineRangeTimeFromEvent(event, metrics);
+  const mode = handle?.getAttribute("data-timeline-range-handle") || (inWindow ? "move" : "select");
+  state.timeline.rangeDrag = {
+    active: true,
+    mode,
+    pointerId: event.pointerId,
+    anchorTime: time,
+    start: metrics.visible.start,
+    end: metrics.visible.end,
+    offset: time - metrics.visible.start,
+    moved: false,
+  };
+  if (mode === "select") {
+    setTimelineVisibleRange(time, time + timelineMinVisibleDuration(metrics.full), metrics);
+  }
+  renderTimelineRangeSelector({ fullTimeRange: metrics.full, visibleTimeRange: metrics.visible });
+}
+
+function updateTimelineRangeDrag(event) {
+  const drag = state.timeline.rangeDrag;
+  if (!drag.active) return;
+  const metrics = timelineRangeSelectorMetrics();
+  if (!metrics) return;
+  const time = timelineRangeTimeFromEvent(event, metrics);
+  const minDuration = timelineMinVisibleDuration(metrics.full);
+  let start = Number(drag.start);
+  let end = Number(drag.end);
+  if (drag.mode === "start") {
+    start = clamp(time, metrics.full.start, end - minDuration);
+  } else if (drag.mode === "end") {
+    end = clamp(time, start + minDuration, metrics.full.end);
+  } else if (drag.mode === "move") {
+    const duration = Math.max(minDuration, end - start);
+    start = clamp(time - Number(drag.offset || 0), metrics.full.start, metrics.full.end - duration);
+    end = start + duration;
+  } else {
+    start = Math.min(Number(drag.anchorTime), time);
+    end = Math.max(Number(drag.anchorTime), time);
+    if (end - start < minDuration) {
+      const center = (start + end) / 2;
+      start = center - minDuration / 2;
+      end = center + minDuration / 2;
+    }
+  }
+  drag.moved = true;
+  setTimelineVisibleRange(start, end, metrics);
+}
+
+function endTimelineRangeDrag(event) {
+  const drag = state.timeline.rangeDrag;
+  if (!drag.active) return;
+  const track = $("timelineRangeTrack");
+  if (event?.pointerId !== undefined && drag.pointerId !== null && event.pointerId !== drag.pointerId) return;
+  track?.releasePointerCapture?.(drag.pointerId);
+  state.timeline.rangeDrag = {
+    active: false,
+    mode: "",
+    pointerId: null,
+    anchorTime: null,
+    start: null,
+    end: null,
+    offset: 0,
+    moved: false,
+  };
+  renderTimelineRangeSelector();
+}
+
+function timelineRangeSelectorMetrics() {
+  const track = $("timelineRangeTrack");
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const count = timelineFrameCount(scene);
+  if (!track || !count) return null;
+  const timeline = effectiveTimeline(scene);
+  const full = timelineDisplayTimeRange(scene, timeline, count);
+  syncTimelineViewport(count, full);
+  return {
+    track,
+    rect: track.getBoundingClientRect(),
+    scene,
+    count,
+    timeline,
+    full,
+    visible: timelineVisibleTimeRange(full),
+  };
+}
+
+function timelineRangeTimeFromEvent(event, metrics) {
+  const progress = clamp((event.clientX - metrics.rect.left) / Math.max(1, metrics.rect.width), 0, 1);
+  return metrics.full.start + progress * metrics.full.duration;
+}
+
+function setTimelineVisibleRange(startTime, endTime, metricsOrScene = null) {
+  const metrics = metricsOrScene?.full
+    ? metricsOrScene
+    : timelineRangeSelectorMetrics();
+  if (!metrics?.full?.duration) return;
+  const full = metrics.full;
+  let start = Number(startTime);
+  let end = Number(endTime);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+  if (end < start) [start, end] = [end, start];
+  const minDuration = timelineMinVisibleDuration(full);
+  let duration = clamp(end - start, minDuration, full.duration);
+  start = clamp(start, full.start, full.end - duration);
+  end = start + duration;
+  if (end > full.end) {
+    end = full.end;
+    start = Math.max(full.start, end - duration);
+  }
+  duration = Math.max(minDuration, end - start);
+  state.timeline.followLive = false;
+  markTimelineManualPreview(metrics.scene);
+  state.timeline.zoom = clamp(full.duration / duration, 1, timelineMaxZoomForRange(full));
+  state.timeline.timeOffset = clamp(start - full.start, 0, Math.max(0, full.duration - duration));
+  schedulePlanTimelineRender();
+}
+
+function timelineOverlayEnabled(key) {
+  if (!key) return false;
+  return state.timeline.overlays?.[key] !== false;
 }
 
 function timelineFrameLabel(scene) {
@@ -3541,7 +6347,13 @@ function timelineFrameLabel(scene) {
   const event = Number.isFinite(selected) ? timelineEventAtFrame(scene, selected) : null;
   const eventType = Array.isArray(event) ? formatTimelineEventType(event[1], event[2]) : "";
   const mode = state.timeline.followLive ? "live" : "preview";
-  return eventType ? `${mode} ${frameText} ${eventType}` : `${mode} ${frameText}`;
+  const time = state.timeline.followLive
+    ? timelineTimeForFrameFromScene(scene, selected)
+    : (timelineHasFiniteNumber(state.timeline.selectedTime) ? Number(state.timeline.selectedTime) : null);
+  const range = timelineDisplayTimeRange(scene, effectiveTimeline(scene), count);
+  const timeText = Number.isFinite(Number(time)) ? `+${formatRelativeSeconds(Number(time) - range.start)}` : "";
+  const pausedText = timelineControlStatus(scene)?.paused ? "recording stopped" : "";
+  return [mode, frameText, timeText, pausedText, eventType].filter(Boolean).join(" ");
 }
 
 function drawTimelineProcessing(ctx, width, height, text) {
@@ -3603,7 +6415,7 @@ function commitTimelineFrameDelay() {
   const delay = Number.isFinite(raw) && raw > 0 ? clamp(raw, 0.01, 60) : 1.0;
   state.timeline.frameDelay = delay;
   if (input) input.value = delay.toFixed(2);
-  renderPlanTimeline();
+  schedulePlanTimelineRender();
   return delay;
 }
 
@@ -3618,20 +6430,20 @@ function playTimelineExecution() {
     clear_existing_breakpoints: true,
     allow_failed_plan: false,
     enable_visualizers: false,
-    execution_view_mode: "follow_droplets",
   });
 }
 
 function rewindTimelineExecution() {
   const delay = commitTimelineFrameDelay();
+  const scene = state.live?.scene?.result || state.live?.scene;
   state.timeline.followLive = true;
   state.timeline.selectedFrame = 0;
+  state.timeline.selectedTime = timelineTimeForFrameFromScene(scene, 0);
   callTimelineExecutionTool("start_plan", {
     frame_delay: delay,
     restart_from_beginning: true,
     allow_failed_plan: false,
     enable_visualizers: false,
-    execution_view_mode: "follow_droplets",
   });
 }
 
@@ -3648,16 +6460,25 @@ function callTimelineExecutionTool(tool, arguments) {
   }
 }
 
+function toggleLogicalTimeline() {
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const paused = Boolean(timelineControlStatus(scene)?.paused);
+  callTimelineExecutionTool(paused ? "resume_timeline" : "pause_timeline", {
+    reason: paused ? "Dashboard user resumed recording" : "Dashboard user stopped recording",
+  });
+}
+
 function formatTimelineEventType(type, data = {}) {
+  const displayType = String(type || "action").replace(/^(planned_|executed_)/i, "");
   const primitive = String(data?.primitive || "").toLowerCase();
   const splitMode = String(data?.split_mode || data?.mode || "").toLowerCase();
-  if (primitive === "reservoir_extraction" || String(type || "").toLowerCase().includes("extraction")) {
+  if (primitive === "reservoir_extraction" || displayType.toLowerCase().includes("extraction")) {
     if (splitMode === "linear") return "Linear extraction";
     if (splitMode === "1to2") return "1to2 extraction";
     if (splitMode === "1to3") return "1to3 extraction";
     return "Reservoir extraction";
   }
-  const raw = String(type || "action").replace(/[_-]+/g, " ").trim();
+  const raw = displayType.replace(/[_-]+/g, " ").trim();
   const normalized = raw ? raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase() : "Action";
   const key = raw.toLowerCase();
   if (key === "split" && splitMode) {
@@ -3675,25 +6496,32 @@ function selectedTimelineFrame(scene) {
   const count = timelineFrameCount(scene);
   if (!count) return null;
   let frame = state.timeline.followLive ? liveFrameIndex(scene) : state.timeline.selectedFrame;
-  if (!Number.isFinite(Number(frame))) frame = state.timeline.selectedFrame;
-  if (!Number.isFinite(Number(frame))) return null;
+  if (!timelineHasFiniteNumber(frame)) frame = state.timeline.selectedFrame;
+  if (!timelineHasFiniteNumber(frame)) return null;
   return Math.trunc(clamp(Number(frame), 0, count - 1));
 }
 
-function timelineLayout(width, height, count) {
-  syncTimelineViewport(count);
+function timelineLayout(width, height, count, sceneArg = null, timelineArg = null) {
+  const scene = sceneArg || state.live?.scene?.result || state.live?.scene;
+  const timeline = timelineArg || effectiveTimeline(scene);
+  const fullTimeRange = timelineDisplayTimeRange(scene, timeline, count);
+  syncTimelineViewport(count, fullTimeRange);
   const left = Math.min(52, Math.max(34, width * 0.055));
   const right = 16;
   const top = 30;
-  const bottom = 25;
+  const bottom = 40;
   const trackWidth = Math.max(1, width - left - right);
   const laneCount = Math.max(2, Math.min(5, Math.floor((height - top - bottom) / 24)));
   const laneGap = 5;
   const laneHeight = Math.max(14, Math.min(20, (height - top - bottom - laneGap * (laneCount - 1)) / laneCount));
   const lanePitch = laneHeight + laneGap;
   const axisY = top + laneCount * lanePitch + 4;
-  const visibleFrames = timelineVisibleFrames(count);
-  const startFrame = Math.max(0, Math.min(Math.max(0, count - visibleFrames), state.timeline.offsetFrame || 0));
+  const visibleTimeRange = timelineVisibleTimeRange(fullTimeRange);
+  const frameTimeModel = timelineFrameTimeModel(scene, timeline, count, fullTimeRange);
+  const timeWarp = timelineTimeWarp(fullTimeRange, scene, timeline);
+  const startFrame = timelineFrameForTimeModel(frameTimeModel, visibleTimeRange.start, count);
+  const endFrame = timelineFrameForTimeModel(frameTimeModel, visibleTimeRange.end, count);
+  const visibleFrames = Math.max(1, Math.min(count || 1, endFrame - startFrame + 1));
   return {
     left,
     right,
@@ -3710,19 +6538,403 @@ function timelineLayout(width, height, count) {
     count,
     visibleFrames,
     startFrame,
-    endFrame: Math.min(Math.max(0, count - 1), startFrame + Math.max(0, visibleFrames - 1)),
+    endFrame,
+    fullTimeRange,
+    visibleTimeRange,
+    frameTimeModel,
+    timeWarp,
   };
 }
 
 function timelineXForFrame(layout, frame) {
-  if (layout.visibleFrames <= 1) return layout.left;
-  return layout.left + ((frame - layout.startFrame) / (layout.visibleFrames - 1)) * layout.trackWidth;
+  const time = timelineTimeForFrame(layout, frame);
+  return timelineXForTime(layout, layout.visibleTimeRange, time);
 }
 
 function timelineFrameForX(layout, x) {
-  if (layout.visibleFrames <= 1) return Math.round(layout.startFrame);
-  const progress = clamp((x - layout.left) / layout.trackWidth, 0, 1);
-  return Math.round(layout.startFrame + progress * (layout.visibleFrames - 1));
+  return timelineFrameForTime(layout, timelineTimeForX(layout, x));
+}
+
+function timelineTimeForX(layout, x) {
+  const range = layout?.visibleTimeRange || { start: 0, duration: 1 };
+  const progress = clamp((Number(x) - layout.left) / Math.max(1, layout.trackWidth), 0, 1);
+  if (layout?.timeWarp) {
+    const warpedStart = timelineWarpedTimeForReal(layout.timeWarp, range.start);
+    const warpedEnd = timelineWarpedTimeForReal(layout.timeWarp, range.end);
+    const warpedDuration = Math.max(0.001, warpedEnd - warpedStart);
+    return timelineRealTimeForWarped(layout.timeWarp, warpedStart + progress * warpedDuration);
+  }
+  return range.start + progress * Math.max(0.001, range.duration || 0.001);
+}
+
+function timelineTimeForFrame(layout, frame) {
+  return timelineTimeForFrameModel(layout?.frameTimeModel, frame);
+}
+
+function timelineTimeForFrameFromScene(scene, frame) {
+  const count = timelineFrameCount(scene);
+  if (!Number.isFinite(Number(frame)) || !count) return null;
+  const timeline = effectiveTimeline(scene);
+  const range = timelineDisplayTimeRange(scene, timeline, count);
+  return timelineTimeForFrameModel(timelineFrameTimeModel(scene, timeline, count, range), frame);
+}
+
+function timelineTimeForFrameModel(model, frame) {
+  const numeric = Number(frame);
+  if (!model || !Number.isFinite(numeric)) return null;
+  const frameIndex = Math.max(0, numeric);
+  return Number(model.start)
+    + frameIndex * Math.max(0.001, Number(model.frameDelay) || 1)
+    + timelinePauseOffsetForFrame(model.pauses, frameIndex, model.executedFrameIndex);
+}
+
+function timelineFrameForTime(layout, time) {
+  return timelineFrameForTimeModel(layout?.frameTimeModel, time, layout?.count || 0);
+}
+
+function timelineFrameForTimeModel(model, time, count) {
+  const total = Number(count);
+  if (!model || !Number.isFinite(Number(time)) || !Number.isFinite(total) || total <= 0) return 0;
+  let low = 0;
+  let high = Math.max(0, Math.trunc(total) - 1);
+  let best = 0;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const midTime = timelineTimeForFrameModel(model, mid);
+    if (Number(midTime) <= Number(time)) {
+      best = mid;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return Math.trunc(clamp(best, 0, Math.max(0, total - 1)));
+}
+
+function timelineFrameTimeModel(scene, timeline, count, range = null) {
+  const sceneDelay = Number(scene?.executor?.frame_delay);
+  const delay = Number.isFinite(sceneDelay) && sceneDelay > 0 ? sceneDelay : timelineFrameDelay();
+  const pauses = timelineFramePauseIntervals(scene, timeline);
+  const executedFrameIndex = timelineExecutedFrameIndex(scene, count);
+  const start = timelineExecutionStartTime(scene, delay, pauses, executedFrameIndex)
+    ?? (Number.isFinite(Number(range?.start)) ? Number(range.start) : 0);
+  const model = {
+    start,
+    frameDelay: delay,
+    pauses,
+    executedFrameIndex,
+    end: start + Math.max(1, Number(count) || 1) * delay,
+  };
+  const lastFrame = Math.max(0, (Number(count) || 1) - 1);
+  model.end = timelineTimeForFrameModel(model, lastFrame) + delay;
+  return model;
+}
+
+function timelineExecutionStartTime(scene, delay, pauses = [], executedFrameIndex = null) {
+  const executor = scene?.executor || {};
+  const appliedIndex = Number(executor?.last_applied_frame?.index);
+  const appliedAt = timelineSecondsFromValue(executor?.last_applied_frame?.applied_at);
+  if (Number.isFinite(appliedIndex) && Number.isFinite(appliedAt)) {
+    if (!timelineTimeBelongsToRun(appliedAt)) return null;
+    return appliedAt
+      - Math.max(0, appliedIndex) * Math.max(0.001, delay || 1)
+      - timelinePauseOffsetForFrame(pauses, appliedIndex, appliedIndex);
+  }
+  const lastIndex = Number(executor?.last_frame?.index);
+  const lastAt = timelineSecondsFromValue(executor?.last_frame?.started_at)
+    ?? timelineSecondsFromValue(executor?.last_frame?.finished_at);
+  if (Number.isFinite(lastIndex) && Number.isFinite(lastAt)) {
+    if (!timelineTimeBelongsToRun(lastAt)) return null;
+    return lastAt
+      - Math.max(0, lastIndex) * Math.max(0.001, delay || 1)
+      - timelinePauseOffsetForFrame(pauses, lastIndex, Number.isFinite(Number(executedFrameIndex)) ? executedFrameIndex : lastIndex);
+  }
+  const hasExecutorPlan = Boolean(executor?.is_executing || executor?.running)
+    || (timelineHasFiniteNumber(executor?.total_frames) && Number(executor.total_frames) > 0)
+    || (timelineHasFiniteNumber(executor?.current_frame) && Number(executor.current_frame) > 0);
+  if (!hasExecutorPlan) return null;
+  for (const event of [...(state.events || [])].reverse()) {
+    if (event?.type !== "mcp_tool_call") continue;
+    if (!["start_plan", "execute_segment_to_breakpoint"].includes(String(event.tool || ""))) continue;
+    const time = eventTimeSeconds(event);
+    if (Number.isFinite(time)) return time;
+  }
+  return null;
+}
+
+function timelineExecutedFrameIndex(scene, count = timelineFrameCount(scene)) {
+  if (!timelineExecutorBelongsToRun(scene) && !timelineHasExecutionEventsThisRun()) return null;
+  const total = Number(count);
+  const maxFrame = Number.isFinite(total) && total > 0 ? Math.max(0, Math.trunc(total) - 1) : Infinity;
+  const executor = scene?.executor || {};
+  const candidates = [
+    executor?.last_applied_frame?.index,
+    Number.isFinite(Number(executor?.frames_executed)) ? Number(executor.frames_executed) - 1 : null,
+    scene?.frame?.index,
+    Number.isFinite(Number(executor?.current_frame)) ? Number(executor.current_frame) - 1 : null,
+  ];
+  for (const value of candidates) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number >= 0) {
+      return Math.trunc(clamp(number, 0, maxFrame));
+    }
+  }
+  return null;
+}
+
+function timelineRunStartTime() {
+  const events = state.events || [];
+  const explicit = events.find((event) => event?.type === "cockpit_run_created" || event?.type === "cockpit_started");
+  const first = explicit || events[0];
+  const time = eventTimeSeconds(first);
+  return Number.isFinite(time) ? time : null;
+}
+
+function timelineTimeBelongsToRun(time) {
+  const start = timelineRunStartTime();
+  if (!Number.isFinite(start) || !Number.isFinite(Number(time))) return true;
+  return Number(time) >= start - 0.5;
+}
+
+function timelineHasExecutionEventsThisRun() {
+  return (state.events || []).some((event) => (
+    (event?.type === "mcp_tool_result" || event?.type === "dashboard_tool_result")
+    && timelineToolIsExecution(String(event.tool || "").toLowerCase())
+  ));
+}
+
+function timelineExecutorBelongsToRun(scene) {
+  const executor = scene?.executor || {};
+  const times = [
+    timelineSecondsFromValue(executor?.last_applied_frame?.applied_at),
+    timelineSecondsFromValue(executor?.last_frame?.started_at),
+    timelineSecondsFromValue(executor?.last_frame?.finished_at),
+  ].filter(Number.isFinite);
+  if (!times.length) return timelineHasExecutionEventsThisRun();
+  return times.some((time) => timelineTimeBelongsToRun(time));
+}
+
+function timelineFramePauseIntervals(scene, timeline = null) {
+  const control = timelineControlStatus(scene, timeline);
+  const intervals = Array.isArray(control?.intervals) ? control.intervals : [];
+  return intervals
+    .map((interval) => ({
+      afterFrameIndex: Number(interval?.after_frame_index),
+      durationSeconds: Number(interval?.duration_seconds),
+    }))
+    .filter((interval) => (
+      Number.isFinite(interval.afterFrameIndex)
+      && Number.isFinite(interval.durationSeconds)
+      && interval.durationSeconds > 0
+    ))
+    .sort((a, b) => a.afterFrameIndex - b.afterFrameIndex);
+}
+
+function timelinePauseOffsetForFrame(pauses, frame, executedFrameIndex = Infinity) {
+  const frameIndex = Number(frame);
+  if (!Number.isFinite(frameIndex) || !Array.isArray(pauses)) return 0;
+  const executedCap = Number(executedFrameIndex);
+  return pauses.reduce((sum, pause) => {
+    const afterFrameIndex = Number(pause?.afterFrameIndex);
+    const duration = Number(pause?.durationSeconds);
+    if (!Number.isFinite(afterFrameIndex) || !Number.isFinite(duration) || duration <= 0) return sum;
+    if (Number.isFinite(executedCap) && afterFrameIndex >= executedCap) return sum;
+    return frameIndex > afterFrameIndex ? sum + duration : sum;
+  }, 0);
+}
+
+function timelineSecondsFromValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed / 1000 : null;
+}
+
+function timelineDisplayTimeRange(scene, timeline, count) {
+  const overlayRange = timelineOverlayTimeRange(scene);
+  const times = [];
+  if (Number.isFinite(Number(overlayRange.start))) times.push(Number(overlayRange.start));
+  if (Number.isFinite(Number(overlayRange.end))) times.push(Number(overlayRange.end));
+  const model = timelineFrameTimeModel(scene, timeline, count, overlayRange);
+  if (Number.isFinite(Number(model.start))) {
+    times.push(Number(model.start));
+    times.push(Number(model.end));
+  }
+  if (!times.length) return { start: 0, end: 1, duration: 1 };
+  const start = Math.min(...times);
+  let end = Math.max(...times);
+  if (!Number.isFinite(end) || end <= start) end = start + 1;
+  return { start, end, duration: Math.max(0.001, end - start) };
+}
+
+function timelineTimeWarp(range, scene = null, timeline = null) {
+  const start = Number(range?.start);
+  const end = Number(range?.end);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return { start: 0, end: 1, segments: [], compressedDuration: 1 };
+  }
+  const cacheKey = [
+    timelineDataCacheKey(scene),
+    Number(start).toFixed(3),
+    Number(end).toFixed(3),
+  ].join("|");
+  if (state.timeline.timeWarpCache.key === cacheKey && state.timeline.timeWarpCache.data) {
+    return state.timeline.timeWarpCache.data;
+  }
+  const telemetryTail = timelineTelemetryTailRange(scene);
+  const anchors = timelineSemanticTimes(scene, timeline, range)
+    .filter((time) => Number.isFinite(Number(time)))
+    .map(Number)
+    .filter((time) => time >= start && time <= end)
+    .sort((a, b) => a - b);
+  if (!anchors.length || anchors[0] > start) anchors.unshift(start);
+  if (anchors[anchors.length - 1] < end) anchors.push(end);
+  const unique = [];
+  for (const time of anchors) {
+    if (!unique.length || Math.abs(time - unique[unique.length - 1]) > 0.5) unique.push(time);
+  }
+  const segments = [];
+  let warpedCursor = start;
+  for (let index = 0; index < unique.length - 1; index += 1) {
+    const realStart = unique[index];
+    const realEnd = unique[index + 1];
+    const realDuration = Math.max(0.001, realEnd - realStart);
+    const inTelemetryTail = telemetryTail
+      && realStart >= Number(telemetryTail.start) - 0.5
+      && realEnd <= Number(telemetryTail.end) + 0.5;
+    const idle = !inTelemetryTail && realDuration >= TIMELINE_IDLE_GAP_SECONDS;
+    const warpedDuration = idle ? Math.min(TIMELINE_IDLE_GAP_VISIBLE_SECONDS, realDuration) : realDuration;
+    segments.push({
+      realStart,
+      realEnd,
+      realDuration,
+      warpedStart: warpedCursor,
+      warpedEnd: warpedCursor + warpedDuration,
+      warpedDuration,
+      idle,
+    });
+    warpedCursor += warpedDuration;
+  }
+  const warp = {
+    start,
+    end,
+    segments,
+    compressedDuration: Math.max(0.001, warpedCursor - start),
+  };
+  state.timeline.timeWarpCache = { key: cacheKey, data: warp };
+  return warp;
+}
+
+function timelineSemanticTimes(scene = null, timeline = null, range = null) {
+  const cacheKey = [
+    timelineDataCacheKey(scene),
+    Number.isFinite(Number(range?.start)) ? Number(range.start).toFixed(3) : "",
+    Number.isFinite(Number(range?.end)) ? Number(range.end).toFixed(3) : "",
+  ].join("|");
+  if (state.timeline.semanticTimesCache.key === cacheKey && state.timeline.semanticTimesCache.data) {
+    return state.timeline.semanticTimesCache.data;
+  }
+  const times = [];
+  const push = (value) => {
+    const number = Number(value);
+    if (Number.isFinite(number)) times.push(number);
+  };
+  const runStart = timelineRunStartTime();
+  push(runStart);
+  for (const event of state.events || []) {
+    if (timelineEventIsSemantic(event)) push(eventTimeSeconds(event));
+    const markerTime = timelineToolExecutionStartTime(event) ?? eventTimeSeconds(event);
+    if (timelineToolIsPlanOrExecution(String(event?.tool || "").toLowerCase())) push(markerTime);
+  }
+  for (const marker of timelineStageMarkers(scene)) push(marker.time);
+  for (const marker of timelinePhotoMarkers(scene)) push(marker.time);
+  for (const marker of timelineTargetTemperatureMarkers(scene)) push(marker.time);
+  const telemetryTail = timelineTelemetryTailRange(scene);
+  if (telemetryTail) {
+    push(telemetryTail.start);
+    push(telemetryTail.end);
+  }
+  for (const marker of timelineStopMarkers(scene, timeline)) {
+    push(marker.startTime);
+    push(marker.endTime);
+  }
+  if (range) {
+    push(range.start);
+    push(range.end);
+  }
+  state.timeline.semanticTimesCache = { key: cacheKey, data: times };
+  return times;
+}
+
+function timelineEventIsSemantic(event) {
+  const type = String(event?.type || "").toLowerCase();
+  const tool = String(event?.tool || "").toLowerCase();
+  if (!event) return false;
+  if (timelineToolIsPlanOrExecution(tool)) return true;
+  if (tool === "move_stage" || tool.includes("capture") || tool.includes("photo") || tool.includes("image")) return true;
+  if (/photo|capture|snapshot|stage_position|calibration_move|preset_applied|timeline_|goal_|matrix_/.test(type)) return true;
+  if (targetTemperatureFromEvent(event) !== null) return true;
+  if (stagePositionFromEvent(event) || photoInfoFromEvent(event)) return true;
+  return false;
+}
+
+function timelineWarpSegmentForTime(warp, time) {
+  if (!warp?.segments?.length || !Number.isFinite(Number(time))) return null;
+  const numeric = Number(time);
+  return warp.segments.find((segment) => numeric >= segment.realStart && numeric <= segment.realEnd)
+    || (numeric < warp.start ? warp.segments[0] : warp.segments[warp.segments.length - 1]);
+}
+
+function timelineWarpedTimeForReal(warp, time) {
+  if (!warp?.segments?.length || !Number.isFinite(Number(time))) return Number(time);
+  const numeric = Number(time);
+  if (numeric <= warp.start) return warp.start;
+  if (numeric >= warp.end) {
+    const last = warp.segments[warp.segments.length - 1];
+    return last ? last.warpedEnd : numeric;
+  }
+  const segment = timelineWarpSegmentForTime(warp, numeric);
+  if (!segment) return numeric;
+  const progress = clamp((numeric - segment.realStart) / Math.max(0.001, segment.realDuration), 0, 1);
+  return segment.warpedStart + progress * segment.warpedDuration;
+}
+
+function timelineRealTimeForWarped(warp, warpedTime) {
+  if (!warp?.segments?.length || !Number.isFinite(Number(warpedTime))) return Number(warpedTime);
+  const numeric = Number(warpedTime);
+  if (numeric <= warp.start) return warp.start;
+  const last = warp.segments[warp.segments.length - 1];
+  if (last && numeric >= last.warpedEnd) return warp.end;
+  const segment = warp.segments.find((item) => numeric >= item.warpedStart && numeric <= item.warpedEnd) || last;
+  if (!segment) return numeric;
+  const progress = clamp((numeric - segment.warpedStart) / Math.max(0.001, segment.warpedDuration), 0, 1);
+  return segment.realStart + progress * segment.realDuration;
+}
+
+function timelineVisibleTimeRange(range) {
+  const full = range || { start: 0, end: 1, duration: 1 };
+  const duration = Math.max(0.001, Number(full.duration) || 0.001);
+  const zoom = clamp(Number(state.timeline.zoom) || 1, 1, timelineMaxZoomForRange(full));
+  const visibleDuration = clamp(duration / zoom, timelineMinVisibleDuration(full), duration);
+  const maxOffset = Math.max(0, duration - visibleDuration);
+  const offset = clamp(Number(state.timeline.timeOffset) || 0, 0, maxOffset);
+  return {
+    start: Number(full.start) + offset,
+    end: Number(full.start) + offset + visibleDuration,
+    duration: visibleDuration,
+    offset,
+  };
+}
+
+function timelineMinVisibleDuration(range) {
+  const duration = Math.max(0.001, Number(range?.duration) || 0.001);
+  return Math.min(duration, TIMELINE_MIN_VISIBLE_SECONDS);
+}
+
+function timelineMaxZoomForRange(range) {
+  const duration = Math.max(0.001, Number(range?.duration) || 0.001);
+  return Math.max(1, duration / timelineMinVisibleDuration(range));
 }
 
 function timelineVisibleFrames(count) {
@@ -3731,8 +6943,13 @@ function timelineVisibleFrames(count) {
   return Math.max(1, Math.ceil(count / zoom));
 }
 
-function syncTimelineViewport(count) {
-  state.timeline.zoom = clamp(Number(state.timeline.zoom) || 1, 1, 80);
+function syncTimelineViewport(count, range = null) {
+  state.timeline.zoom = clamp(Number(state.timeline.zoom) || 1, 1, range ? timelineMaxZoomForRange(range) : 80);
+  if (range?.duration) {
+    const duration = Math.max(0.001, Number(range.duration) || 0.001);
+    const visibleDuration = clamp(duration / state.timeline.zoom, timelineMinVisibleDuration(range), duration);
+    state.timeline.timeOffset = clamp(Number(state.timeline.timeOffset) || 0, 0, Math.max(0, duration - visibleDuration));
+  }
   const visible = timelineVisibleFrames(count);
   const maxOffset = Math.max(0, count - visible);
   state.timeline.offsetFrame = clamp(Number(state.timeline.offsetFrame) || 0, 0, maxOffset);
@@ -3741,12 +6958,23 @@ function syncTimelineViewport(count) {
 function panTimelineFrames(deltaFrames) {
   const count = timelineFrameCount(state.live?.scene?.result || state.live?.scene);
   if (!count) return;
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const delay = timelineFrameTimeModel(scene, effectiveTimeline(scene), count).frameDelay;
+  panTimelineTime(deltaFrames * delay);
+}
+
+function panTimelineTime(deltaSeconds) {
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const count = timelineFrameCount(scene);
+  if (!count) return;
+  const range = timelineDisplayTimeRange(scene, effectiveTimeline(scene), count);
   state.timeline.followLive = false;
-  syncTimelineViewport(count);
-  const visible = timelineVisibleFrames(count);
-  const maxOffset = Math.max(0, count - visible);
-  state.timeline.offsetFrame = clamp((Number(state.timeline.offsetFrame) || 0) + deltaFrames, 0, maxOffset);
-  renderPlanTimeline();
+  markTimelineManualPreview(scene);
+  syncTimelineViewport(count, range);
+  const visible = timelineVisibleTimeRange(range);
+  const maxOffset = Math.max(0, range.duration - visible.duration);
+  state.timeline.timeOffset = clamp((Number(state.timeline.timeOffset) || 0) + Number(deltaSeconds || 0), 0, maxOffset);
+  schedulePlanTimelineRender();
 }
 
 function zoomTimelineAtEvent(event) {
@@ -3755,20 +6983,23 @@ function zoomTimelineAtEvent(event) {
   const count = timelineFrameCount(scene);
   if (!canvas || !count) return;
   state.timeline.followLive = false;
+  markTimelineManualPreview(scene);
   const rect = canvas.getBoundingClientRect();
-  const oldLayout = timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count);
-  const cursorFrame = timelineFrameForX(oldLayout, event.clientX - rect.left);
+  const oldLayout = timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count, scene);
+  const cursorTime = timelineTimeForX(oldLayout, event.clientX - rect.left);
   const direction = event.deltaY < 0 ? 1 : -1;
   const factor = direction > 0 ? 1.25 : 0.8;
-  const oldZoom = clamp(Number(state.timeline.zoom) || 1, 1, 80);
-  const newZoom = clamp(oldZoom * factor, 1, 80);
+  const range = oldLayout.fullTimeRange || timelineDisplayTimeRange(scene, effectiveTimeline(scene), count);
+  const maxZoom = timelineMaxZoomForRange(range);
+  const oldZoom = clamp(Number(state.timeline.zoom) || 1, 1, maxZoom);
+  const newZoom = clamp(oldZoom * factor, 1, maxZoom);
   if (Math.abs(newZoom - oldZoom) < 0.001) return;
   state.timeline.zoom = newZoom;
-  const visible = timelineVisibleFrames(count);
+  const visibleDuration = clamp(range.duration / newZoom, timelineMinVisibleDuration(range), range.duration);
   const cursorRatio = clamp((event.clientX - rect.left - oldLayout.left) / oldLayout.trackWidth, 0, 1);
-  const maxOffset = Math.max(0, count - visible);
-  state.timeline.offsetFrame = clamp(cursorFrame - cursorRatio * Math.max(0, visible - 1), 0, maxOffset);
-  renderPlanTimeline();
+  const maxOffset = Math.max(0, range.duration - visibleDuration);
+  state.timeline.timeOffset = clamp(cursorTime - range.start - cursorRatio * visibleDuration, 0, maxOffset);
+  schedulePlanTimelineRender();
 }
 
 function zoomTimelineButton(factor) {
@@ -3776,15 +7007,22 @@ function zoomTimelineButton(factor) {
   const count = timelineFrameCount(scene);
   if (!count) return;
   state.timeline.followLive = false;
-  const focus = selectedTimelineFrame(scene) ?? (state.timeline.offsetFrame + timelineVisibleFrames(count) / 2);
-  const oldZoom = clamp(Number(state.timeline.zoom) || 1, 1, 80);
-  const newZoom = clamp(oldZoom * factor, 1, 80);
+  markTimelineManualPreview(scene);
+  const timeline = effectiveTimeline(scene);
+  const range = timelineDisplayTimeRange(scene, timeline, count);
+  const visible = timelineVisibleTimeRange(range);
+  const focus = timelineHasFiniteNumber(state.timeline.selectedTime)
+    ? Number(state.timeline.selectedTime)
+    : visible.start + visible.duration / 2;
+  const maxZoom = timelineMaxZoomForRange(range);
+  const oldZoom = clamp(Number(state.timeline.zoom) || 1, 1, maxZoom);
+  const newZoom = clamp(oldZoom * factor, 1, maxZoom);
   if (Math.abs(newZoom - oldZoom) < 0.001) return;
   state.timeline.zoom = newZoom;
-  const visible = timelineVisibleFrames(count);
-  const maxOffset = Math.max(0, count - visible);
-  state.timeline.offsetFrame = clamp(focus - visible / 2, 0, maxOffset);
-  renderPlanTimeline();
+  const visibleDuration = clamp(range.duration / newZoom, timelineMinVisibleDuration(range), range.duration);
+  const maxOffset = Math.max(0, range.duration - visibleDuration);
+  state.timeline.timeOffset = clamp(focus - range.start - visibleDuration / 2, 0, maxOffset);
+  schedulePlanTimelineRender();
 }
 
 function drawTimelineRuler(ctx, layout, count) {
@@ -3828,9 +7066,62 @@ function drawTimelineRuler(ctx, layout, count) {
     ctx.lineTo(x, layout.axisY + 5);
     ctx.strokeStyle = "rgba(255,255,255,0.2)";
     ctx.stroke();
-    ctx.fillText(String(frame + 1), x - 5, layout.axisY + 18);
+    ctx.fillText(String(frame + 1), x - 5, layout.axisY + 15);
   }
   ctx.restore();
+}
+
+function drawTimelineTimeCursor(ctx, layout, time, color, primary = true, label = "") {
+  const numeric = Number(time);
+  const range = layout?.visibleTimeRange;
+  if (!range || !Number.isFinite(numeric) || numeric < range.start || numeric > range.end) return;
+  const x = timelineXForTime(layout, range, numeric);
+  if (!Number.isFinite(x)) return;
+  ctx.save();
+  const top = layout.top - 11;
+  const bottom = Math.min(layout.height - 8, layout.axisY + 18);
+  if (primary) {
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12;
+  } else {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+  }
+  ctx.beginPath();
+  ctx.moveTo(x, top + (primary ? 7 : 0));
+  ctx.lineTo(x, bottom);
+  ctx.stroke();
+  if (primary) {
+    roundedRect(ctx, x - 5, top, 10, 14, 5);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "rgba(5, 6, 7, 0.88)";
+    ctx.fillRect(x - 1, top + 3, 2, 8);
+  }
+  if (label) {
+    ctx.shadowBlur = 0;
+    ctx.font = "9px -apple-system, BlinkMacSystemFont, Segoe UI";
+    const textWidth = ctx.measureText(label).width + 10;
+    const lx = clamp(x - textWidth / 2, layout.left, layout.left + layout.trackWidth - textWidth);
+    const ly = Math.max(3, top - 16);
+    roundedRect(ctx, lx, ly, textWidth, 14, 5);
+    ctx.fillStyle = "rgba(5, 6, 7, 0.78)";
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, lx + 5, ly + 7);
+  }
+  ctx.restore();
+}
+
+function timelineHasFiniteNumber(value) {
+  return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
 }
 
 function drawTimelineExecutedRegion(ctx, layout, scene) {
@@ -3850,30 +7141,33 @@ function drawTimelineEvents(ctx, layout, events, count) {
   ctx.save();
   const selectedDropletId = selectedTimelineDropletId();
   events.forEach((event, index) => {
-    const span = event?.frame_span;
-    if (!Array.isArray(span) || span.length < 2) return;
-    const start = clamp(Number(span[0]), 0, count - 1);
-    const end = clamp(Number(span[1]), 0, count - 1);
-    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
-    if (Math.max(start, end) < layout.startFrame || Math.min(start, end) > layout.endFrame) return;
+    const times = timelineVisualEventTimes(event, layout, count);
+    if (!times) return;
+    const { startTime, endTime, eventStartFrame, eventEndFrame } = times;
+    if (!Number.isFinite(Number(startTime)) || !Number.isFinite(Number(endTime))) return;
+    const visibleRange = layout.visibleTimeRange || { start: 0, end: 1, duration: 1 };
+    if (Number(endTime) < visibleRange.start || Number(startTime) > visibleRange.end) return;
     const lane = index % layout.laneCount;
-    const visibleStart = Math.max(layout.startFrame, Math.min(start, end));
-    const visibleEnd = Math.min(layout.endFrame, Math.max(start, end));
-    const x0 = timelineXForFrame(layout, visibleStart);
-    const x1 = timelineXForFrame(layout, visibleEnd);
+    const clippedStartTime = clamp(Number(startTime), visibleRange.start, visibleRange.end);
+    const clippedEndTime = clamp(Number(endTime), visibleRange.start, visibleRange.end);
+    const x0 = timelineXForTime(layout, visibleRange, clippedStartTime);
+    const x1 = timelineXForTime(layout, visibleRange, clippedEndTime);
+    if (!Number.isFinite(x0) || !Number.isFinite(x1)) return;
     const y = layout.top + lane * layout.lanePitch;
-    const singleFrame = Math.min(start, end) === Math.max(start, end);
-    const w = Math.max(singleFrame ? 8 : 5, x1 - x0 + Math.max(4, layout.trackWidth / Math.max(1, layout.visibleFrames) * 0.6));
-    const clippedW = Math.min(w, layout.left + layout.trackWidth - x0);
+    const singleFrame = eventStartFrame === eventEndFrame || event.time_based;
+    const visualW = Math.max(1.5, x1 - x0);
+    const hitW = Math.max(singleFrame ? 7 : 5, visualW);
+    const clippedW = Math.min(visualW, layout.left + layout.trackWidth - x0);
     const rect = {
       x: x0,
       y: y + 2,
-      w: clippedW,
+      w: Math.min(hitW, layout.left + layout.trackWidth - x0),
       h: layout.laneHeight - 4,
     };
     const selected = selectedDropletId !== null && timelineEventMentionsDroplet(event, selectedDropletId);
     hitboxes.push({
       ...rect,
+      z: 10,
       event,
       label: formatTimelineEventType(event.type, event.data),
     });
@@ -3893,11 +7187,35 @@ function drawTimelineEvents(ctx, layout, events, count) {
       ctx.stroke();
       ctx.restore();
     }
-    if (singleFrame) {
+    const markerX = x0 + Math.max(1.5, clippedW) / 2;
+    if (visualW < 6 || clippedW < 6) {
+      ctx.save();
+      ctx.shadowColor = timelineEventColor(event.type, 0.5);
+      ctx.shadowBlur = selected ? 9 : 5;
+      ctx.strokeStyle = selected ? "rgba(255, 214, 10, 0.95)" : timelineEventColor(event.type, 1);
+      ctx.fillStyle = selected ? "rgba(255, 214, 10, 0.95)" : timelineEventColor(event.type, 1);
+      ctx.lineWidth = selected ? 2 : 1.4;
       ctx.beginPath();
-      ctx.moveTo(x0 + clippedW / 2, y - 2);
-      ctx.lineTo(x0 + clippedW / 2 - 5, y + 6);
-      ctx.lineTo(x0 + clippedW / 2 + 5, y + 6);
+      ctx.moveTo(markerX, y - 5);
+      ctx.lineTo(markerX, y + layout.laneHeight + 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(markerX, y - 7);
+      ctx.lineTo(markerX + 4, y - 3);
+      ctx.lineTo(markerX, y + 1);
+      ctx.lineTo(markerX - 4, y - 3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(5, 6, 7, 0.9)";
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+      ctx.restore();
+    } else if (singleFrame) {
+      ctx.beginPath();
+      ctx.moveTo(markerX, y - 2);
+      ctx.lineTo(markerX - 4, y + 5);
+      ctx.lineTo(markerX + 4, y + 5);
       ctx.closePath();
       ctx.fillStyle = timelineEventColor(event.type, 1);
       ctx.fill();
@@ -3917,13 +7235,1824 @@ function drawTimelineEvents(ctx, layout, events, count) {
   state.timelineHitboxes = hitboxes;
 }
 
+function timelineVisualEventTimes(event, layout, count) {
+  const explicitStart = timelineHasFiniteNumber(event?.start_time) ? Number(event.start_time) : null;
+  const explicitEnd = timelineHasFiniteNumber(event?.end_time) ? Number(event.end_time) : null;
+  const hasExplicitTime = Number.isFinite(explicitStart);
+  const span = event?.frame_span;
+  let startFrame = null;
+  let endFrame = null;
+  if (Array.isArray(span) && span.length >= 2) {
+    const start = clamp(Number(span[0]), 0, Math.max(0, count - 1));
+    const end = clamp(Number(span[1]), 0, Math.max(0, count - 1));
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      startFrame = Math.min(start, end);
+      endFrame = Math.max(start, end);
+    }
+  }
+  if (hasExplicitTime) {
+    const duration = Number.isFinite(explicitEnd)
+      ? Math.max(0.25, explicitEnd - explicitStart)
+      : Math.max(0.25, Number(event?.duration_seconds) || 0.25);
+    return {
+      startTime: explicitStart,
+      endTime: explicitStart + duration,
+      eventStartFrame: Number.isFinite(startFrame) ? startFrame : 0,
+      eventEndFrame: Number.isFinite(endFrame) ? endFrame : startFrame ?? 0,
+    };
+  }
+  if (!Number.isFinite(startFrame) || !Number.isFinite(endFrame)) return null;
+  return {
+    startTime: timelineTimeForFrame(layout, startFrame),
+    endTime: timelineEventEndTime(layout, startFrame, endFrame),
+    eventStartFrame: startFrame,
+    eventEndFrame: endFrame,
+  };
+}
+
+function timelinePlanEvents(scene, timeline, count) {
+  const executedFrame = timelineExecutedFrameIndex(scene, count);
+  const events = (timeline?.events || [])
+    .map((event) => timelinePlanActionMarker(event, executedFrame))
+    .filter(Boolean);
+  const seen = new Set(events.map((event) => `plan:${event?.id || event?.event_id || event?.label || ""}:${event?.frame_span?.join("-") || ""}`));
+  const hasPlanPrimitiveEvents = events.length > 0;
+  for (const runEvent of state.events || []) {
+    const marker = timelineToolMarkerFromRunEvent(runEvent, count, {
+      includeToolMarkers: !hasPlanPrimitiveEvents,
+    });
+    if (!marker) continue;
+    const key = `run:${marker.id}:${marker.frame_span?.join("-") || ""}:${marker.start_time || ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    events.push(marker);
+  }
+  return events;
+}
+
+function timelinePlanActionMarker(event, executedFrame) {
+  if (!event) return null;
+  const span = event?.frame_span;
+  const type = String(event.type || "action");
+  let executionState = "planned";
+  if (Array.isArray(span) && span.length >= 2 && Number.isFinite(Number(executedFrame))) {
+    const start = Math.min(Number(span[0]), Number(span[1]));
+    const end = Math.max(Number(span[0]), Number(span[1]));
+    if (Number.isFinite(end) && end <= Number(executedFrame)) executionState = "executed";
+    else if (Number.isFinite(start) && start <= Number(executedFrame)) executionState = "executing";
+  }
+  return {
+    ...event,
+    type: executionState === "planned" ? `planned_${type}` : type,
+    execution_state: executionState,
+    planned_preview: executionState === "planned",
+  };
+}
+
+function timelineToolMarkerFromRunEvent(event, count, options = {}) {
+  if (options.includeToolMarkers === false) return null;
+  if (event?.type !== "mcp_tool_result" && event?.type !== "dashboard_tool_result") return null;
+  const tool = String(event?.tool || "").toLowerCase();
+  if (!timelineToolIsPlanOrExecution(tool)) return null;
+  const frame = timelineToolEventFrame(event);
+  if (!Number.isFinite(frame) || !Number.isFinite(count) || count <= 0) return null;
+  const bounded = Math.trunc(clamp(frame, 0, count - 1));
+  const span = timelineToolEventFrameSpan(event, bounded, count);
+  const toolTime = timelineToolEventTimeSpan(event, tool);
+  return {
+    id: `run-${event.t || event.ts || ""}-${tool}`,
+    type: timelineToolIsExecution(tool) ? "execution_tool" : "plan_tool",
+    label: formatTimelineEventType(tool),
+    frame_span: span,
+    frame_count: Math.max(1, Math.abs(span[1] - span[0]) + 1),
+    start_time: toolTime.start,
+    end_time: toolTime.end,
+    duration_seconds: toolTime.duration,
+    time_based: true,
+    droplet_ids: timelineToolEventDropletIds(event),
+    data: {
+      tool,
+      ok: event.ok,
+      via: event.via,
+      frame_idx: bounded,
+      ...(event.arguments && typeof event.arguments === "object" ? event.arguments : {}),
+    },
+    run_event: event,
+  };
+}
+
+function timelineToolIsExecution(tool) {
+  return [
+    "start_plan",
+    "resume_plan",
+    "execute_segment_to_breakpoint",
+    "start_execute_until_breakpoint",
+    "execute_until_breakpoint",
+    "execution_wait_status",
+    "pause_plan",
+    "stop_plan",
+  ].includes(String(tool || "").toLowerCase());
+}
+
+function timelineToolEventTimeSpan(event, tool) {
+  const eventTime = eventTimeSeconds(event);
+  const duration = firstFiniteNumber(
+    getPath(event, "dashboard_timing.tool_total_seconds"),
+    getPath(event, "result.elapsed_seconds"),
+    getPath(event, "result.wait_status.elapsed_seconds"),
+    getPath(event, "result.structuredContent.result.wait_status.elapsed_seconds"),
+    timelineToolIsExecution(tool) ? timelineExecutionDurationFromEvent(event) : null,
+  );
+  const safeDuration = Number.isFinite(duration) && duration > 0 ? Number(duration) : 0.35;
+  const start = timelineToolIsExecution(tool)
+    ? (Number.isFinite(eventTime) ? Math.max(timelineRunStartTime() ?? -Infinity, eventTime - safeDuration) : null)
+    : eventTime;
+  const end = Number.isFinite(eventTime)
+    ? eventTime
+    : (Number.isFinite(start) ? start + safeDuration : null);
+  return {
+    start: Number.isFinite(start) ? start : null,
+    end: Number.isFinite(end) ? Math.max(end, Number(start) + 0.25) : null,
+    duration: safeDuration,
+  };
+}
+
+function timelineToolExecutionStartTime(event) {
+  const tool = String(event?.tool || "").toLowerCase();
+  if (!timelineToolIsExecution(tool)) return null;
+  return timelineToolEventTimeSpan(event, tool).start;
+}
+
+function timelineExecutionDurationFromEvent(event) {
+  const roots = eventPayloadRoots(event);
+  for (const root of roots) {
+    const frameDelay = firstFiniteNumber(
+      getPath(root, "wait_estimate.frame_delay"),
+      getPath(root, "execution_status.frame_delay"),
+      getPath(root, "executor_status.frame_delay"),
+      getPath(root, "executor.frame_delay"),
+    );
+    const remaining = firstFiniteNumber(
+      getPath(root, "wait_estimate.remaining_frames"),
+      getPath(root, "remaining_frames"),
+    );
+    if (Number.isFinite(frameDelay) && Number.isFinite(remaining)) {
+      return Math.max(0, Number(frameDelay) * Number(remaining));
+    }
+  }
+  return null;
+}
+
+function timelineToolIsPlanOrExecution(tool) {
+  return [
+    "plan_activation_frame",
+    "plan_move",
+    "plan_reservoir_extraction",
+    "plan_isometric_split",
+    "plan_mix",
+    "plan_merge",
+    "trim_plan_tail",
+    "start_plan",
+    "resume_plan",
+    "execute_segment_to_breakpoint",
+    "start_execute_until_breakpoint",
+    "execute_until_breakpoint",
+    "execution_wait_status",
+    "pause_plan",
+    "stop_plan",
+  ].includes(tool);
+}
+
+function timelineToolEventFrame(event) {
+  const roots = eventPayloadRoots(event);
+  for (const root of roots) {
+    const frame = firstFiniteNumber(
+      getPath(root, "executor.last_frame.index"),
+      getPath(root, "executor_status.last_frame.index"),
+      getPath(root, "wait_status.executor_status.last_frame.index"),
+      getPath(root, "status.executor.last_frame.index"),
+      getPath(root, "status.executor_status.last_frame.index"),
+      getPath(root, "frame.index"),
+      getPath(root, "frame_idx"),
+      getPath(root, "frame_index"),
+      getPath(root, "target_frame"),
+      getPath(root, "plan.frame_count") !== undefined ? Number(getPath(root, "plan.frame_count")) - 1 : null,
+      getPath(root, "failed_plan.frame_count") !== undefined ? Number(getPath(root, "failed_plan.frame_count")) - 1 : null,
+    );
+    if (Number.isFinite(frame)) return frame;
+  }
+  const argFrame = firstFiniteNumber(event?.arguments?.frame_number, event?.arguments?.frame_idx, event?.arguments?.frame_index);
+  if (Number.isFinite(argFrame)) return event?.arguments?.frame_number !== undefined ? Number(argFrame) : Number(argFrame);
+  return eventFrameIndex(event);
+}
+
+function timelineToolEventFrameSpan(event, frame, count) {
+  const roots = eventPayloadRoots(event);
+  for (const root of roots) {
+    const rawSpan = getPath(root, "frame_span") || getPath(root, "result.frame_span");
+    if (Array.isArray(rawSpan) && rawSpan.length >= 2) {
+      const start = Number(rawSpan[0]);
+      const end = Number(rawSpan[1]);
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        return [
+          Math.trunc(clamp(Math.min(start, end), 0, count - 1)),
+          Math.trunc(clamp(Math.max(start, end), 0, count - 1)),
+        ];
+      }
+    }
+  }
+  const startFrame = firstFiniteNumber(
+    getPath(event, "result.executor_status.current_frame"),
+    getPath(event, "result.status.executor_status.current_frame"),
+  );
+  const start = Number.isFinite(startFrame) ? Math.min(frame, Number(startFrame)) : frame;
+  return [
+    Math.trunc(clamp(start, 0, count - 1)),
+    Math.trunc(clamp(frame, 0, count - 1)),
+  ];
+}
+
+function timelineToolEventDropletIds(event) {
+  const ids = new Set();
+  collectDropletIds(event?.arguments || {}, ids);
+  collectDropletIds(event?.result || {}, ids);
+  return Array.from(ids).sort((a, b) => a - b);
+}
+
+function timelineEventEndTime(layout, startFrame, endFrame) {
+  const model = layout?.frameTimeModel;
+  const eventStart = Number(startFrame);
+  const eventEnd = Number(endFrame);
+  if (!model || !Number.isFinite(eventStart) || !Number.isFinite(eventEnd)) return null;
+  const startTime = timelineTimeForFrameModel(model, eventStart);
+  const frameDelay = Math.max(0.001, Number(model.frameDelay) || 1);
+  const frameCount = Math.max(1, Math.abs(eventEnd - eventStart) + 1);
+  return Number(startTime) + frameCount * frameDelay;
+}
+
+function drawTimelineOverlays(ctx, layout, scene, timeline, count) {
+  const overlays = timelineOverlayData(scene, timeline, count);
+  const hitboxes = [];
+  const visibleRange = layout.visibleTimeRange || overlays.timeRange;
+  drawTimelineTimeAxis(ctx, layout, visibleRange, layout.fullTimeRange || overlays.timeRange);
+  drawTimelineIdleGaps(ctx, layout, visibleRange, hitboxes);
+  if (timelineOverlayEnabled("timelineStops")) {
+    drawTimelineStopMarkers(ctx, layout, visibleRange, overlays.timelineStops, hitboxes);
+  }
+  if (timelineOverlayEnabled("stage")) {
+    drawTimelineStageMarkers(ctx, layout, visibleRange, overlays.stage, hitboxes);
+  }
+  if (timelineOverlayEnabled("photos")) {
+    drawTimelinePhotoMarkers(ctx, layout, visibleRange, overlays.photos, hitboxes);
+  }
+  if (timelineOverlayEnabled("plan")) {
+    drawTimelineActiveTicks(ctx, layout, timeline.frames || [], count);
+  }
+  drawTimelineTemperatureLines(ctx, layout, overlays, hitboxes);
+  state.timelineOverlayHitboxes = hitboxes;
+}
+
+function drawTimelineIdleGaps(ctx, layout, range, hitboxes) {
+  const segments = layout?.timeWarp?.segments || [];
+  if (!segments.length || !range?.duration) return;
+  const top = Math.max(4, layout.top - 22);
+  const bottom = Math.max(top + 1, Math.min(layout.height - 8, layout.axisY + 20));
+  ctx.save();
+  for (const segment of segments) {
+    if (!segment.idle) continue;
+    if (segment.realEnd < range.start || segment.realStart > range.end) continue;
+    const x0 = timelineXForTime(layout, range, clamp(segment.realStart, range.start, range.end));
+    const x1 = timelineXForTime(layout, range, clamp(segment.realEnd, range.start, range.end));
+    if (!Number.isFinite(x0) || !Number.isFinite(x1)) continue;
+    const left = Math.min(x0, x1);
+    const width = Math.max(8, Math.abs(x1 - x0));
+    ctx.fillStyle = "rgba(142, 142, 147, 0.08)";
+    ctx.fillRect(left, top, width, bottom - top);
+    ctx.strokeStyle = "rgba(245, 245, 247, 0.20)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath();
+    ctx.moveTo(left + width / 2, top);
+    ctx.lineTo(left + width / 2, bottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (width > 34) {
+      ctx.fillStyle = "rgba(245, 245, 247, 0.68)";
+      ctx.font = "700 9px -apple-system, BlinkMacSystemFont, Segoe UI";
+      ctx.textAlign = "center";
+      ctx.fillText("skip", left + width / 2, top + 11);
+      ctx.font = "8px -apple-system, BlinkMacSystemFont, Segoe UI";
+      ctx.fillText(formatRelativeSeconds(segment.realDuration), left + width / 2, top + 22);
+    }
+    hitboxes.push({
+      x: left,
+      y: top,
+      w: width,
+      h: bottom - top,
+      z: 12,
+      overlay: {
+        kind: "idle_gap",
+        label: "Idle gap",
+        startTime: segment.realStart,
+        endTime: segment.realEnd,
+        durationSeconds: segment.realDuration,
+        lines: [
+          `${eventTimeLabel({ t: segment.realStart })} to ${eventTimeLabel({ t: segment.realEnd })}`,
+          `${formatRelativeSeconds(segment.realDuration)} compressed`,
+        ],
+      },
+    });
+  }
+  ctx.restore();
+}
+
+function timelineOverlayData(scene, timeline, count) {
+  const key = timelineOverlayCacheKey(scene, count);
+  if (state.timeline.overlayCache.key === key && state.timeline.overlayCache.data) {
+    return state.timeline.overlayCache.data;
+  }
+  const range = timelineOverlayTimeRange(scene);
+  const samples = timelineMeasuredTemperatureSamples(scene);
+  const data = {
+    timeRange: range,
+    temperatureSamples: samples,
+    targetTemperature: timelineTargetTemperatureMarkers(scene),
+    stage: timelineStageMarkers(scene),
+    photos: timelinePhotoMarkers(scene),
+    timelineStops: timelineStopMarkers(scene, timeline),
+  };
+  state.timeline.overlayCache = { key, data };
+  return data;
+}
+
+function timelineOverlayCacheKey(scene, count) {
+  return [count, timelineDataCacheKey(scene)].join("|");
+}
+
+function timelineDataCacheKey(scene = null) {
+  const events = state.events || [];
+  const firstEvent = events[0] || {};
+  const lastEvent = events[events.length - 1] || {};
+  const samples = state.temperatureSamples || [];
+  const firstSample = samples[0] || {};
+  const lastSample = samples[samples.length - 1] || {};
+  const targetSamples = state.temperatureTargetSamples || [];
+  const firstTargetSample = targetSamples[0] || {};
+  const lastTargetSample = targetSamples[targetSamples.length - 1] || {};
+  const control = timelineControlStatus(scene);
+  const intervals = Array.isArray(control?.intervals) ? control.intervals : [];
+  const lastInterval = intervals[intervals.length - 1] || {};
+  return [
+    state.selectedRunId || state.status?.run_id || "",
+    scene?.revision || "",
+    Boolean(control?.paused),
+    control?.paused_at || "",
+    control?.paused_after_frame_index ?? "",
+    intervals.length,
+    lastInterval.start_time || "",
+    lastInterval.end_time || "",
+    events.length,
+    firstEvent.t || "",
+    firstEvent.ts || "",
+    lastEvent.t || "",
+    lastEvent.ts || "",
+    lastEvent.type || "",
+    lastEvent.tool || "",
+    state.temperatureRevision || 0,
+    samples.length || 0,
+    firstSample.t ? Math.floor(Number(firstSample.t) / 1000) : "",
+    lastSample.t ? Math.floor(Number(lastSample.t) / 30000) : "",
+    lastSample.value !== undefined ? Number(lastSample.value).toFixed(2) : "",
+    targetSamples.length || 0,
+    firstTargetSample.t ? Math.floor(Number(firstTargetSample.t) / 1000) : "",
+    lastTargetSample.t || "",
+    lastTargetSample.value !== undefined ? Number(lastTargetSample.value).toFixed(2) : "",
+  ].join("|");
+}
+
+function timelineOverlayTimeRange(scene = null) {
+  const key = timelineDataCacheKey(scene);
+  if (state.timeline.rangeCache.key === key && state.timeline.rangeCache.data) {
+    return state.timeline.rangeCache.data;
+  }
+  const times = [];
+  for (const stop of timelineStopMarkers(scene)) {
+    if (Number.isFinite(Number(stop.startTime))) times.push(Number(stop.startTime));
+    if (!stop.active && Number.isFinite(Number(stop.endTime))) times.push(Number(stop.endTime));
+  }
+  for (const event of state.events || []) {
+    const eventTime = eventTimeSeconds(event);
+    if (timelineTimeIsStopped(eventTime, scene)) continue;
+    if (timelineEventIsSemantic(event) && Number.isFinite(eventTime)) {
+      times.push(eventTime);
+    }
+    const target = targetTemperatureFromEvent(event);
+    if (Number.isFinite(target) && Number.isFinite(eventTime)) {
+      times.push(eventTime);
+    }
+    if (
+      !Number.isFinite(measuredTemperatureFromEvent(event))
+      && !Number.isFinite(target)
+      && !stagePositionFromEvent(event)
+      && !photoInfoFromEvent(event)
+    ) {
+      continue;
+    }
+    const t = eventTime;
+    if (Number.isFinite(t)) times.push(t);
+  }
+  for (const marker of timelineTargetTemperatureMarkers(scene)) {
+    if (Number.isFinite(Number(marker.time)) && !timelineTimeIsStopped(marker.time, scene)) {
+      times.push(Number(marker.time));
+    }
+  }
+  const telemetryTail = timelineTelemetryTailRange(scene);
+  if (telemetryTail) {
+    times.push(telemetryTail.start, telemetryTail.end);
+  }
+  if (!times.length) {
+    const empty = { start: 0, end: 0, duration: 0 };
+    state.timeline.rangeCache = { key, data: empty };
+    return empty;
+  }
+  const start = Math.min(...times);
+  const end = Math.max(...times);
+  const range = { start, end, duration: Math.max(0.001, end - start) };
+  state.timeline.rangeCache = { key, data: range };
+  return range;
+}
+
+function timelineTelemetryTailRange(scene = null) {
+  const key = timelineDataCacheKey(scene);
+  if (state.timeline.telemetryTailCache.key === key) {
+    return state.timeline.telemetryTailCache.data;
+  }
+  const stopMarkers = timelineStopMarkers(scene);
+  let earliest = null;
+  let latest = null;
+  const pushTime = (rawTime, value, validator) => {
+    if (!validator(value)) return;
+    const time = Number(rawTime) / 1000;
+    if (!Number.isFinite(time) || timelineTimeIsStoppedWithMarkers(time, stopMarkers)) return;
+    earliest = earliest === null ? time : Math.min(earliest, time);
+    latest = latest === null ? time : Math.max(latest, time);
+  };
+  for (const sample of state.temperatureSamples || []) {
+    pushTime(sample?.t, sample?.value, isValidMeasuredTemperature);
+  }
+  for (const sample of state.temperatureTargetSamples || []) {
+    pushTime(sample?.t, sample?.value, isValidTemperatureTarget);
+  }
+  if (!Number.isFinite(latest) || !Number.isFinite(earliest)) {
+    state.timeline.telemetryTailCache = { key, data: null };
+    return null;
+  }
+  const bounds = timelineLoadedEventBounds();
+  if (bounds && latest <= bounds.end + TIMELINE_IDLE_GAP_SECONDS) {
+    state.timeline.telemetryTailCache = { key, data: null };
+    return null;
+  }
+  const tailStart = Math.max(earliest, latest - TIMELINE_TELEMETRY_TAIL_SECONDS);
+  if (!Number.isFinite(tailStart) || latest <= tailStart) {
+    state.timeline.telemetryTailCache = { key, data: null };
+    return null;
+  }
+  const range = {
+    start: tailStart,
+    end: latest,
+    duration: latest - tailStart,
+  };
+  state.timeline.telemetryTailCache = { key, data: range };
+  return range;
+}
+
+function timelineXForTime(layout, range, time) {
+  if (!range?.duration || !Number.isFinite(Number(time))) return null;
+  let progress;
+  if (layout?.timeWarp) {
+    const warpedStart = timelineWarpedTimeForReal(layout.timeWarp, range.start);
+    const warpedEnd = timelineWarpedTimeForReal(layout.timeWarp, range.end);
+    const warpedTime = timelineWarpedTimeForReal(layout.timeWarp, Number(time));
+    progress = (warpedTime - warpedStart) / Math.max(0.001, warpedEnd - warpedStart);
+  } else {
+    progress = (Number(time) - range.start) / range.duration;
+  }
+  return layout.left + progress * layout.trackWidth;
+}
+
+function eventTimeSeconds(event) {
+  const t = Number(event?.t);
+  if (Number.isFinite(t)) return t;
+  if (event?.ts) {
+    const parsed = Date.parse(String(event.ts));
+    if (Number.isFinite(parsed)) return parsed / 1000;
+  }
+  return null;
+}
+
+function eventFrameIndex(event) {
+  const candidates = [
+    event?.frame,
+    event?.frame_index,
+    event?.frame_number !== undefined ? Number(event.frame_number) - 1 : null,
+    event?.result?.frame?.index,
+    event?.result?.frame_index,
+    event?.arguments?.frame_index,
+  ];
+  for (const value of candidates) {
+    const number = Number(value);
+    if (Number.isFinite(number)) return number;
+  }
+  return null;
+}
+
+function timelineMeasuredTemperatureSamples(scene = null) {
+  const stopMarkers = timelineStopMarkers(scene);
+  const eventSamples = [];
+  for (const event of state.events || []) {
+    for (const sample of timelineTemperatureSamplesFromEvent(event)) {
+      if (!timelineTimeIsStoppedWithMarkers(sample.time, stopMarkers)) eventSamples.push(sample);
+    }
+    const temp = measuredTemperatureFromEvent(event);
+    if (!isValidMeasuredTemperature(temp)) continue;
+    const time = eventTimeSeconds(event);
+    if (!Number.isFinite(time)) continue;
+    if (timelineTimeIsStoppedWithMarkers(time, stopMarkers)) continue;
+    eventSamples.push({
+      time,
+      value: temp,
+      event,
+      label: "Measured temperature",
+      lines: [`${temp.toFixed(2)} C`, eventTimeLabel(event)],
+    });
+  }
+  const chartSamples = [];
+  for (const sample of state.temperatureSamples || []) {
+    const value = Number(sample?.value);
+    if (!isValidMeasuredTemperature(value)) continue;
+    const time = Number(sample?.t) / 1000;
+    if (!Number.isFinite(time) || timelineTimeIsStoppedWithMarkers(time, stopMarkers)) continue;
+    chartSamples.push({
+      time,
+      value,
+      source: sample?.source || "history",
+      label: "Measured temperature",
+    });
+  }
+  if (!eventSamples.length) return chartSamples;
+  return dedupeTimelineSamples([...eventSamples, ...chartSamples], (item) => `${Math.round(item.time * 10)}:${Number(item.value).toFixed(2)}`);
+}
+
+function timelineTemperatureSamplesFromEvent(event) {
+  const eventTime = eventTimeSeconds(event);
+  if (!Number.isFinite(eventTime)) return [];
+  const expanded = [];
+  for (const root of eventPayloadRoots(event)) {
+    expanded.push(...timelineRoutineTemperatureSamples(root, event, eventTime));
+    const samples = getPath(root, "samples") || getPath(root, "temperature_samples");
+    if (!Array.isArray(samples) || !samples.length) continue;
+    const elapsedValues = samples
+      .map((sample) => firstFiniteNumber(sample?.elapsed_seconds, sample?.elapsed, sample?.time_seconds))
+      .filter(Number.isFinite);
+    const maxElapsed = elapsedValues.length ? Math.max(...elapsedValues) : 0;
+    const startTime = eventTime - maxElapsed;
+    for (const sample of samples) {
+      const value = firstFiniteNumber(
+        sample?.temperature_c,
+        sample?.temperature,
+        sample?.current_temperature,
+        sample?.current,
+        sample?.value,
+        sample,
+      );
+      if (!isValidMeasuredTemperature(value)) continue;
+      const elapsed = firstFiniteNumber(sample?.elapsed_seconds, sample?.elapsed, sample?.time_seconds);
+      const time = Number.isFinite(elapsed) ? startTime + elapsed : eventTime;
+      expanded.push({
+        time,
+        value,
+        event,
+        label: "Measured temperature",
+        lines: [`${value.toFixed(2)} C`, eventTimeLabel({ t: time })],
+      });
+    }
+  }
+  return expanded;
+}
+
+function timelineRoutineTemperatureSamples(root, event, eventTime) {
+  const samples = [];
+  const startedAt = firstFiniteNumber(getPath(root, "started_at"), getPath(root, "routine.started_at"));
+  const results = getPath(root, "results");
+  let cursor = Number.isFinite(startedAt) ? startedAt : null;
+  if (Array.isArray(results)) {
+    for (const result of results) {
+      const stepSamples = Array.isArray(result?.samples) ? result.samples : [];
+      const maxElapsed = maxTemperatureSampleElapsed(stepSamples);
+      const stepStart = Number.isFinite(cursor) ? cursor : eventTime - maxElapsed;
+      for (const sample of stepSamples) {
+        const value = firstFiniteNumber(sample?.temperature_c, sample?.temperature, sample?.current_temperature, sample?.current, sample?.value);
+        if (!isValidMeasuredTemperature(value)) continue;
+        const elapsed = firstFiniteNumber(sample?.elapsed_seconds, sample?.elapsed, sample?.time_seconds);
+        const time = Number.isFinite(elapsed) ? stepStart + elapsed : eventTime;
+        samples.push({
+          time,
+          value,
+          event,
+          label: "Measured temperature",
+          lines: [`${value.toFixed(2)} C`, eventTimeLabel({ t: time })],
+        });
+      }
+      if (Number.isFinite(cursor)) cursor += Math.max(maxElapsed, firstFiniteNumber(result?.hold_seconds, result?.duration_seconds, 0) || 0);
+    }
+  }
+  const activeStep = getPath(root, "active_step");
+  const lastSample = getPath(root, "last_sample");
+  if (activeStep && lastSample && typeof lastSample === "object") {
+    const value = firstFiniteNumber(lastSample.temperature_c, lastSample.temperature, lastSample.current_temperature, lastSample.current, lastSample.value);
+    if (isValidMeasuredTemperature(value)) {
+      const elapsed = firstFiniteNumber(lastSample.elapsed_seconds, lastSample.elapsed, lastSample.time_seconds);
+      const time = Number.isFinite(elapsed) ? eventTime : eventTime;
+      samples.push({
+        time,
+        value,
+        event,
+        label: "Measured temperature",
+        lines: [`${value.toFixed(2)} C`, eventTimeLabel({ t: time })],
+      });
+    }
+  }
+  return samples;
+}
+
+function maxTemperatureSampleElapsed(samples) {
+  if (!Array.isArray(samples) || !samples.length) return 0;
+  const values = samples
+    .map((sample) => firstFiniteNumber(sample?.elapsed_seconds, sample?.elapsed, sample?.time_seconds))
+    .filter(Number.isFinite);
+  return values.length ? Math.max(...values) : 0;
+}
+
+function timelineTargetTemperatureMarkers(scene = null) {
+  const stopMarkers = timelineStopMarkers(scene);
+  const markers = [];
+  for (const event of state.events || []) {
+    const target = targetTemperatureFromEvent(event);
+    const time = eventTimeSeconds(event);
+    if (isValidTemperatureTarget(target) && Number.isFinite(time) && !timelineTimeIsStoppedWithMarkers(time, stopMarkers)) {
+      markers.push({
+        kind: "target-temperature",
+        time,
+        frame: eventFrameIndex(event),
+        value: target,
+        event,
+        label: "Target temperature",
+        lines: [`Set to ${target.toFixed(1)} C`, eventToolLine(event), eventTimeLabel(event)].filter(Boolean),
+      });
+    }
+    markers.push(...timelineRoutineTargetMarkersFromEvent(event, scene, stopMarkers));
+  }
+  for (const sample of state.temperatureTargetSamples || []) {
+    const sampleTime = Number(sample?.t);
+    const value = Number(sample?.value);
+    if (!Number.isFinite(sampleTime) || !isValidTemperatureTarget(value)) continue;
+    const time = sampleTime / 1000;
+    if (timelineTimeIsStoppedWithMarkers(time, stopMarkers)) continue;
+    markers.push({
+      kind: "target-temperature",
+      time,
+      frame: null,
+      value,
+      source: sample.source || "state",
+      label: "Target temperature",
+      lines: [`Set to ${value.toFixed(1)} C`, eventTimeLabel({ t: time })].filter(Boolean),
+    });
+  }
+  const deduped = dedupeTimelineSamples(markers, (item) => `${Math.round(item.time * 2)}:${item.value.toFixed(1)}`);
+  const changes = [];
+  let lastValue = null;
+  for (const marker of deduped) {
+    const value = Number(marker.value);
+    if (lastValue !== null && Math.abs(value - lastValue) < 0.001) continue;
+    changes.push(marker);
+    lastValue = value;
+  }
+  return changes;
+}
+
+function timelineRoutineTargetMarkersFromEvent(event, scene = null, stopMarkersArg = null) {
+  const eventTime = eventTimeSeconds(event);
+  if (!Number.isFinite(eventTime)) return [];
+  const stopMarkers = stopMarkersArg || timelineStopMarkers(scene);
+  const markers = [];
+  for (const root of eventPayloadRoots(event)) {
+    const startedAt = firstFiniteNumber(getPath(root, "started_at"), getPath(root, "routine.started_at"));
+    const results = getPath(root, "results");
+    let cursor = Number.isFinite(startedAt) ? startedAt : null;
+    if (Array.isArray(results)) {
+      for (const result of results) {
+        const value = firstFiniteNumber(result?.target_c, result?.target_temperature, result?.target, result?.set_result?.actual_value);
+        const stepSamples = Array.isArray(result?.samples) ? result.samples : [];
+        const maxElapsed = maxTemperatureSampleElapsed(stepSamples);
+        const time = Number.isFinite(cursor) ? cursor : eventTime - maxElapsed;
+        if (isValidTemperatureTarget(value) && Number.isFinite(time) && !timelineTimeIsStoppedWithMarkers(time, stopMarkers)) {
+          markers.push({
+            kind: "target-temperature",
+            time,
+            value,
+            event,
+            source: "temperature_routine",
+            label: "Target temperature",
+            lines: [`Set to ${value.toFixed(1)} C`, `Routine step ${Number(result?.index ?? markers.length) + 1}`, eventTimeLabel({ t: time })],
+          });
+        }
+        if (Number.isFinite(cursor)) cursor += Math.max(maxElapsed, firstFiniteNumber(result?.hold_seconds, result?.duration_seconds, 0) || 0);
+      }
+    }
+    const activeStep = getPath(root, "active_step");
+    if (activeStep && typeof activeStep === "object") {
+      const value = firstFiniteNumber(activeStep.target_c, activeStep.target_temperature, activeStep.target);
+      const elapsed = firstFiniteNumber(getPath(root, "last_sample.elapsed_seconds"), getPath(root, "last_sample.elapsed"), 0);
+      const time = Number.isFinite(elapsed) ? eventTime - elapsed : eventTime;
+      if (isValidTemperatureTarget(value) && Number.isFinite(time) && !timelineTimeIsStoppedWithMarkers(time, stopMarkers)) {
+        markers.push({
+          kind: "target-temperature",
+          time,
+          value,
+          event,
+          source: "temperature_routine",
+          label: "Target temperature",
+          lines: [`Set to ${value.toFixed(1)} C`, `Routine step ${Number(activeStep.index ?? 0) + 1}`, eventTimeLabel({ t: time })],
+        });
+      }
+    }
+  }
+  return markers;
+}
+
+function timelineStageMarkers(scene = null) {
+  const markers = [];
+  for (const event of state.events || []) {
+    const position = stagePositionFromEvent(event);
+    if (!position) continue;
+    const time = eventTimeSeconds(event);
+    if (!Number.isFinite(time)) continue;
+    if (timelineTimeIsStopped(time, scene)) continue;
+    markers.push({
+      kind: "stage",
+      time,
+      frame: eventFrameIndex(event),
+      position,
+      event,
+      label: "Stage position",
+      lines: [
+        formatStagePosition(position),
+        eventToolLine(event),
+        eventTimeLabel(event),
+      ].filter(Boolean),
+    });
+  }
+  return dedupeTimelineSamples(markers, (item) => `${Math.round(item.time * 10)}:${formatStagePosition(item.position)}`);
+}
+
+function timelinePhotoMarkers(scene = null) {
+  const markers = [];
+  for (const event of state.events || []) {
+    const photo = photoInfoFromEvent(event);
+    if (!photo) continue;
+    const time = eventTimeSeconds(event);
+    if (!Number.isFinite(time)) continue;
+    if (timelineTimeIsStopped(time, scene)) continue;
+    markers.push({
+      kind: "photo",
+      time,
+      frame: eventFrameIndex(event),
+      photo,
+      event,
+      label: "Photo captured",
+      lines: [
+        photo.source ? `Source ${photo.source}` : "",
+        photo.preset ? `Preset ${photo.preset}` : "",
+        photo.path ? `File ${photo.path}` : "",
+        (photo.path || photo.absolutePath) ? "Click marker to reveal file" : "",
+        eventTimeLabel(event),
+      ].filter(Boolean),
+    });
+  }
+  return dedupeTimelineSamples(markers, (item) => `${Math.round(item.time * 10)}:${item.photo.source || ""}:${item.photo.path || ""}`);
+}
+
+function timelineControlStatus(scene = null, timeline = null) {
+  const effectiveScene = scene || state.live?.scene?.result || state.live?.scene;
+  const effective = timeline || effectiveTimeline(effectiveScene);
+  return effective?.control
+    || effectiveScene?.timeline_control
+    || effectiveScene?.timeline?.control
+    || state.status?.timeline_control
+    || null;
+}
+
+function timelineStopMarkers(scene = null, timeline = null) {
+  const key = timelineStopMarkersCacheKey(scene, timeline);
+  if (state.timeline.stopMarkersCache.key === key && state.timeline.stopMarkersCache.data) {
+    return state.timeline.stopMarkersCache.data;
+  }
+  const control = timelineControlStatus(scene, timeline);
+  const intervals = Array.isArray(control?.intervals) ? control.intervals : [];
+  const markers = intervals
+    .map((interval) => timelineStopMarkerFromInterval(interval, false))
+    .filter(Boolean);
+  if (control?.paused && Number.isFinite(Number(control.paused_at))) {
+    markers.push(timelineStopMarkerFromInterval({
+      id: "active",
+      start_time: control.paused_at,
+      end_time: null,
+      duration_seconds: control.active_duration_seconds,
+      reason: control.paused_reason,
+      source: control.paused_source,
+      after_frame_index: control.paused_after_frame_index,
+    }, true));
+  }
+  const filtered = markers
+    .filter((marker) => timelineStopMarkerBelongsToLoadedRun(marker))
+    .sort((a, b) => a.startTime - b.startTime);
+  state.timeline.stopMarkersCache = { key, data: filtered };
+  return filtered;
+}
+
+function timelineStopMarkersCacheKey(scene = null, timeline = null) {
+  const control = timelineControlStatus(scene, timeline);
+  const intervals = Array.isArray(control?.intervals) ? control.intervals : [];
+  const first = intervals[0] || {};
+  const last = intervals[intervals.length - 1] || {};
+  return [
+    timelineEventBoundsCacheKey(),
+    scene?.revision || "",
+    Boolean(control?.paused),
+    control?.paused_at ?? "",
+    control?.paused_after_frame_index ?? "",
+    control?.active_duration_seconds ?? "",
+    intervals.length,
+    first.start_time ?? "",
+    first.end_time ?? "",
+    last.start_time ?? "",
+    last.end_time ?? "",
+  ].join("|");
+}
+
+function timelineStopMarkerBelongsToLoadedRun(marker) {
+  const bounds = timelineLoadedEventBounds();
+  if (!bounds) return true;
+  const start = Number(marker?.startTime);
+  const end = Number(marker?.endTime);
+  if (!Number.isFinite(start)) return false;
+  const tolerance = 60;
+  if (Number.isFinite(end)) {
+    return end >= bounds.start - tolerance && start <= bounds.end + tolerance;
+  }
+  return start >= bounds.start - tolerance && start <= bounds.end + tolerance;
+}
+
+function timelineLoadedEventBounds() {
+  const key = timelineEventBoundsCacheKey();
+  if (state.timeline.eventBoundsCache.key === key) {
+    return state.timeline.eventBoundsCache.data;
+  }
+  let start = Infinity;
+  let end = -Infinity;
+  for (const event of state.events || []) {
+    const time = eventTimeSeconds(event);
+    if (!Number.isFinite(time)) continue;
+    start = Math.min(start, time);
+    end = Math.max(end, time);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    state.timeline.eventBoundsCache = { key, data: null };
+    return null;
+  }
+  const bounds = { start, end };
+  state.timeline.eventBoundsCache = { key, data: bounds };
+  return bounds;
+}
+
+function timelineEventBoundsCacheKey() {
+  const events = state.events || [];
+  const first = events[0] || {};
+  const last = events[events.length - 1] || {};
+  return [
+    state.selectedRunId || state.status?.run_id || "",
+    events.length,
+    first.t || "",
+    first.ts || "",
+    last.t || "",
+    last.ts || "",
+    last.type || "",
+    last.tool || "",
+  ].join("|");
+}
+
+function timelineTimeIsStopped(time, scene = null, timeline = null) {
+  return timelineTimeIsStoppedWithMarkers(time, timelineStopMarkers(scene, timeline));
+}
+
+function timelineTimeIsStoppedWithMarkers(time, markers) {
+  const numeric = Number(time);
+  if (!Number.isFinite(numeric)) return false;
+  return (markers || []).some((marker) => {
+    const start = Number(marker.startTime);
+    if (!Number.isFinite(start) || numeric <= start) return false;
+    if (marker.active || !Number.isFinite(Number(marker.endTime))) return true;
+    return numeric < Number(marker.endTime);
+  });
+}
+
+function timelineStopMarkerFromInterval(interval, active) {
+  const startTime = Number(interval?.start_time);
+  if (!Number.isFinite(startTime)) return null;
+  const endTime = Number(interval?.end_time);
+  const duration = Number(interval?.duration_seconds);
+  const afterFrameIndex = Number(interval?.after_frame_index);
+  const durationText = Number.isFinite(duration) && duration > 0
+    ? formatRelativeSeconds(duration)
+    : active
+      ? "running"
+      : "0s";
+  return {
+    kind: "timeline_stop",
+    id: interval?.id ?? `${startTime}`,
+    time: startTime,
+    startTime,
+    endTime: Number.isFinite(endTime) ? endTime : null,
+    active: Boolean(active),
+    frame: Number.isFinite(afterFrameIndex) ? afterFrameIndex : null,
+    afterFrameIndex: Number.isFinite(afterFrameIndex) ? afterFrameIndex : null,
+    durationSeconds: Number.isFinite(duration) ? duration : null,
+    label: "Recording stopped",
+    lines: [
+      active ? "Still not recording" : `Duration ${durationText}`,
+      Number.isFinite(afterFrameIndex) ? `After frame ${Math.trunc(afterFrameIndex) + 1}` : "",
+      interval?.reason ? `Reason ${interval.reason}` : "",
+      interval?.resume_reason ? `Resume ${interval.resume_reason}` : "",
+      interval?.source ? `Source ${interval.source}` : "",
+    ].filter(Boolean),
+  };
+}
+
+function dedupeTimelineSamples(items, keyFn) {
+  const seen = new Set();
+  const deduped = [];
+  for (const item of items) {
+    const key = keyFn(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(item);
+  }
+  return deduped.sort((a, b) => {
+    const at = Number(a.time);
+    const bt = Number(b.time);
+    if (Number.isFinite(at) && Number.isFinite(bt)) return at - bt;
+    return Number(a.frame || 0) - Number(b.frame || 0);
+  });
+}
+
+function drawTimelineTemperatureLines(ctx, layout, overlays, hitboxes) {
+  const measuredEnabled = timelineOverlayEnabled("measuredTemperature");
+  const targetEnabled = timelineOverlayEnabled("targetTemperature");
+  if (!measuredEnabled && !targetEnabled) return;
+  const timeRange = layout.visibleTimeRange || overlays.timeRange;
+  const measured = measuredEnabled ? visibleTimelineTemperatureValues(overlays.temperatureSamples, timeRange, layout) : [];
+  const measuredForRender = measuredEnabled ? simplifyTimelineTemperatureSamplesForRender(measured, layout) : [];
+  const targets = targetEnabled ? (overlays.targetTemperature || []).filter((marker) => Number.isFinite(Number(marker.value))) : [];
+  const visibleTargets = visibleTimelineTimeValues(targets, timeRange);
+  const targetValues = targetEnabled ? timelineTargetValuesForRange(targets, timeRange) : [];
+  const values = [
+    ...measuredForRender.map((sample) => Number(sample.value)),
+    ...targetValues,
+  ].filter(Number.isFinite);
+  if (!values.length) return;
+
+  const bounds = timelineTemperaturePlotBounds(layout);
+  const domain = timelineTemperatureDomain(values);
+  const yForValue = (value) => bounds.bottom - ((Number(value) - domain.min) / domain.span) * bounds.height;
+
+  ctx.save();
+  const gradient = ctx.createLinearGradient(0, bounds.top, 0, bounds.bottom);
+  gradient.addColorStop(0, "rgba(255, 255, 255, 0.035)");
+  gradient.addColorStop(1, "rgba(255, 255, 255, 0.006)");
+  ctx.fillStyle = gradient;
+  roundedRect(ctx, layout.left, bounds.top, layout.trackWidth, bounds.height, 5);
+  ctx.fill();
+
+  if (measuredEnabled) {
+    drawTimelineMeasuredTemperatureLine(ctx, layout, timeRange, measuredForRender, yForValue, hitboxes);
+  }
+  if (targetEnabled) {
+    drawTimelineTargetTemperatureLine(ctx, layout, timeRange, targets, visibleTargets, yForValue, hitboxes);
+  }
+  ctx.restore();
+}
+
+function visibleTimelineTimeValues(items, range) {
+  return (items || [])
+    .filter((item) => Number.isFinite(Number(item.time)) && Number.isFinite(Number(item.value)))
+    .filter((item) => !range?.duration || (item.time >= range.start && item.time <= range.end))
+    .sort((a, b) => Number(a.time) - Number(b.time));
+}
+
+function visibleTimelineTemperatureValues(items, range, layout) {
+  return visibleTimelineTimeValues(items, range)
+    .filter((item) => !timelineTimeInsideIdleGap(layout, item.time));
+}
+
+function timelineTimeInsideIdleGap(layout, time) {
+  const numeric = Number(time);
+  if (!Number.isFinite(numeric)) return false;
+  for (const segment of layout?.timeWarp?.segments || []) {
+    if (!segment?.idle) continue;
+    if (numeric > Number(segment.realStart) && numeric < Number(segment.realEnd)) return true;
+  }
+  return false;
+}
+
+function timelineTimesCrossIdleGap(layout, start, end) {
+  const a = Number(start);
+  const b = Number(end);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  const left = Math.min(a, b);
+  const right = Math.max(a, b);
+  return (layout?.timeWarp?.segments || []).some((segment) => (
+    segment?.idle
+    && Number(segment.realStart) > left
+    && Number(segment.realEnd) < right
+  ));
+}
+
+function simplifyTimelineTemperatureSamplesForRender(samples, layout) {
+  const sorted = (samples || [])
+    .filter((sample) => Number.isFinite(Number(sample.time)) && Number.isFinite(Number(sample.value)))
+    .sort((a, b) => Number(a.time) - Number(b.time));
+  const maxPoints = Math.max(80, Math.min(
+    TIMELINE_TEMPERATURE_RENDER_MAX_POINTS,
+    Math.floor(Math.max(1, Number(layout?.trackWidth) || 1) / 3),
+  ));
+  if (sorted.length <= maxPoints) return sorted;
+  const bucketCount = Math.max(1, Math.floor(maxPoints / 3));
+  const start = Number(sorted[0].time);
+  const end = Number(sorted[sorted.length - 1].time);
+  const duration = Math.max(0.001, end - start);
+  const buckets = Array.from({ length: bucketCount }, () => []);
+  for (const sample of sorted) {
+    const index = clamp(Math.floor(((Number(sample.time) - start) / duration) * bucketCount), 0, bucketCount - 1);
+    buckets[index].push(sample);
+  }
+  const simplified = [];
+  for (const bucket of buckets) {
+    if (!bucket.length) continue;
+    const first = bucket[0];
+    const min = bucket.reduce((best, item) => Number(item.value) < Number(best.value) ? item : best, first);
+    const max = bucket.reduce((best, item) => Number(item.value) > Number(best.value) ? item : best, first);
+    const last = bucket[bucket.length - 1];
+    for (const item of [first, min, max, last].sort((a, b) => Number(a.time) - Number(b.time))) {
+      const previous = simplified[simplified.length - 1];
+      if (
+        previous
+        && Math.round(Number(previous.time) * 1000) === Math.round(Number(item.time) * 1000)
+        && Math.abs(Number(previous.value) - Number(item.value)) < 0.0001
+      ) {
+        continue;
+      }
+      simplified.push(item);
+    }
+  }
+  return simplified;
+}
+
+function timelineTargetValuesForRange(markers, range) {
+  if (!Array.isArray(markers) || !markers.length) return [];
+  if (!range?.duration) return markers.map((marker) => Number(marker.value)).filter(Number.isFinite);
+  const sorted = markers
+    .filter((marker) => Number.isFinite(Number(marker.time)) && Number.isFinite(Number(marker.value)))
+    .sort((a, b) => Number(a.time) - Number(b.time));
+  const values = [];
+  let carried = null;
+  for (const marker of sorted) {
+    const time = Number(marker.time);
+    const value = Number(marker.value);
+    if (time <= range.start) carried = value;
+    if (time >= range.start && time <= range.end) values.push(value);
+    if (time > range.end) break;
+  }
+  if (Number.isFinite(carried)) values.push(carried);
+  return values;
+}
+
+function timelineTemperaturePlotBounds(layout) {
+  const top = Math.max(8, layout.top - 6);
+  const bottom = Math.min(layout.height - 20, layout.axisY + 5);
+  const height = Math.max(34, bottom - top);
+  return { top, bottom: top + height, height };
+}
+
+function timelineTemperatureDomain(values) {
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const rawSpan = Math.max(0.5, maxValue - minValue);
+  const padding = Math.max(0.25, rawSpan * 0.12);
+  const min = minValue - padding;
+  const max = maxValue + padding;
+  return { min, max, span: Math.max(0.5, max - min) };
+}
+
+function drawTimelineMeasuredTemperatureLine(ctx, layout, range, samples, yForValue, hitboxes) {
+  if (!samples.length) return;
+  const points = [];
+  ctx.save();
+  ctx.beginPath();
+  let previousTime = null;
+  samples.forEach((sample, index) => {
+    const x = timelineXForTime(layout, range, sample.time);
+    if (!Number.isFinite(x)) return;
+    const y = yForValue(sample.value);
+    points.push({ x, y, sample });
+    if (index === 0 || timelineTimesCrossIdleGap(layout, previousTime, sample.time)) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+    previousTime = sample.time;
+  });
+  ctx.shadowColor = "rgba(10, 132, 255, 0.45)";
+  ctx.shadowBlur = 7;
+  ctx.strokeStyle = "rgba(10, 132, 255, 0.96)";
+  ctx.lineWidth = 2.2;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.stroke();
+  const drawAllPoints = points.length <= 180;
+  const pointStep = drawAllPoints ? 1 : Math.max(1, Math.ceil(points.length / 120));
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index];
+    const hoverKey = timelineOverlayPointKey("measured-temperature", point.sample);
+    const hovered = timelineOverlayPointHovered("measured-temperature", point.sample, hoverKey);
+    const representative = drawAllPoints || hovered || index % pointStep === 0 || index === points.length - 1;
+    if (hovered) {
+      ctx.save();
+      ctx.shadowColor = "rgba(100, 210, 255, 0.72)";
+      ctx.shadowBlur = 12;
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, 7.5, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(100, 210, 255, 0.20)";
+      ctx.fill();
+      ctx.restore();
+    }
+    if (representative) {
+      ctx.beginPath();
+      ctx.arc(point.x, point.y, hovered ? 4.8 : (points.length === 1 ? 3.5 : 1.8), 0, Math.PI * 2);
+      ctx.fillStyle = hovered ? "#dff7ff" : "rgba(100, 210, 255, 0.90)";
+      ctx.fill();
+      ctx.strokeStyle = hovered ? "rgba(10, 132, 255, 0.98)" : "rgba(3, 20, 32, 0.65)";
+      ctx.lineWidth = hovered ? 1.8 : 0.6;
+      ctx.stroke();
+      hitboxes.push({
+        x: point.x - 6,
+        y: point.y - 6,
+        w: 12,
+        h: 12,
+        z: 30,
+        overlay: {
+          ...point.sample,
+          kind: "measured-temperature",
+          hoverKey,
+          label: "Measured temperature",
+          lines: point.sample.lines || measuredTemperatureHoverLines(point.sample),
+        },
+      });
+    }
+  }
+  ctx.restore();
+}
+
+function measuredTemperatureHoverLines(sample) {
+  const value = Number(sample?.value);
+  const time = Number(sample?.time);
+  return [
+    Number.isFinite(value) ? `${value.toFixed(2)} C` : "",
+    Number.isFinite(time) ? eventTimeLabel({ t: time }) : "",
+  ].filter(Boolean);
+}
+
+function timelineOverlayPointKey(kind, item) {
+  const time = Number(item?.time);
+  const value = Number(item?.value);
+  return [
+    kind || "overlay",
+    Number.isFinite(time) ? Math.round(time * 1000) : "",
+    Number.isFinite(value) ? value.toFixed(3) : "",
+  ].join(":");
+}
+
+function timelineOverlayPointHovered(kind, item, key = null) {
+  const overlay = state.timeline.hoverOverlay;
+  if (!overlay || overlay.kind !== kind) return false;
+  const overlayKey = overlay.hoverKey || timelineOverlayPointKey(kind, overlay);
+  const itemKey = key || timelineOverlayPointKey(kind, item);
+  return overlayKey === itemKey;
+}
+
+function drawTimelineTargetTemperatureLine(ctx, layout, range, markers, visibleMarkers, yForValue, hitboxes) {
+  if (!markers.length) return;
+  const sorted = [...markers].sort((a, b) => Number(a.time) - Number(b.time));
+  const startTime = range.start;
+  const endTime = range.end;
+  let currentIndex = -1;
+  for (let index = 0; index < sorted.length; index += 1) {
+    if (Number(sorted[index].time) <= startTime) currentIndex = index;
+  }
+  if (currentIndex < 0) {
+    currentIndex = sorted.findIndex((marker) => Number(marker.time) <= endTime);
+  }
+  if (currentIndex < 0) return;
+
+  const current = sorted[currentIndex];
+  let currentValue = Number(current.value);
+  let cursorTime = Math.max(startTime, Number(current.time));
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(timelineXForTime(layout, range, cursorTime), yForValue(currentValue));
+  for (let index = currentIndex + 1; index < sorted.length; index += 1) {
+    const marker = sorted[index];
+    const markerTime = Number(marker.time);
+    if (!Number.isFinite(markerTime)) continue;
+    if (markerTime < startTime) {
+      currentValue = Number(marker.value);
+      continue;
+    }
+    if (markerTime > endTime) break;
+    const x = timelineXForTime(layout, range, markerTime);
+    ctx.lineTo(x, yForValue(currentValue));
+    currentValue = Number(marker.value);
+    ctx.lineTo(x, yForValue(currentValue));
+    cursorTime = markerTime;
+  }
+  if (cursorTime <= endTime) {
+    ctx.lineTo(timelineXForTime(layout, range, endTime), yForValue(currentValue));
+  }
+  ctx.shadowColor = "rgba(255, 69, 58, 0.48)";
+  ctx.shadowBlur = 7;
+  ctx.strokeStyle = "rgba(255, 69, 58, 0.98)";
+  ctx.lineWidth = 2.4;
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.stroke();
+  ctx.restore();
+
+  for (const marker of visibleMarkers) {
+    drawTimelineTargetTemperatureBubble(ctx, layout, range, marker, yForValue(marker.value), hitboxes);
+  }
+}
+
+function drawTimelineTargetTemperatureBubble(ctx, layout, range, marker, y, hitboxes) {
+  const label = compactTemperatureLabel(marker.value);
+  const rawX = timelineXForTime(layout, range, marker.time);
+  if (!Number.isFinite(rawX)) return;
+  const x = clamp(rawX, layout.left + 13, layout.left + layout.trackWidth - 13);
+  ctx.save();
+  ctx.font = "800 9px -apple-system, BlinkMacSystemFont, Segoe UI";
+  const radius = Math.max(10, Math.min(16, ctx.measureText(label).width / 2 + 5));
+  ctx.shadowColor = "rgba(255, 69, 58, 0.52)";
+  ctx.shadowBlur = 10;
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255, 69, 58, 0.96)";
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "rgba(255, 245, 245, 0.9)";
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.fillStyle = "#fff7f7";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, x, y + 0.5);
+  ctx.restore();
+  hitboxes.push({
+    x: x - radius,
+    y: y - radius,
+    w: radius * 2,
+    h: radius * 2,
+    z: 60,
+    overlay: marker,
+  });
+}
+
+function compactTemperatureLabel(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return Math.abs(number) >= 10 ? String(Math.round(number)) : number.toFixed(1).replace(/\.0$/, "");
+}
+
+function drawTimelineTimeAxis(ctx, layout, range, fullRange = null) {
+  if (!range?.duration || range.duration <= 0.001) return;
+  const y = layout.height - 13;
+  ctx.save();
+  ctx.strokeStyle = "rgba(10, 132, 255, 0.18)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(layout.left, y);
+  ctx.lineTo(layout.left + layout.trackWidth, y);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(100, 210, 255, 0.76)";
+  ctx.font = "9px -apple-system, BlinkMacSystemFont, Segoe UI";
+  const divisions = Math.min(7, Math.max(2, Math.floor(layout.trackWidth / 150)));
+  for (let tick = 0; tick <= divisions; tick += 1) {
+    const progress = tick / divisions;
+    const time = range.start + range.duration * progress;
+    const x = timelineXForTime(layout, range, time);
+    if (!Number.isFinite(x)) continue;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 4);
+    ctx.lineTo(x, y + 3);
+    ctx.stroke();
+    const origin = Number.isFinite(Number(fullRange?.start)) ? Number(fullRange.start) : range.start;
+    ctx.fillText(`+${formatRelativeSeconds(time - origin)}`, x - 8, y + 11);
+  }
+  ctx.restore();
+}
+
+function formatRelativeSeconds(seconds) {
+  const value = Math.max(0, Number(seconds) || 0);
+  if (value < 60) return `${Math.round(value)}s`;
+  if (value >= 3600) {
+    const hours = Math.floor(value / 3600);
+    const minutes = Math.round((value % 3600) / 60);
+    return minutes ? `${hours}h${String(minutes).padStart(2, "0")}` : `${hours}h`;
+  }
+  const minutes = Math.floor(value / 60);
+  const rest = Math.round(value % 60);
+  return `${minutes}m${String(rest).padStart(2, "0")}`;
+}
+
+function drawTimelineStopMarkers(ctx, layout, range, markers, hitboxes) {
+  if (!Array.isArray(markers) || !markers.length || !range?.duration) return;
+  const top = Math.max(4, layout.top - 22);
+  const bottom = Math.max(top + 1, Math.min(layout.height - 8, layout.axisY + 20));
+  ctx.save();
+  for (const marker of markers) {
+    const start = Number(marker.startTime);
+    const end = Number(marker.endTime);
+    if (!Number.isFinite(start)) continue;
+    const active = marker.active || !Number.isFinite(end);
+    if (!active && (end < range.start || start > range.end)) continue;
+    if (active && (start < range.start || start > range.end)) continue;
+    const x0 = timelineXForTime(layout, range, clamp(start, range.start, range.end));
+    if (!Number.isFinite(x0)) continue;
+    if (active) {
+      ctx.beginPath();
+      ctx.moveTo(x0, top);
+      ctx.lineTo(x0, bottom);
+      ctx.strokeStyle = "rgba(255, 214, 10, 0.82)";
+      ctx.lineWidth = 1.6;
+      ctx.setLineDash([2, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      drawTimelineStopCap(ctx, x0, top + 7, "stop");
+      hitboxes.push({
+        x: x0 - 10,
+        y: top,
+        w: 20,
+        h: bottom - top,
+        z: 45,
+        overlay: marker,
+      });
+      continue;
+    }
+    const x1 = timelineXForTime(layout, range, clamp(end, range.start, range.end));
+    if (!Number.isFinite(x1)) continue;
+    const left = Math.min(x0, x1);
+    const width = Math.max(5, Math.abs(x1 - x0));
+    ctx.fillStyle = "rgba(255, 214, 10, 0.10)";
+    ctx.fillRect(left, top, width, bottom - top);
+    ctx.strokeStyle = "rgba(255, 214, 10, 0.38)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([5, 5]);
+    ctx.strokeRect(left + 0.5, top + 0.5, Math.max(0, width - 1), Math.max(0, bottom - top - 1));
+    ctx.setLineDash([]);
+    if (width > 44) {
+      ctx.fillStyle = "rgba(255, 224, 102, 0.92)";
+      ctx.font = "700 9px -apple-system, BlinkMacSystemFont, Segoe UI";
+      ctx.fillText(formatRelativeSeconds(marker.durationSeconds || Math.max(0, end - start)), left + 6, top + 14);
+    }
+    hitboxes.push({
+      x: left,
+      y: top,
+      w: width,
+      h: bottom - top,
+      z: 44,
+      overlay: marker,
+    });
+  }
+  ctx.restore();
+}
+
+function drawTimelineStopCap(ctx, x, y, label) {
+  ctx.save();
+  const text = String(label || "stop");
+  ctx.font = "700 8px -apple-system, BlinkMacSystemFont, Segoe UI";
+  const width = Math.max(24, ctx.measureText(text).width + 10);
+  roundedRect(ctx, x - width / 2, y - 7, width, 14, 5);
+  ctx.fillStyle = "rgba(255, 214, 10, 0.94)";
+  ctx.fill();
+  ctx.fillStyle = "#171407";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, x, y);
+  ctx.restore();
+}
+
+function drawTimelineStageMarkers(ctx, layout, range, markers, hitboxes) {
+  drawTimelineMarkerLane(ctx, layout, markers, hitboxes, {
+    range,
+    y: timelineOverlayLaneY(layout, 1),
+    color: [100, 210, 255],
+    radius: 6,
+    draw: (_marker, x, y) => {
+      ctx.beginPath();
+      ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(100, 210, 255, 0.95)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(245, 245, 247, 0.82)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    },
+  });
+}
+
+function timelineOverlayLaneY(layout, lane) {
+  const base = layout.axisY + 15 + lane * 16;
+  return Math.min(layout.height - 13, base);
+}
+
+function drawTimelinePhotoMarkers(ctx, layout, range, markers, hitboxes) {
+  drawTimelineMarkerLane(ctx, layout, markers, hitboxes, {
+    range,
+    y: layout.top - 10,
+    color: [191, 90, 242],
+    radius: 8,
+    draw: (_marker, x, y) => {
+      drawTimelinePhotoLine(ctx, layout, x);
+      drawCameraGlyph(ctx, x, y);
+    },
+  });
+}
+
+function drawTimelinePhotoLine(ctx, layout, x) {
+  const y0 = Math.max(4, layout.top - 22);
+  const y1 = Math.max(y0 + 1, layout.height - 8);
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x, y0);
+  ctx.lineTo(x, y1);
+  ctx.strokeStyle = "rgba(245, 215, 255, 0.18)";
+  ctx.lineWidth = 4;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x, y0);
+  ctx.lineTo(x, y1);
+  ctx.strokeStyle = "rgba(191, 90, 242, 0.68)";
+  ctx.lineWidth = 1.4;
+  ctx.setLineDash([4, 5]);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawTimelineMarkerLane(ctx, layout, markers, hitboxes, options) {
+  if (!Array.isArray(markers) || !markers.length) return;
+  ctx.save();
+  for (const marker of markers) {
+    if (options.range && (marker.time < options.range.start || marker.time > options.range.end)) continue;
+    if (!options.range && (marker.frame < layout.startFrame || marker.frame > layout.endFrame)) continue;
+    const x = options.range
+      ? timelineXForTime(layout, options.range, marker.time)
+      : timelineXForFrame(layout, marker.frame);
+    if (!Number.isFinite(x)) continue;
+    const y = Number(options.y);
+    options.draw(marker, x, y);
+    const radius = Number(options.radius) || 7;
+    if (marker.kind === "photo") {
+      const lineTop = Math.max(4, layout.top - 22);
+      const lineBottom = Math.max(lineTop + 1, layout.height - 8);
+      hitboxes.push({
+        x: x - 5,
+        y: lineTop,
+        w: 10,
+        h: lineBottom - lineTop,
+        z: 50,
+        overlay: marker,
+      });
+    }
+    hitboxes.push({
+      x: x - radius,
+      y: y - radius,
+      w: radius * 2,
+      h: radius * 2,
+      z: Number(options.z) || (marker.kind === "photo" ? 70 : marker.kind === "stage" ? 40 : 20),
+      overlay: marker,
+    });
+  }
+  ctx.restore();
+}
+
+function drawTimelineBubble(ctx, x, y, text, rgb, textColor) {
+  const label = String(text || "");
+  ctx.save();
+  ctx.font = "700 9px -apple-system, BlinkMacSystemFont, Segoe UI";
+  const w = Math.max(16, ctx.measureText(label).width + 8);
+  roundedRect(ctx, x - w / 2, y - 8, w, 16, 8);
+  ctx.fillStyle = `rgba(${rgb[0]}, ${rgb[1]}, ${rgb[2]}, 0.95)`;
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,0.62)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.fillStyle = textColor || "#050607";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, x, y + 0.5);
+  ctx.restore();
+}
+
+function drawCameraGlyph(ctx, x, y) {
+  ctx.save();
+  ctx.shadowColor = "rgba(191, 90, 242, 0.45)";
+  ctx.shadowBlur = 8;
+  roundedRect(ctx, x - 8, y - 5.5, 16, 11, 3);
+  ctx.fillStyle = "rgba(191, 90, 242, 0.96)";
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  roundedRect(ctx, x - 4.5, y - 8, 9, 4, 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+  ctx.fillStyle = "#050607";
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(x, y, 1.4, 0, Math.PI * 2);
+  ctx.fillStyle = "#f5f5f7";
+  ctx.fill();
+  ctx.restore();
+}
+
+function measuredTemperatureFromEvent(event) {
+  const roots = eventPayloadRoots(event);
+  for (const root of roots) {
+    const direct = firstFiniteNumber(
+      getPath(root, "temperature.current"),
+      getPath(root, "temperature.current_c"),
+      getPath(root, "temperature.value"),
+      getPath(root, "temperature.temperature"),
+      getPath(root, "temperature.current_temperature"),
+      getPath(root, "current_temperature"),
+      getPath(root, "measured_temperature"),
+      getPath(root, "temperature_c"),
+      getPath(root, "measured_c"),
+      getPath(root, "current_c"),
+      getPath(root, "current"),
+    );
+    if (isValidMeasuredTemperature(direct)) return direct;
+    const temperature = getPath(root, "temperature");
+    if (temperature && typeof temperature === "object") {
+      for (const [key, value] of Object.entries(temperature)) {
+        if (/target|setpoint|limit|port|version/i.test(key)) continue;
+        const number = Number(value);
+        if (isValidMeasuredTemperature(number)) return number;
+      }
+    }
+    const samples = getPath(root, "samples") || getPath(root, "temperature_samples");
+    if (Array.isArray(samples) && samples.length) {
+      const sample = samples[samples.length - 1];
+      const number = firstFiniteNumber(sample?.temperature, sample?.current, sample?.value, sample?.temperature_c, sample);
+      if (isValidMeasuredTemperature(number)) return number;
+    }
+  }
+  return null;
+}
+
+function isValidMeasuredTemperature(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return false;
+  // The controller/config can emit sentinel values when no reading exists.
+  if (temperatureValueIsMissingSentinel(number)) return false;
+  return number > -50 && number < 180;
+}
+
+function isValidTemperatureTarget(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return false;
+  if (temperatureValueIsMissingSentinel(number)) return false;
+  return number > -50 && number < 180;
+}
+
+function temperatureValueIsMissingSentinel(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return false;
+  return Math.abs(number) < 1e-9 || Math.abs(number + 1) < 1e-9;
+}
+
+function targetTemperatureFromEvent(event) {
+  const tool = String(event?.tool || "").toLowerCase();
+  const type = String(event?.type || "").toLowerCase();
+  if (
+    (type === "mcp_tool_call" || type === "dashboard_tool_call" || type === "tool_call")
+    && (
+      tool.includes("temperature")
+      || String(getPath(event, "arguments.path") || "").includes("temperature")
+      || event?.arguments?.temperature !== undefined
+      || event?.arguments?.target_temperature !== undefined
+      || event?.arguments?.tarjet_temperature !== undefined
+      || event?.arguments?.target_c !== undefined
+      || event?.arguments?.target !== undefined
+      || event?.arguments?.tarjet !== undefined
+    )
+  ) {
+    const value = firstFiniteNumber(
+      getPath(event, "arguments.temperature"),
+      getPath(event, "arguments.target_temperature"),
+      getPath(event, "arguments.tarjet_temperature"),
+      getPath(event, "arguments.target_c"),
+      getPath(event, "arguments.target"),
+      getPath(event, "arguments.tarjet"),
+      getPath(event, "arguments.temp"),
+      getPath(event, "arguments.value"),
+    );
+    if (isValidTemperatureTarget(value)) return value;
+  }
+  for (const root of eventPayloadRoots(event)) {
+    const value = firstFiniteNumber(
+      getPath(root, "temperature.target"),
+      getPath(root, "temperature.tarjet"),
+      getPath(root, "temperature.target_c"),
+      getPath(root, "temperature.tarjet_c"),
+      getPath(root, "temperature.target_temperature"),
+      getPath(root, "temperature.tarjet_temperature"),
+      getPath(root, "temperature.setpoint"),
+      getPath(root, "temperature.setpoint_c"),
+      getPath(root, "target_c"),
+      getPath(root, "tarjet_c"),
+      getPath(root, "target_temperature"),
+      getPath(root, "tarjet_temperature"),
+      getPath(root, "target_temperature_c"),
+      getPath(root, "tarjet_temperature_c"),
+    );
+    if (isValidTemperatureTarget(value)) return value;
+  }
+  return null;
+}
+
+function stagePositionFromEvent(event) {
+  const tool = String(event?.tool || "").toLowerCase();
+  if (event?.type === "mcp_tool_call" && tool === "move_stage") {
+    return normalizeStagePosition(event?.arguments?.position || event?.arguments?.target_position || event?.arguments);
+  }
+  if (event?.type === "preset_applied") {
+    const stageAction = (event?.result?.actions || []).find((action) => action?.tool === "move_stage");
+    return normalizeStagePosition(stageAction?.result?.actual_position || stageAction?.result?.target_position || stageAction?.arguments?.position);
+  }
+  const stageEventTypes = new Set(["calibration_move_result", "stage_position", "verify_droplet_step"]);
+  if (tool !== "move_stage" && !stageEventTypes.has(String(event?.type || ""))) return null;
+  for (const root of eventPayloadRoots(event)) {
+    const movements = getPath(root, "stage_movements");
+    if (Array.isArray(movements) && movements.length) {
+      const last = movements[movements.length - 1];
+      const movementPosition = normalizeStagePosition(last?.actual_position || last?.target_position || last?.position);
+      if (movementPosition) return movementPosition;
+    }
+    const position = normalizeStagePosition(
+      getPath(root, "actual_position")
+      || getPath(root, "target_position")
+      || getPath(root, "position")
+      || getPath(root, "stage.position")
+      || getPath(root, "stage.current_position")
+      || getPath(root, "stage")
+    );
+    if (position) return position;
+  }
+  return null;
+}
+
+function photoInfoFromEvent(event) {
+  const tool = String(event?.tool || "").toLowerCase();
+  const type = String(event?.type || "").toLowerCase();
+  const roots = eventPayloadRoots(event);
+  const captureLike = /photo|capture|snapshot|visualizer_frame|image/.test(tool)
+    || /photo|capture|snapshot|visualizer|download/.test(type);
+  const configuredImaging = event?.type === "preset_applied"
+    && String(event?.category || "").toLowerCase() === "imaging";
+  if (!captureLike && !configuredImaging) return null;
+  const info = {
+    source: event?.frame_source || event?.visualizer || event?.arguments?.frame_source || event?.arguments?.visualizer || "",
+    preset: configuredImaging ? event?.name : "",
+    path: "",
+    absolutePath: "",
+    mimeType: "",
+  };
+  for (const root of roots) {
+    info.source = info.source
+      || getPath(root, "frame.frame_source")
+      || getPath(root, "frame.visualizer")
+      || getPath(root, "frame_source")
+      || getPath(root, "visualizer")
+      || getPath(root, "source")
+      || "";
+    info.path = info.path
+      || getPath(root, "frame.path")
+      || getPath(root, "artifact.path")
+      || getPath(root, "path")
+      || getPath(root, "file")
+      || getPath(root, "output_path")
+      || "";
+    info.absolutePath = info.absolutePath
+      || getPath(root, "frame.absolute_path")
+      || getPath(root, "artifact.absolute_path")
+      || getPath(root, "absolute_path")
+      || "";
+    info.mimeType = info.mimeType
+      || getPath(root, "frame.mime_type")
+      || getPath(root, "artifact.mime_type")
+      || getPath(root, "mime_type")
+      || "";
+    info.preset = info.preset || getPath(root, "preset.name") || getPath(root, "name") || "";
+  }
+  return info;
+}
+
+function eventPayloadRoots(event) {
+  const roots = [];
+  const push = (value) => {
+    if (value && typeof value === "object") roots.push(value);
+  };
+  push(event);
+  push(event?.arguments);
+  push(event?.result);
+  push(event?.result?.structuredContent);
+  push(event?.result?.structuredContent?.result);
+  push(event?.result?.result);
+  if (Array.isArray(event?.result?.content)) {
+    for (const part of event.result.content) {
+      if (part?.structuredContent) push(part.structuredContent);
+      if (typeof part?.text === "string") {
+        const parsed = parseJsonMaybe(part.text);
+        push(parsed);
+      }
+    }
+  }
+  return roots;
+}
+
+function parseJsonMaybe(text) {
+  const value = String(text || "").trim();
+  if (!value || !/^[\[{]/.test(value)) return null;
+  if (value.length > 60000) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeStagePosition(value) {
+  if (!value || typeof value !== "object") return null;
+  const x = firstFiniteNumber(value.X, value.x, value[0]);
+  const y = firstFiniteNumber(value.Y, value.y, value[1]);
+  const z = firstFiniteNumber(value.Z, value.z, value[2]);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  return {
+    X: Math.trunc(x),
+    Y: Math.trunc(y),
+    ...(Number.isFinite(z) ? { Z: Math.trunc(z) } : {}),
+  };
+}
+
+function formatStagePosition(position) {
+  if (!position) return "";
+  const z = Number.isFinite(Number(position.Z)) ? `, Z ${Math.trunc(position.Z)}` : "";
+  return `X ${Math.trunc(position.X)}, Y ${Math.trunc(position.Y)}${z}`;
+}
+
+function eventToolLine(event) {
+  if (!event?.tool) return "";
+  return `${event.tool}${event.via ? ` via ${event.via}` : ""}`;
+}
+
+function eventTimeLabel(event) {
+  if (event?.ts) return String(event.ts).replace("T", " ").replace(/\.\d+.*$/, " UTC");
+  const t = Number(event?.t);
+  if (Number.isFinite(t)) return new Date(t * 1000).toISOString().replace("T", " ").replace(/\.\d+.*$/, " UTC");
+  return "";
+}
+
 function drawTimelineActiveTicks(ctx, layout, frames, count) {
   if (!Array.isArray(frames) || !frames.length) return;
   ctx.save();
   const maxActive = Math.max(1, ...frames.map((frame) => Number(frame?.summary?.active_count || 0)));
-  const tickBaseY = Math.min(layout.height - 10, layout.axisY + 22);
-  const tickHeight = Math.max(8, layout.height - tickBaseY - 6);
-  ctx.fillStyle = "rgba(100, 210, 255, 0.36)";
+  const tickHeight = Math.max(8, Math.min(18, layout.height - layout.axisY - 54));
+  const tickBaseY = Math.min(layout.height - 10, layout.axisY + 47);
+  const barWidth = Math.max(1.5, Math.min(5, layout.trackWidth / Math.max(1, layout.visibleFrames)));
+  ctx.fillStyle = "rgba(100, 210, 255, 0.56)";
   const step = Math.max(1, Math.ceil(count / Math.max(1, layout.trackWidth)));
   const firstIndex = Math.max(0, Math.floor(layout.startFrame));
   const lastIndex = Math.min(frames.length - 1, Math.ceil(layout.endFrame));
@@ -3933,9 +9062,9 @@ function drawTimelineActiveTicks(ctx, layout, frames, count) {
     if (!Number.isFinite(frameIndex)) continue;
     const active = Number(frame?.summary?.active_count || 0);
     if (active <= 0) continue;
-    const x = timelineXForFrame(layout, frameIndex);
+    const x = clamp(timelineXForFrame(layout, frameIndex), layout.left + barWidth / 2, layout.left + layout.trackWidth - barWidth / 2);
     const h = Math.max(2, tickHeight * Math.sqrt(active / maxActive));
-    ctx.fillRect(x, tickBaseY + tickHeight - h, Math.max(1, layout.trackWidth / count), h);
+    ctx.fillRect(x - barWidth / 2, tickBaseY - h, barWidth, h);
   }
   ctx.restore();
 }
@@ -4018,7 +9147,7 @@ function renderTimelineDropletPanel(scene) {
   close.addEventListener("click", () => {
     setMatrixSelectedDropletIds([]);
     renderMatrixPanel(state.live || {});
-    renderPlanTimeline();
+    schedulePlanTimelineRender();
   });
   header.append(title, close);
 
@@ -4039,10 +9168,12 @@ function renderTimelineDropletPanel(scene) {
       const frame = Number(action.startFrame);
       if (!Number.isFinite(frame)) return;
       state.timeline.followLive = false;
+      markTimelineManualPreview(scene);
       state.timeline.selectedFrame = frame;
+      state.timeline.selectedTime = timelineTimeForFrameFromScene(scene, frame);
       ensureTimelineFrameVisible(frame, timelineFrameCount(scene));
       renderMatrixPanel(state.live || {});
-      renderPlanTimeline();
+      schedulePlanTimelineRender();
     });
     row.addEventListener("mouseenter", () => {
       state.matrixPaths.hoveredActionId = String(action.id || "");
@@ -4278,6 +9409,9 @@ function addDropletId(ids, value) {
 
 function timelineEventColor(type, alpha = 1) {
   const key = String(type || "action").toLowerCase();
+  if (key.includes("execution_tool")) return `rgba(48, 209, 88, ${alpha})`;
+  if (key.includes("planned_")) return `rgba(100, 210, 255, ${alpha})`;
+  if (key.includes("plan_tool")) return `rgba(100, 210, 255, ${alpha})`;
   if (key.includes("merge")) return `rgba(255, 159, 10, ${alpha})`;
   if (key.includes("split") || key.includes("extraction")) return `rgba(191, 90, 242, ${alpha})`;
   if (key.includes("move")) return `rgba(100, 210, 255, ${alpha})`;
@@ -4292,13 +9426,40 @@ function selectTimelineFrameFromEvent(event) {
   const count = timelineFrameCount(scene);
   if (!canvas || !count) return;
   const rect = canvas.getBoundingClientRect();
-  const layout = timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count);
-  const frame = timelineFrameForX(layout, event.clientX - rect.left);
+  const layout = cachedTimelineLayout(canvas, scene, count)
+    || timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count, scene);
+  const time = timelineTimeForX(layout, event.clientX - rect.left);
+  const frame = timelineFrameForTime(layout, time);
   state.timeline.followLive = false;
+  markTimelineManualPreview(scene);
+  state.timeline.selectedTime = time;
   state.timeline.selectedFrame = frame;
-  ensureTimelineFrameVisible(frame, count);
+  ensureTimelineTimeVisible(time, scene, count);
   renderMatrixPanel(state.live || {});
-  renderPlanTimeline();
+  if (!renderTimelineHoverCursorFast(scene, { updateControls: true })) schedulePlanTimelineRender();
+}
+
+function scheduleTimelineHoverFromEvent(event) {
+  state.timeline.pendingHover = {
+    clientX: event.clientX,
+    clientY: event.clientY,
+  };
+  if (state.timeline.hoverRaf !== null) return;
+  state.timeline.hoverRaf = requestAnimationFrame(() => {
+    state.timeline.hoverRaf = null;
+    const pending = state.timeline.pendingHover;
+    state.timeline.pendingHover = null;
+    if (!pending) return;
+    updateTimelineHoverFromEvent(pending);
+  });
+}
+
+function cancelScheduledTimelineHover() {
+  if (state.timeline.hoverRaf !== null) {
+    cancelAnimationFrame(state.timeline.hoverRaf);
+    state.timeline.hoverRaf = null;
+  }
+  state.timeline.pendingHover = null;
 }
 
 function updateTimelineHoverFromEvent(event) {
@@ -4307,45 +9468,240 @@ function updateTimelineHoverFromEvent(event) {
   const count = timelineFrameCount(scene);
   if (!canvas || !count) return;
   const rect = canvas.getBoundingClientRect();
-  const layout = timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count);
+  const layout = cachedTimelineLayout(canvas, scene, count)
+    || timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count, scene);
   const hover = {
     x: event.clientX - rect.left,
     y: event.clientY - rect.top,
   };
-  state.timeline.hoverFrame = timelineFrameForX(layout, hover.x);
+  state.timeline.hoverTime = timelineTimeForX(layout, hover.x);
+  state.timeline.hoverFrame = timelineFrameForTime(layout, state.timeline.hoverTime);
   state.timeline.hoverX = hover.x;
   state.timeline.hoverY = hover.y;
-  const hit = [...state.timelineHitboxes].reverse().find((box) => matrixHitboxContains(box, hover));
-  state.timeline.hoverEvent = hit?.event || null;
-  renderPlanTimeline();
+  const hitKey = [
+    Math.round(hover.x),
+    Math.round(hover.y),
+    state.timeline.canvasBaseCache?.key || "",
+    state.timelineOverlayHitboxes?.length || 0,
+    state.timelineHitboxes?.length || 0,
+  ].join("|");
+  if (hitKey !== state.timeline.hoverHitKey) {
+    const hit = topTimelineHitboxAt(hover, state.timelineOverlayHitboxes, state.timelineHitboxes);
+    state.timeline.hoverOverlay = hit?.overlay || null;
+    state.timeline.hoverEvent = hit?.overlay ? null : (hit?.event || null);
+    state.timeline.hoverHitKey = hitKey;
+  }
+  if (!renderTimelineHoverCursorFast(scene)) schedulePlanTimelineRender();
   updateTimelineHover(hover);
+}
+
+function topTimelineHitboxAt(point, ...groups) {
+  let best = null;
+  let bestOrder = -1;
+  let order = 0;
+  for (const group of groups) {
+    for (const box of group || []) {
+      if (!matrixHitboxContains(box, point)) {
+        order += 1;
+        continue;
+      }
+      if (!best || compareTimelineHitbox(box, best, order, bestOrder) < 0) {
+        best = box;
+        bestOrder = order;
+      }
+      order += 1;
+    }
+  }
+  return best;
+}
+
+function compareTimelineHitbox(a, b, orderA = 0, orderB = 0) {
+  const z = Number(b?.z || 0) - Number(a?.z || 0);
+  if (z) return z;
+  const y = Number(a?.y || 0) - Number(b?.y || 0);
+  if (y) return y;
+  const h = Number(b?.h || 0) - Number(a?.h || 0);
+  if (h) return h;
+  return Number(orderA || 0) - Number(orderB || 0);
 }
 
 function updateTimelineHover(hover) {
   const tooltip = $("timelineHover");
   if (!tooltip) return;
+  const overlay = state.timeline.hoverOverlay;
   const event = state.timeline.hoverEvent;
-  if (!hover || !event) {
+  if (!hover || (!event && !overlay)) {
+    tooltip.classList.remove("overlay");
     tooltip.hidden = true;
+    state.timeline.hoverContentKey = "";
+    state.timeline.hoverHitKey = "";
+    state.timeline.hoverTooltipWidth = 0;
+    state.timeline.hoverTooltipHeight = 0;
     return;
   }
-  const label = formatTimelineEventType(event.type, event.data);
-  const span = timelineEventSpanText(event);
-  const metaLines = timelineEventMetaLines(event);
-  tooltip.innerHTML = [
-    `<strong>${escapeHtml(label)}</strong>`,
-    `<span>${escapeHtml(span)}</span>`,
-    ...metaLines.map((line) => `<span>${escapeHtml(line)}</span>`),
-  ].join("");
-  tooltip.hidden = false;
+  const contentKey = timelineHoverContentKey(event, overlay);
+  const contentChanged = contentKey !== state.timeline.hoverContentKey;
+  if (contentChanged) {
+    const label = overlay?.label || formatTimelineEventType(event.type, event.data);
+    const span = overlay ? timelineOverlaySpanText(overlay) : timelineEventSpanText(event);
+    const metaLines = overlay ? (overlay.lines || []) : timelineEventMetaLines(event);
+    const previewHtml = timelineOverlayPreviewHtml(overlay);
+    tooltip.classList.toggle("overlay", Boolean(overlay));
+    tooltip.classList.toggle("has-preview", Boolean(previewHtml));
+    tooltip.innerHTML = [
+      `<strong>${escapeHtml(label)}</strong>`,
+      `<span>${escapeHtml(span)}</span>`,
+      ...metaLines.map((line) => `<span>${escapeHtml(line)}</span>`),
+      previewHtml,
+    ].join("");
+    state.timeline.hoverContentKey = contentKey;
+    tooltip.hidden = false;
+    state.timeline.hoverTooltipWidth = tooltip.offsetWidth;
+    state.timeline.hoverTooltipHeight = tooltip.offsetHeight;
+  }
+  if (tooltip.hidden) tooltip.hidden = false;
   const canvas = $("planTimeline");
   const panel = canvas?.closest(".plan-timeline-panel");
   const baseX = (canvas?.offsetLeft || 0) + hover.x;
   const baseY = (canvas?.offsetTop || 0) + hover.y;
-  const maxX = Math.max(8, (panel?.clientWidth || 260) - tooltip.offsetWidth - 8);
-  const maxY = Math.max(8, (panel?.clientHeight || 220) - tooltip.offsetHeight - 8);
+  const tooltipWidth = state.timeline.hoverTooltipWidth || tooltip.offsetWidth || 0;
+  const tooltipHeight = state.timeline.hoverTooltipHeight || tooltip.offsetHeight || 0;
+  const maxX = Math.max(8, (panel?.clientWidth || 260) - tooltipWidth - 8);
+  const maxY = Math.max(8, (panel?.clientHeight || 220) - tooltipHeight - 8);
   tooltip.style.left = `${Math.min(maxX, Math.max(8, baseX + 12))}px`;
   tooltip.style.top = `${Math.min(maxY, Math.max(8, baseY + 12))}px`;
+}
+
+function timelineHoverContentKey(event, overlay) {
+  if (overlay) {
+    return [
+      "overlay",
+      overlay.kind || "",
+      overlay.hoverKey || "",
+      overlay.id || "",
+      overlay.time ?? overlay.t ?? "",
+      overlay.value ?? "",
+      overlay.photo?.path || overlay.photo?.absolutePath || overlay.photo?.absolute_path || "",
+    ].join("|");
+  }
+  if (!event) return "";
+  return [
+    "event",
+    event.id || event.event_id || "",
+    event.type || "",
+    event.t ?? event.ts ?? "",
+    event.start_time ?? "",
+    event.end_time ?? "",
+    Array.isArray(event.frame_span) ? event.frame_span.join("-") : "",
+  ].join("|");
+}
+
+function timelineOverlayPreviewHtml(overlay) {
+  if (overlay?.kind !== "photo") return "";
+  const url = timelinePhotoArtifactUrl(overlay.photo);
+  if (!url || !timelinePhotoLooksLikeImage(overlay.photo)) return "";
+  const alt = overlay.photo?.preset
+    ? `Photo preview ${overlay.photo.preset}`
+    : "Photo preview";
+  return `<img class="timeline-photo-preview" src="${escapeHtml(url)}" alt="${escapeHtml(alt)}" loading="lazy" />`;
+}
+
+function timelinePhotoLooksLikeImage(photo) {
+  const mime = String(photo?.mimeType || photo?.mime_type || "").toLowerCase();
+  if (mime.startsWith("image/")) return true;
+  const path = String(photo?.path || photo?.absolutePath || photo?.absolute_path || "").toLowerCase();
+  return /\.(png|jpe?g|webp|gif|bmp|tiff?)($|\?)/.test(path);
+}
+
+function timelinePhotoArtifactUrl(photo) {
+  const runId = state.selectedRunId || state.status?.run_id || "";
+  const path = String(photo?.path || "").trim();
+  const absolutePath = String(photo?.absolutePath || photo?.absolute_path || "").trim();
+  if (!runId || (!path && !absolutePath)) return "";
+  const params = new URLSearchParams({ run_id: runId });
+  if (path) params.set("path", path);
+  if (absolutePath) params.set("absolute_path", absolutePath);
+  return `/run-artifact?${params.toString()}`;
+}
+
+function handleTimelineMarkerClick(event) {
+  const overlay = timelinePhotoOverlayFromPointerEvent(event);
+  if (!overlay) return false;
+  revealTimelinePhoto(overlay.photo);
+  return true;
+}
+
+function timelinePhotoOverlayFromPointerEvent(event) {
+  const overlay = timelineOverlayFromPointerEvent(event);
+  return overlay?.kind === "photo" && overlay.photo ? overlay : null;
+}
+
+function timelineOverlayFromPointerEvent(event) {
+  const canvas = $("planTimeline");
+  if (!canvas) return null;
+  const rect = canvas.getBoundingClientRect();
+  const point = {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+  };
+  const hit = topTimelineHitboxAt(point, state.timelineOverlayHitboxes, state.timelineHitboxes);
+  return hit?.overlay || null;
+}
+
+function revealTimelinePhoto(photo) {
+  const path = String(photo?.path || "").trim();
+  const absolutePath = String(photo?.absolutePath || photo?.absolute_path || "").trim();
+  if (!path && !absolutePath) {
+    appendEvent({
+      ts: new Date().toISOString(),
+      type: "ui_error",
+      level: "warning",
+      message: "Photo marker has no saved file path",
+    });
+    return;
+  }
+  send({
+    type: "reveal_artifact",
+    run_id: state.selectedRunId || state.status?.run_id || "",
+    path,
+    absolute_path: absolutePath,
+  });
+}
+
+function handleArtifactRevealResult(result) {
+  if (result?.ok !== false) return;
+  appendEvent({
+    ts: new Date().toISOString(),
+    type: "ui_error",
+    level: "warning",
+    message: result?.error || "Could not reveal artifact",
+  });
+}
+
+function timelineOverlaySpanText(overlay) {
+  if (overlay?.kind === "idle_gap") {
+    const start = Number(overlay.startTime);
+    const end = Number(overlay.endTime);
+    const duration = Number(overlay.durationSeconds);
+    return `${eventTimeLabel({ t: start })} to ${eventTimeLabel({ t: end })} | skipped ${formatRelativeSeconds(duration)}`;
+  }
+  if (overlay?.kind === "timeline_stop") {
+    const start = Number(overlay.startTime);
+    const end = Number(overlay.endTime);
+    if (overlay.active || !Number.isFinite(end)) {
+      return Number.isFinite(start) ? `Recording stopped at ${eventTimeLabel({ t: start })}` : "Recording stopped";
+    }
+    const duration = Number(overlay.durationSeconds);
+    const durationText = Number.isFinite(duration) ? formatRelativeSeconds(duration) : formatRelativeSeconds(end - start);
+    return `${eventTimeLabel({ t: start })} to ${eventTimeLabel({ t: end })} | ${durationText}`;
+  }
+  const frame = Number(overlay?.frame);
+  const time = Number(overlay?.time);
+  if (Number.isFinite(frame) && Number.isFinite(time)) {
+    return `Frame ${Math.round(frame) + 1} | ${eventTimeLabel({ t: time })}`;
+  }
+  if (Number.isFinite(time)) return eventTimeLabel({ t: time });
+  return Number.isFinite(frame) ? `Frame ${Math.round(frame) + 1}` : "Timeline marker";
 }
 
 function timelineEventSpanText(event) {
@@ -4424,25 +9780,135 @@ function formatTimelineMetaValue(value) {
   return shortText(String(value), 90);
 }
 
-function followLiveTimeline() {
+function timelineLiveBootstrapKey() {
+  return state.status?.run_id || state.selectedRunId || "active";
+}
+
+function resetTimelineLiveBootstrap() {
+  state.timeline.liveBootstrappedRunId = "";
+  state.timeline.manualPreviewExecutionKey = "";
+  state.timeline.manualPreviewAt = 0;
+}
+
+function bootstrapTimelineLiveFromScene(scene) {
+  if (!scene?.available) return;
+  maybeAutoFollowActiveExecution(scene);
+  const key = timelineLiveBootstrapKey();
+  if (state.timeline.liveBootstrappedRunId === key) return;
+
+  const userIsPreviewing =
+    !state.timeline.followLive &&
+    (timelineHasFiniteNumber(state.timeline.selectedFrame) ||
+      timelineHasFiniteNumber(state.timeline.selectedTime));
+  if (!userIsPreviewing) {
+    resetTimelineLiveState(scene);
+  }
+  state.timeline.liveBootstrappedRunId = key;
+}
+
+function timelineActiveExecution(scene) {
+  const executor = scene?.executor || scene?.executor_status || {};
+  return Boolean(
+    executor.is_executing ||
+      executor.running ||
+      executor.executing ||
+      executor.execution_running,
+  );
+}
+
+function timelineExecutionKey(scene) {
+  const executor = scene?.executor || scene?.executor_status || {};
+  const applied = executor.last_applied_frame || scene?.last_applied_frame || {};
+  const plan = scene?.plan || {};
+  const frame = scene?.frame || {};
+  const active = timelineActiveExecution(scene) ? "active" : "idle";
+  const runId = state.status?.run_id || state.selectedRunId || "active";
+  const planId = applied.plan_id || frame.plan_id || plan.plan_id || plan.id || "";
+  const totalFrames = executor.total_frames || frame.count || plan.frame_count || timelineFrameCount(scene) || "";
+  return [runId, active, planId, totalFrames].join("|");
+}
+
+function markTimelineManualPreview(scene = state.live?.scene?.result || state.live?.scene) {
+  state.timeline.manualPreviewExecutionKey = timelineExecutionKey(scene);
+  state.timeline.manualPreviewAt = performance.now();
+}
+
+function maybeAutoFollowActiveExecution(scene) {
+  if (!scene?.available || state.timeline.followLive || !timelineActiveExecution(scene)) return;
+  if (state.timeline.dragging || state.timeline.rangeDrag?.active) return;
+  const key = timelineExecutionKey(scene);
+  const userPreviewedThisExecution = state.timeline.manualPreviewExecutionKey === key;
+  const manualPreviewAt = Number(state.timeline.manualPreviewAt || 0);
+  const justPreviewed = manualPreviewAt > 0
+    && performance.now() - manualPreviewAt < TIMELINE_ACTIVE_EXECUTION_AUTO_FOLLOW_GRACE_MS;
+  if (userPreviewedThisExecution || justPreviewed) return;
+  resetTimelineLiveState(scene);
+  updateTimelineLightweightControls(scene);
+  schedulePlanTimelineRender();
+}
+
+function resetTimelineLiveState(scene = null) {
+  const resolvedScene = scene || state.live?.scene?.result || state.live?.scene;
   state.timeline.followLive = true;
+  state.timeline.manualPreviewExecutionKey = "";
+  state.timeline.manualPreviewAt = 0;
+  state.timeline.dragging = false;
+  state.timeline.moved = false;
+  state.timeline.dragMode = "";
+  const frame = liveFrameIndex(resolvedScene);
+  if (timelineHasFiniteNumber(frame)) {
+    state.timeline.selectedFrame = Math.trunc(Number(frame));
+    state.timeline.selectedTime = timelineTimeForFrameFromScene(
+      resolvedScene,
+      state.timeline.selectedFrame,
+    );
+  } else {
+    state.timeline.selectedFrame = null;
+    state.timeline.selectedTime = null;
+  }
+  state.timeline.hoverFrame = null;
+  state.timeline.hoverTime = null;
+  state.timeline.hoverEvent = null;
+  state.timeline.hoverOverlay = null;
+}
+
+function followLiveTimeline() {
   const scene = state.live?.scene?.result || state.live?.scene;
-  state.timeline.selectedFrame = liveFrameIndex(scene);
-  ensureTimelineFrameVisible(state.timeline.selectedFrame, timelineFrameCount(scene));
+  resetTimelineLiveState(scene);
+  if (timelineHasFiniteNumber(state.timeline.selectedFrame)) {
+    ensureTimelineFrameVisible(state.timeline.selectedFrame, timelineFrameCount(scene));
+  }
   renderMatrixPanel(state.live || {});
-  renderPlanTimeline();
+  schedulePlanTimelineRender();
 }
 
 function ensureTimelineFrameVisible(frame, count) {
   if (!Number.isFinite(Number(frame)) || !count) return;
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const time = timelineTimeForFrameFromScene(scene, frame);
+  if (Number.isFinite(Number(time))) {
+    ensureTimelineTimeVisible(Number(time), scene, count);
+    return;
+  }
   syncTimelineViewport(count);
   const visible = timelineVisibleFrames(count);
-  if (frame < state.timeline.offsetFrame) {
-    state.timeline.offsetFrame = frame;
-  } else if (frame > state.timeline.offsetFrame + visible - 1) {
-    state.timeline.offsetFrame = frame - visible + 1;
-  }
+  if (frame < state.timeline.offsetFrame) state.timeline.offsetFrame = frame;
+  else if (frame > state.timeline.offsetFrame + visible - 1) state.timeline.offsetFrame = frame - visible + 1;
   state.timeline.offsetFrame = clamp(state.timeline.offsetFrame, 0, Math.max(0, count - visible));
+}
+
+function ensureTimelineTimeVisible(time, scene, count) {
+  if (!Number.isFinite(Number(time)) || !count) return;
+  const timeline = effectiveTimeline(scene);
+  const range = timelineDisplayTimeRange(scene, timeline, count);
+  syncTimelineViewport(count, range);
+  const visible = timelineVisibleTimeRange(range);
+  if (time < visible.start) {
+    state.timeline.timeOffset = Number(time) - range.start;
+  } else if (time > visible.end) {
+    state.timeline.timeOffset = Number(time) - range.start - visible.duration;
+  }
+  state.timeline.timeOffset = clamp(state.timeline.timeOffset, 0, Math.max(0, range.duration - visible.duration));
 }
 
 function dragPanTimeline(event) {
@@ -4451,12 +9917,12 @@ function dragPanTimeline(event) {
   const count = timelineFrameCount(scene);
   if (!canvas || !count) return;
   const rect = canvas.getBoundingClientRect();
-  const layout = timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count);
-  const framesPerPixel = layout.visibleFrames / Math.max(1, layout.trackWidth);
-  const deltaFrames = -(event.clientX - state.timeline.dragStartX) * framesPerPixel;
-  const maxOffset = Math.max(0, count - layout.visibleFrames);
-  state.timeline.offsetFrame = clamp(state.timeline.dragStartOffsetFrame + deltaFrames, 0, maxOffset);
-  renderPlanTimeline();
+  const layout = timelineLayout(rect.width || canvas.clientWidth || 1, rect.height || canvas.clientHeight || 1, count, scene);
+  const secondsPerPixel = layout.visibleTimeRange.duration / Math.max(1, layout.trackWidth);
+  const deltaSeconds = -(event.clientX - state.timeline.dragStartX) * secondsPerPixel;
+  const maxOffset = Math.max(0, layout.fullTimeRange.duration - layout.visibleTimeRange.duration);
+  state.timeline.timeOffset = clamp(state.timeline.dragStartOffsetTime + deltaSeconds, 0, maxOffset);
+  schedulePlanTimelineRender();
 }
 
 function zoomStreamerFrame(event) {
@@ -4464,16 +9930,17 @@ function zoomStreamerFrame(event) {
   if (!img) return;
   const viewer = img.closest(".viewer.streamer") || img.closest(".viewer");
   const rect = (viewer || img).getBoundingClientRect();
-  const x = event.clientX - rect.left;
-  const y = event.clientY - rect.top;
+  const bounds = streamerImageBounds(img, rect);
+  const x = event.clientX - rect.left - (viewer?.clientLeft || 0);
+  const y = event.clientY - rect.top - (viewer?.clientTop || 0);
   const view = state.streamerView;
   const oldZoom = Number(view.zoom) || 1;
   const nextZoom = clamp(oldZoom * Math.exp(-event.deltaY * 0.0014), 1, 12);
   if (Math.abs(nextZoom - oldZoom) < 0.001) return;
   const oldPanX = Number(view.panX) || 0;
   const oldPanY = Number(view.panY) || 0;
-  const centerX = rect.width / 2;
-  const centerY = rect.height / 2;
+  const centerX = bounds.centerX;
+  const centerY = bounds.centerY;
   const imageX = (x - centerX - oldPanX) / oldZoom;
   const imageY = (y - centerY - oldPanY) / oldZoom;
   view.zoom = nextZoom;
@@ -4494,6 +9961,34 @@ function resetStreamerView() {
   saveStreamerView();
 }
 
+function streamerImageBounds(img = $("streamerFrame"), rect = null) {
+  const viewer = img?.closest(".viewer.streamer") || img?.closest(".viewer");
+  const viewport = rect || viewer?.getBoundingClientRect();
+  const viewportWidth = Math.max(1, Number(viewer?.clientWidth) || Number(viewport?.width) || 1);
+  const viewportHeight = Math.max(1, Number(viewer?.clientHeight) || Number(viewport?.height) || 1);
+  const naturalWidth = Math.max(1, Number(img?.naturalWidth) || viewportWidth);
+  const naturalHeight = Math.max(1, Number(img?.naturalHeight) || viewportHeight);
+  const scale = Math.min(viewportWidth / naturalWidth, viewportHeight / naturalHeight);
+  const width = Math.max(1, naturalWidth * scale);
+  const height = Math.max(1, naturalHeight * scale);
+  return {
+    viewportWidth,
+    viewportHeight,
+    width,
+    height,
+    x: (viewportWidth - width) / 2,
+    y: (viewportHeight - height) / 2,
+    centerX: viewportWidth / 2,
+    centerY: viewportHeight / 2,
+  };
+}
+
+function refreshStreamerViewForLayout() {
+  if (!$("streamerFrame")) return;
+  applyStreamerView();
+  requestStreamerResolutionUpdate();
+}
+
 function clampStreamerView() {
   const img = $("streamerFrame");
   const view = state.streamerView;
@@ -4502,10 +9997,33 @@ function clampStreamerView() {
   const viewer = img.closest(".viewer");
   const rect = viewer?.getBoundingClientRect();
   if (!rect) return;
-  const maxPanX = Math.max(0, rect.width * (view.zoom - 1) / 2);
-  const maxPanY = Math.max(0, rect.height * (view.zoom - 1) / 2);
+  const bounds = streamerImageBounds(img, rect);
+  preserveStreamerViewAcrossResize(bounds);
+  if (view.zoom <= 1.001) {
+    view.panX = 0;
+    view.panY = 0;
+    return;
+  }
+  const maxPanX = Math.max(0, (bounds.width * view.zoom - bounds.viewportWidth) / 2);
+  const maxPanY = Math.max(0, (bounds.height * view.zoom - bounds.viewportHeight) / 2);
   view.panX = clamp(Number(view.panX) || 0, -maxPanX, maxPanX);
   view.panY = clamp(Number(view.panY) || 0, -maxPanY, maxPanY);
+}
+
+function preserveStreamerViewAcrossResize(bounds) {
+  const view = state.streamerView;
+  const width = Number(bounds?.width);
+  const height = Number(bounds?.height);
+  if (!Number.isFinite(width) || width <= 1 || !Number.isFinite(height) || height <= 1) return;
+
+  const oldWidth = Number(view.lastRectWidth);
+  const oldHeight = Number(view.lastRectHeight);
+  if (Number.isFinite(oldWidth) && oldWidth > 1 && Number.isFinite(oldHeight) && oldHeight > 1) {
+    if (Math.abs(width - oldWidth) > 0.5) view.panX = (Number(view.panX) || 0) * (width / oldWidth);
+    if (Math.abs(height - oldHeight) > 0.5) view.panY = (Number(view.panY) || 0) * (height / oldHeight);
+  }
+  view.lastRectWidth = width;
+  view.lastRectHeight = height;
 }
 
 function applyStreamerView() {
@@ -4513,6 +10031,11 @@ function applyStreamerView() {
   if (!img) return;
   clampStreamerView();
   const view = state.streamerView;
+  const bounds = streamerImageBounds(img);
+  img.style.left = `${bounds.x}px`;
+  img.style.top = `${bounds.y}px`;
+  img.style.width = `${bounds.width}px`;
+  img.style.height = `${bounds.height}px`;
   img.style.transform = `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`;
   img.classList.toggle("zoomed", view.zoom > 1.01);
   img.closest(".viewer")?.classList.toggle("streamer-zoomed", view.zoom > 1.01);
@@ -4523,15 +10046,37 @@ function applyStreamerView() {
 function streamerMetaText(baseText) {
   const zoom = Number(state.streamerView.zoom) || 1;
   const resolution = streamerResolutionForZoom(zoom);
+  if (resolution.full_resolution) {
+    const zoomLabel = zoom > 1.01 ? ` z${zoom.toFixed(1)}x` : "";
+    return `${baseText}${zoomLabel} full-res`;
+  }
   const zoomLabel = zoom > 1.01 ? ` z${zoom.toFixed(1)}x ${resolution.max_width}x${resolution.max_height}` : "";
   return `${baseText}${zoomLabel}`;
 }
 
 function streamerResolutionForZoom(zoom = state.streamerView.zoom) {
+  if (state.calibration.active || state.calibration.data?.active) {
+    return {
+      full_resolution: true,
+      max_width: null,
+      max_height: null,
+    };
+  }
   const factor = clamp(Number(zoom) || 1, 1, 12);
+  const viewer = $("streamerFrame")?.closest(".viewer.streamer");
+  const rect = viewer?.getBoundingClientRect();
+  const dpr = clamp(window.devicePixelRatio || 1, 1, 2);
+  const viewportWidth = Math.max(
+    Number(viewer?.clientWidth) || Number(rect?.width) || 0,
+    960,
+  );
+  const viewportHeight = Math.max(
+    Number(viewer?.clientHeight) || Number(rect?.height) || 0,
+    720,
+  );
   return {
-    max_width: Math.round(clamp(720 * factor, 720, 3200)),
-    max_height: Math.round(clamp(460 * factor, 460, 2200)),
+    max_width: Math.round(clamp(viewportWidth * dpr * factor, 960, 4096)),
+    max_height: Math.round(clamp(viewportHeight * dpr * factor, 720, 3072)),
   };
 }
 
@@ -4541,13 +10086,18 @@ function requestStreamerResolutionUpdate() {
   view.requestTimer = window.setTimeout(() => {
     view.requestTimer = null;
     const resolution = streamerResolutionForZoom();
-    const key = `${resolution.max_width}x${resolution.max_height}`;
+    const key = resolution.full_resolution
+      ? "full-resolution"
+      : `${resolution.max_width}x${resolution.max_height}`;
+    if (view.directActive) refreshDirectStreamerSrc();
     if (key === view.lastRequestKey) return;
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
     view.lastRequestKey = key;
+    const payload = resolution.full_resolution
+      ? { type: "set_streamer_view", full_resolution: true }
+      : { type: "set_streamer_view", ...resolution };
     send({
-      type: "set_streamer_view",
-      ...resolution,
+      ...payload,
       zoom: Number(state.streamerView.zoom) || 1,
     });
   }, 180);
@@ -4593,21 +10143,116 @@ function renderCalibrationFrame(frame) {
     img.removeAttribute("src");
     shell.classList.remove("has-frame");
   }
+  updateCalibrationOverlayGeometry();
+}
+
+function updateCalibrationOverlayGeometry() {
+  const shell = document.querySelector(".calibration-streamer");
+  const img = $("calibrationStreamerFrame");
+  if (!shell || !img) return;
+  const shellRect = shell.getBoundingClientRect();
+  const naturalWidth = Number(img.naturalWidth || 0);
+  const naturalHeight = Number(img.naturalHeight || 0);
+  if (!shellRect.width || !shellRect.height || !naturalWidth || !naturalHeight) {
+    shell.style.removeProperty("--calibration-image-width");
+    shell.style.removeProperty("--calibration-image-height");
+    shell.style.removeProperty("--calibration-target-width");
+    shell.style.removeProperty("--calibration-target-height");
+    return;
+  }
+
+  const imageAspect = naturalWidth / naturalHeight;
+  let imageWidth = shellRect.width;
+  let imageHeight = imageWidth / imageAspect;
+  if (imageHeight > shellRect.height) {
+    imageHeight = shellRect.height;
+    imageWidth = imageHeight * imageAspect;
+  }
+  const calibrationDisplayScale = 0.92;
+  imageWidth *= calibrationDisplayScale;
+  imageHeight *= calibrationDisplayScale;
+
+  const streamer = calibrationStreamerStatus();
+  const frameShape = Array.isArray(streamer?.frame_shape) ? streamer.frame_shape : null;
+  const metadataSourceHeight = Number(frameShape?.[0]);
+  const metadataSourceWidth = Number(frameShape?.[1]);
+  const metadataElectrodeWidth = Number(streamer?.electrode_width_px);
+  const metadataElectrodeHeight = Number(streamer?.electrode_height_px);
+  const hasMetadataGeometry = (
+    Number.isFinite(metadataSourceWidth)
+    && metadataSourceWidth > 0
+    && Number.isFinite(metadataSourceHeight)
+    && metadataSourceHeight > 0
+    && Number.isFinite(metadataElectrodeWidth)
+    && metadataElectrodeWidth > 0
+    && Number.isFinite(metadataElectrodeHeight)
+    && metadataElectrodeHeight > 0
+  );
+
+  const fallbackWidth = imageWidth * 0.154;
+  const fallbackHeight = imageHeight * 0.185;
+  let targetWidth = fallbackWidth;
+  let targetHeight = fallbackHeight;
+  if (hasMetadataGeometry) {
+    const scaleX = imageWidth / metadataSourceWidth;
+    const scaleY = imageHeight / metadataSourceHeight;
+    targetWidth = metadataElectrodeWidth * scaleX;
+    targetHeight = metadataElectrodeHeight * scaleY;
+    const suspicious = (
+      targetWidth > fallbackWidth * 1.8
+      || targetHeight > fallbackHeight * 1.8
+      || targetWidth < fallbackWidth * 0.45
+      || targetHeight < fallbackHeight * 0.45
+    );
+    if (suspicious) {
+      targetWidth = fallbackWidth;
+      targetHeight = fallbackHeight;
+    }
+  }
+  targetWidth = Math.max(8, targetWidth);
+  targetHeight = Math.max(8, targetHeight);
+
+  shell.style.setProperty("--calibration-image-width", `${imageWidth}px`);
+  shell.style.setProperty("--calibration-image-height", `${imageHeight}px`);
+  shell.style.setProperty("--calibration-target-width", `${targetWidth}px`);
+  shell.style.setProperty("--calibration-target-height", `${targetHeight}px`);
+}
+
+function calibrationStreamerStatus() {
+  const visualizers = state.live?.visualizers?.result
+    || state.live?.visualizers?.value
+    || state.live?.visualizers
+    || {};
+  const candidates = [
+    visualizers.streamer,
+    getPath(visualizers, "result.streamer"),
+    getPath(visualizers, "structuredContent.result.streamer"),
+  ];
+  return candidates.find((candidate) => candidate && typeof candidate === "object") || {};
 }
 
 function openCalibrationOverlay() {
   state.calibration.active = true;
+  state.calibration.data = {
+    ...(state.calibration.data || {}),
+    active: true,
+    preparing: true,
+    status: "Preparing calibration",
+  };
   state.calibration.localPosition = normalizeStagePosition(currentStagePosition());
   renderCalibrationOverlay();
+  requestStreamerResolutionUpdate();
   send({ type: "calibration_start" });
 }
 
 function closeCalibrationOverlay() {
+  stopAllCalibrationJogs();
   state.calibration.active = false;
   state.calibration.data = null;
   state.calibration.localPosition = null;
   state.calibration.movePending = false;
   renderCalibrationOverlay();
+  requestStreamerResolutionUpdate();
   send({ type: "calibration_close" });
 }
 
@@ -4626,7 +10271,7 @@ function renderCalibrationOverlay() {
   const stepNumber = Number.isFinite(Number(data.guided_index)) ? Number(data.guided_index) + 1 : "-";
   const stepCount = data.step_count || 3;
   setText("calibrationStepIndex", data.workflow_complete ? "Complete" : `${stepNumber}/${stepCount}`);
-  setText("calibrationStepLabel", step.label ? `Target ${step.label}` : "-");
+  setText("calibrationStepLabel", step.label || "-");
 
   const position = calibrationPosition();
   setText("calibrationX", formatStageCoordinate(position?.X));
@@ -4643,14 +10288,18 @@ function renderCalibrationOverlay() {
   setText("calibrationColumnY", formatCalibrationVector(interColumn[1]));
   setText("calibrationColumnZ", formatCalibrationVector(interColumn[2]));
 
-  for (const button of document.querySelectorAll("[data-calibration-step]")) {
+  const speedKey = String(data.speed_key || state.calibration.speedKey || "2");
+  const speedBusy = Boolean(data.preparing || state.calibration.movePending);
+  for (const button of document.querySelectorAll("[data-calibration-speed]")) {
     button.classList.toggle(
       "active",
-      Number(button.getAttribute("data-calibration-step")) === Number(state.calibration.jogStep),
+      String(button.getAttribute("data-calibration-speed")) === speedKey,
     );
+    button.disabled = speedBusy;
   }
   const accept = $("calibrationAccept");
   if (accept) accept.disabled = Boolean(data.workflow_complete);
+  window.requestAnimationFrame(updateCalibrationOverlayGeometry);
 }
 
 function formatCalibrationVector(value) {
@@ -4676,6 +10325,7 @@ function calibrationPosition() {
 }
 
 function acceptCalibrationStep() {
+  stopAllCalibrationJogs();
   const position = calibrationPosition();
   if (!position) {
     appendEvent({
@@ -4707,6 +10357,16 @@ function handleCalibrationKeydown(event) {
     closeCalibrationOverlay();
     return;
   }
+  if (["1", "2", "3"].includes(key)) {
+    event.preventDefault();
+    if (!calibrationKeyboardBusy()) setCalibrationSpeed(key);
+    return;
+  }
+  const jog = calibrationJogFromKey(key);
+  if (calibrationKeyboardBusy() && (jog || key === "Enter" || key.toLowerCase() === "m" || key.toLowerCase() === "s")) {
+    event.preventDefault();
+    return;
+  }
   if (key === "Enter") {
     event.preventDefault();
     acceptCalibrationStep();
@@ -4714,6 +10374,7 @@ function handleCalibrationKeydown(event) {
   }
   if (key.toLowerCase() === "m") {
     event.preventDefault();
+    stopAllCalibrationJogs();
     send({ type: "calibration_move_to_target" });
     return;
   }
@@ -4722,25 +10383,18 @@ function handleCalibrationKeydown(event) {
     send({ type: "calibration_save" });
     return;
   }
-  if (key === "1" || key === "2" || key === "3") {
-    event.preventDefault();
-    state.calibration.jogStep = key === "1" ? 25 : key === "2" ? 100 : 500;
-    renderCalibrationOverlay();
-    return;
-  }
-
-  const step = Number(state.calibration.jogStep) || 100;
-  const delta = {};
-  if (key === "ArrowLeft") delta.X = -step;
-  else if (key === "ArrowRight") delta.X = step;
-  else if (key === "ArrowUp") delta.Y = step;
-  else if (key === "ArrowDown") delta.Y = -step;
-  else if (key === "-" || key === "_" || key === "PageDown") delta.Z = -step;
-  else if (key === "+" || key === "=" || key === "PageUp") delta.Z = step;
-  else return;
+  if (!jog) return;
 
   event.preventDefault();
-  moveCalibrationStage(delta);
+  startCalibrationJog(jog.axis, jog.direction);
+}
+
+function handleCalibrationKeyup(event) {
+  if (!state.calibration.active && !state.calibration.data?.active) return;
+  const jog = calibrationJogFromKey(event.key);
+  if (!jog) return;
+  event.preventDefault();
+  stopCalibrationJog(jog.axis);
 }
 
 function handleSelectedDropletKeydown(event) {
@@ -4751,14 +10405,14 @@ function handleSelectedDropletKeydown(event) {
     event.preventDefault();
     setMatrixSelectedDropletIds([]);
     renderMatrixPanel(state.live || {});
-    renderPlanTimeline();
+    schedulePlanTimelineRender();
     return;
   }
   if (event.key.toLowerCase() === "r" && selectedIds.length && !state.matrixCommands.planning) {
     event.preventDefault();
     state.matrixMovePreview.rotation = (Number(state.matrixMovePreview.rotation) + 1) % 4;
     renderMatrixPanel(state.live || {});
-    renderPlanTimeline();
+    schedulePlanTimelineRender();
     return;
   }
   const delta = dropletDeltaForVisualArrow(event.key);
@@ -4849,6 +10503,104 @@ function clampDropletCorner(position, droplet, rows, cols) {
   ];
 }
 
+function setCalibrationSpeed(speedKey) {
+  const key = ["1", "2", "3"].includes(String(speedKey)) ? String(speedKey) : "2";
+  if (calibrationKeyboardBusy()) {
+    renderCalibrationOverlay();
+    return;
+  }
+  if (state.calibration.speedKey === key) {
+    renderCalibrationOverlay();
+    return;
+  }
+  state.calibration.speedKey = key;
+  renderCalibrationOverlay();
+  send({ type: "calibration_set_speed", speed_key: key });
+}
+
+function calibrationJogFromKey(key) {
+  if (key === "ArrowLeft") return { axis: "X", direction: -1 };
+  if (key === "ArrowRight") return { axis: "X", direction: 1 };
+  if (key === "ArrowUp") return { axis: "Y", direction: 1 };
+  if (key === "ArrowDown") return { axis: "Y", direction: -1 };
+  if (key === "-" || key === "_" || key === "PageDown" || key === "Subtract") return { axis: "Z", direction: -1 };
+  if (key === "+" || key === "=" || key === "PageUp" || key === "Add") return { axis: "Z", direction: 1 };
+  return null;
+}
+
+function calibrationKeyboardBusy() {
+  return Boolean(state.calibration.data?.preparing || state.calibration.movePending);
+}
+
+function startCalibrationJog(axis, direction) {
+  if (calibrationKeyboardBusy()) return;
+  if (!axis || !direction) return;
+  const directions = state.calibration.jogDirections || { X: 0, Y: 0, Z: 0 };
+  if (directions[axis] === direction) return;
+  directions[axis] = direction;
+  state.calibration.jogDirections = directions;
+  sendCalibrationJog(axis, direction);
+  ensureCalibrationJogKeepalive();
+}
+
+function stopCalibrationJog(axis) {
+  const directions = state.calibration.jogDirections || { X: 0, Y: 0, Z: 0 };
+  if (!axis || directions[axis] === 0) return;
+  directions[axis] = 0;
+  state.calibration.jogDirections = directions;
+  sendCalibrationJog(axis, 0);
+  if (!Object.values(directions).some((value) => Number(value) !== 0)) {
+    clearCalibrationJogKeepalive();
+  }
+}
+
+function stopAllCalibrationJogs() {
+  const directions = state.calibration.jogDirections || { X: 0, Y: 0, Z: 0 };
+  const hadMotion = Object.values(directions).some((value) => Number(value) !== 0);
+  state.calibration.jogDirections = { X: 0, Y: 0, Z: 0 };
+  clearCalibrationJogKeepalive();
+  if (hadMotion || state.calibration.active || state.calibration.data?.active) {
+    send({ type: "calibration_jog", stop_all: true });
+  }
+}
+
+function ensureCalibrationJogKeepalive() {
+  if (state.calibration.jogKeepaliveTimer) return;
+  state.calibration.jogKeepaliveTimer = window.setInterval(() => {
+    if (!state.calibration.active && !state.calibration.data?.active) {
+      stopAllCalibrationJogs();
+      return;
+    }
+    const directions = state.calibration.jogDirections || {};
+    let active = false;
+    for (const axis of ["X", "Y", "Z"]) {
+      const direction = Number(directions[axis] || 0);
+      if (direction === 0) continue;
+      active = true;
+      sendCalibrationJog(axis, direction, { keepalive: true });
+    }
+    if (!active) clearCalibrationJogKeepalive();
+  }, 80);
+}
+
+function clearCalibrationJogKeepalive() {
+  if (!state.calibration.jogKeepaliveTimer) return;
+  window.clearInterval(state.calibration.jogKeepaliveTimer);
+  state.calibration.jogKeepaliveTimer = null;
+}
+
+function sendCalibrationJog(axis, direction, options = {}) {
+  const now = Date.now();
+  const directionValue = Math.max(-1, Math.min(1, Number(direction) || 0));
+  if (!options.keepalive && directionValue !== 0 && now - Number(state.calibration.lastJogAt || 0) < 10) return;
+  state.calibration.lastJogAt = now;
+  send({
+    type: "calibration_jog",
+    axis,
+    direction: directionValue,
+  });
+}
+
 function moveCalibrationStage(delta) {
   const now = Date.now();
   if (now - state.calibration.lastMoveAt < 90) return;
@@ -4869,6 +10621,11 @@ function moveCalibrationStage(delta) {
   state.calibration.localPosition = position;
   state.calibration.lastMoveAt = now;
   state.calibration.movePending = true;
+  beginStageMotionFromCommand({
+    position,
+    source: "calibration",
+    wait_timeout_seconds: 1.2,
+  });
   renderCalibrationOverlay();
   send({
     type: "calibration_move_stage",
@@ -4887,6 +10644,7 @@ function renderMatrixScene(scene, options = {}) {
   viewer.classList.add("has-scene");
   viewer.classList.remove("has-frame");
   img?.removeAttribute("src");
+  syncMatrixViewerSize();
 
   const { ctx, width, height } = prepareCanvas(canvas);
   ctx.clearRect(0, 0, width, height);
@@ -4903,13 +10661,16 @@ function renderMatrixScene(scene, options = {}) {
   drawMatrixRanges(ctx, geom, renderedSummary, "rgba(100, 210, 255, 0.45)");
   drawMatrixPaintOverlay(ctx, geom);
   const microscopeFoV = drawMicroscopeFoV(ctx, geom, scene);
-  const droplets = matrixDropletsWithOverrides(scene.droplets || []);
+  const droplets = matrixDropletsWithOverrides(scene.droplets || [])
+    .map((droplet) => dynamicDropletForSceneFrame(scene, droplet));
   syncMatrixPathState(scene);
   drawMatrixPaths(ctx, geom, scene, droplets);
   drawMatrixQueuedPaths(ctx, geom, droplets);
   const hitboxes = drawMatrixDroplets(ctx, geom, droplets);
   drawMatrixMovePreview(ctx, geom, scene, droplets);
   drawMatrixSelectionBox(ctx);
+  drawMatrixCoordinateAxes(ctx, geom, scene);
+  drawCartridgeInputHoles(ctx, geom, scene);
   drawMatrixOverlay(ctx, width, height, scene);
   state.matrixSceneHitboxes = hitboxes;
   renderMatrixMinimap(scene, geom);
@@ -4929,8 +10690,10 @@ function renderMatrixScene(scene, options = {}) {
     ? "executed"
     : scene.frame?.source === "state"
       ? "state"
-      : scene.frame?.source === "timeline_preview"
-        ? "preview"
+    : scene.frame?.source === "timeline_preview"
+      ? "preview"
+      : scene.frame?.source === "cartridge"
+        ? "cartridge"
       : "plan";
   const zoomLabel = Math.abs(geom.zoom - 1) > 0.01 ? ` z${geom.zoom.toFixed(1)}x` : "";
   const pathCount = matrixPathActions(scene).length
@@ -4938,6 +10701,7 @@ function renderMatrixScene(scene, options = {}) {
   const pathLabel = pathCount ? ` paths ${pathCount}` : "";
   const fovLabel = microscopeFoV ? ` fov ${formatElectrodeCoordinate(microscopeFoV.row)},${formatElectrodeCoordinate(microscopeFoV.col)}` : "";
   meta.textContent = `${source} ${index}/${count} active ${active}${pathLabel}${fovLabel}${zoomLabel}`;
+  updateMatrixLiveBadge(scene);
 }
 
 function matrixShape(scene) {
@@ -4951,7 +10715,7 @@ function matrixSceneGeometry(width, height, rows, cols) {
     view.shapeKey = shapeKey;
     resetMatrixView();
   }
-  const pad = Math.max(10, Math.min(width, height) * 0.035);
+  const pad = Math.max(34, Math.min(width, height) * 0.06);
   const displayCols = rows;
   const displayRows = cols;
   const fitCell = Math.max(1, Math.min(
@@ -5057,26 +10821,82 @@ function zoomMatrixScene(event) {
   renderMatrixPanel(state.live || {});
 }
 
+function startMatrixManualPan(event) {
+  const canvas = $("matrixScene");
+  const scene = state.live?.scene?.result || state.live?.scene;
+  if (!canvas || !scene?.available) return;
+  event.preventDefault();
+  canvas.setPointerCapture?.(event.pointerId);
+  state.matrixView.dragging = true;
+  state.matrixView.moved = false;
+  state.matrixView.dragStartX = event.clientX;
+  state.matrixView.dragStartY = event.clientY;
+  state.matrixView.dragPanX = Number(state.matrixView.panX) || 0;
+  state.matrixView.dragPanY = Number(state.matrixView.panY) || 0;
+  canvas.classList.add("dragging");
+}
+
+function updateMatrixManualPan(event) {
+  if (!state.matrixView.dragging) return;
+  const dx = Number(event.clientX) - Number(state.matrixView.dragStartX);
+  const dy = Number(event.clientY) - Number(state.matrixView.dragStartY);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+  state.matrixView.panX = Number(state.matrixView.dragPanX || 0) + dx;
+  state.matrixView.panY = Number(state.matrixView.dragPanY || 0) + dy;
+  if (Math.hypot(dx, dy) >= 3) state.matrixView.moved = true;
+  clampMatrixPanForCurrentScene();
+  renderMatrixPanel(state.live || {});
+}
+
+function endMatrixManualPan() {
+  if (!state.matrixView.dragging) return;
+  state.matrixView.dragging = false;
+  state.matrixView.moved = false;
+  saveMatrixView();
+}
+
+function cancelMatrixManualPan() {
+  if (!state.matrixView.dragging) return;
+  state.matrixView.dragging = false;
+  state.matrixView.moved = false;
+  saveMatrixView();
+}
+
 function updateMatrixEdgePan(event, rect) {
   const scene = state.live?.scene?.result || state.live?.scene;
   const selectionDrag = state.matrixSelection.dragging;
+  const paintDrag = state.matrixPaint.dragging;
   if (
     !scene?.available
-    || (event.buttons && !selectionDrag)
+    || (event.buttons && !selectionDrag && !paintDrag)
     || state.matrixView.dragging
-    || state.matrixPaint.dragging
     || state.matrixNav.minimapDragging
   ) {
     stopMatrixEdgePan();
     return;
   }
-  const shortSide = Math.min(rect.width, rect.height);
-  const edge = clamp(shortSide * 0.16, 44, 96);
-  const x = event.clientX - rect.left;
-  const y = event.clientY - rect.top;
-  const speed = clamp(shortSide * 0.46, 90, 300);
-  const vx = matrixEdgeVelocity(x, rect.width, edge) * speed;
-  const vy = matrixEdgeVelocity(y, rect.height, edge) * speed;
+  const edgeX = clamp(rect.width * 0.10, 36, 110);
+  const edgeTop = clamp(rect.height * 0.10, 36, 110);
+  const edgeBottom = clamp(rect.height * 0.14, 44, 140);
+  const outsideX = clamp(rect.width * 0.035, 10, 34);
+  const outsideY = clamp(rect.height * 0.05, 12, 46);
+  const rawX = event.clientX - rect.left;
+  const rawY = event.clientY - rect.top;
+  if (
+    rawX < -outsideX
+    || rawX > rect.width + outsideX
+    || rawY < -outsideY
+    || rawY > rect.height + outsideY
+  ) {
+    stopMatrixEdgePan();
+    return;
+  }
+  const x = clamp(rawX, 0, rect.width);
+  const y = clamp(rawY, 0, rect.height);
+  const speedX = clamp(rect.width * 0.24, 70, 220);
+  const speedY = clamp(rect.height * 0.24, 70, 220);
+  const vx = matrixEdgeVelocity(x, rect.width, edgeX) * speedX;
+  const vy = matrixEdgeVelocity(y, rect.height, edgeTop, edgeBottom) * speedY;
   if (Math.abs(vx) < 1 && Math.abs(vy) < 1) {
     stopMatrixEdgePan();
     return;
@@ -5089,13 +10909,13 @@ function updateMatrixEdgePan(event, rect) {
   state.matrixNav.edgePanRaf = requestAnimationFrame(stepMatrixEdgePan);
 }
 
-function matrixEdgeVelocity(position, size, edge) {
-  if (position < edge) {
-    const pull = clamp((edge - position) / edge, 0, 1);
+function matrixEdgeVelocity(position, size, leadingEdge, trailingEdge = leadingEdge) {
+  if (position < leadingEdge) {
+    const pull = clamp((leadingEdge - position) / leadingEdge, 0, 1);
     return Math.pow(pull, 2.2);
   }
-  if (position > size - edge) {
-    const pull = clamp((position - (size - edge)) / edge, 0, 1);
+  if (position > size - trailingEdge) {
+    const pull = clamp((position - (size - trailingEdge)) / trailingEdge, 0, 1);
     return -Math.pow(pull, 2.2);
   }
   return 0;
@@ -5108,6 +10928,7 @@ function stepMatrixEdgePan(now) {
   state.matrixView.panX += state.matrixNav.edgePanVx * dt;
   state.matrixView.panY += state.matrixNav.edgePanVy * dt;
   clampMatrixPanForCurrentScene();
+  updateMatrixDragFromStoredPointer();
   renderMatrixPanel(state.live || {});
   state.matrixNav.edgePanRaf = requestAnimationFrame(stepMatrixEdgePan);
 }
@@ -5148,6 +10969,7 @@ function renderMatrixMinimap(scene, mainGeom = null) {
 
   const summary = scene.frame?.summary || scene.matrix;
   drawMatrixRanges(ctx, geom, summary, "rgba(100, 210, 255, 0.62)");
+  drawCartridgeInputHoles(ctx, geom, scene, { compact: true });
   for (const droplet of matrixDropletsWithOverrides(scene.droplets || [])) {
     const cells = dropletDisplayCells(droplet);
     const bbox = droplet.bbox || bboxFromCells(cells);
@@ -5264,28 +11086,146 @@ function centerMatrixViewportOnDisplay(displayCol, displayRow) {
   renderMatrixPanel(state.live || {});
 }
 
-function canvasPointToDisplayCell(geom, x, y) {
+function canvasPointToDisplayCell(geom, x, y, options = {}) {
+  const col = (x - geom.originX) / geom.cell;
+  const row = (y - geom.originY) / geom.cell;
+  if (options.clamp === false) return { col, row };
   return {
-    col: clamp((x - geom.originX) / geom.cell, 0, geom.displayCols),
-    row: clamp((y - geom.originY) / geom.cell, 0, geom.displayRows),
+    col: clamp(col, 0, geom.displayCols),
+    row: clamp(row, 0, geom.displayRows),
   };
 }
 
-function canvasPointToElectrode(geom, x, y) {
-  const displayCol = (x - geom.originX) / geom.cell;
-  const displayRow = (y - geom.originY) / geom.cell;
-  if (
-    displayCol < 0
-    || displayRow < 0
-    || displayCol >= geom.displayCols
-    || displayRow >= geom.displayRows
-  ) {
-    return null;
-  }
-  const row = geom.rows - Math.floor(displayCol) - 1;
-  const col = Math.floor(displayRow);
+function canvasPointToElectrode(geom, x, y, options = {}) {
+  const info = canvasPointToElectrodeInfo(geom, x, y, options);
+  return info ? { row: info.row, col: info.col } : null;
+}
+
+function canvasPointToElectrodeInfo(geom, x, y, options = {}) {
+  const display = canvasPointToDisplayCell(geom, x, y, { clamp: false });
+  const inside = matrixDisplayPointInside(geom, display);
+  if (!inside && !options.clampToGrid) return null;
+  const electrode = matrixElectrodeFromDisplayPosition(geom, display);
+  if (!electrode) return null;
+  return {
+    ...electrode,
+    inside,
+    display,
+  };
+}
+
+function matrixDisplayPointInside(geom, display) {
+  return !!geom
+    && !!display
+    && display.col >= 0
+    && display.row >= 0
+    && display.col < geom.displayCols
+    && display.row < geom.displayRows;
+}
+
+function matrixElectrodeFromDisplayPosition(geom, display) {
+  if (!geom || !display) return null;
+  const displayCol = clamp(Math.floor(Number(display.col)), 0, geom.displayCols - 1);
+  const displayRow = clamp(Math.floor(Number(display.row)), 0, geom.displayRows - 1);
+  if (!Number.isFinite(displayCol) || !Number.isFinite(displayRow)) return null;
+  const row = geom.rows - displayCol - 1;
+  const col = displayRow;
   if (row < 0 || row >= geom.rows || col < 0 || col >= geom.cols) return null;
   return { row, col };
+}
+
+function matrixGeometryForPointer(rectOverride = null) {
+  const canvas = $("matrixScene");
+  const scene = state.live?.scene?.result || state.live?.scene;
+  if (!canvas || !scene?.available) return null;
+  const rect = rectOverride || canvas.getBoundingClientRect();
+  const shape = matrixShape(scene);
+  const geom = matrixSceneGeometry(
+    Math.max(1, Math.round(rect.width || canvas.clientWidth || 1)),
+    Math.max(1, Math.round(rect.height || canvas.clientHeight || 1)),
+    Math.max(1, Number(shape?.[0] || 128)),
+    Math.max(1, Number(shape?.[1] || 128)),
+  );
+  return { canvas, scene, rect, geom };
+}
+
+function matrixPointerInfoFromEvent(event, options = {}) {
+  const geometry = matrixGeometryForPointer(options.rect || null);
+  if (!geometry) return null;
+  const raw = {
+    x: event.clientX - geometry.rect.left,
+    y: event.clientY - geometry.rect.top,
+  };
+  const hover = options.magnetic
+    ? matrixMagneticHoverPoint(raw, geometry.rect)
+    : matrixHoverPoint(raw, geometry.rect);
+  state.matrixNav.lastPointerX = raw.x;
+  state.matrixNav.lastPointerY = raw.y;
+  state.matrixNav.lastPointerAt = performance.now();
+  state.matrixNav.lastCanvasPoint = hover;
+  return matrixPointerInfoFromCanvasPoint(raw, {
+    ...options,
+    ...geometry,
+    hover,
+  });
+}
+
+function matrixPointerInfoFromCanvasPoint(point, options = {}) {
+  const geometry = options.geom
+    ? options
+    : matrixGeometryForPointer(options.rect || null);
+  if (!geometry?.geom || !point) return null;
+  const display = canvasPointToDisplayCell(geometry.geom, point.x, point.y, { clamp: false });
+  const electrodeInfo = canvasPointToElectrodeInfo(
+    geometry.geom,
+    point.x,
+    point.y,
+    { clampToGrid: options.clampToGrid === true },
+  );
+  return {
+    canvas: geometry.canvas,
+    scene: geometry.scene,
+    rect: geometry.rect,
+    geom: geometry.geom,
+    raw: point,
+    hover: options.hover || matrixHoverPoint(point, geometry.rect),
+    display,
+    electrode: electrodeInfo ? { row: electrodeInfo.row, col: electrodeInfo.col } : null,
+    insideGrid: !!electrodeInfo?.inside,
+  };
+}
+
+function matrixHoverPoint(point, rect) {
+  if (!point || !rect) return null;
+  if (point.x < 0 || point.y < 0 || point.x > rect.width || point.y > rect.height) return null;
+  return { x: point.x, y: point.y };
+}
+
+function matrixMagneticHoverPoint(point, rect) {
+  if (!point || !rect) return null;
+  const inside = point.x >= 0 && point.y >= 0 && point.x <= rect.width && point.y <= rect.height;
+  if (inside) return { x: point.x, y: point.y };
+  const marginX = rect.width * 0.05;
+  const marginY = rect.height * 0.05;
+  const inTrapBand = point.x >= -marginX
+    && point.x <= rect.width + marginX
+    && point.y >= -marginY
+    && point.y <= rect.height + marginY;
+  if (!inTrapBand) return null;
+  const previousX = Number(state.matrixNav.lastPointerX);
+  const previousY = Number(state.matrixNav.lastPointerY);
+  const previousAt = Number(state.matrixNav.lastPointerAt);
+  const now = performance.now();
+  const dt = previousAt ? Math.max(0.001, (now - previousAt) / 1000) : 0;
+  const speed = dt && Number.isFinite(previousX) && Number.isFinite(previousY)
+    ? Math.hypot(point.x - previousX, point.y - previousY) / dt
+    : 0;
+  const escapeSpeed = clamp(Math.max(rect.width, rect.height) * 1.8, 720, 1600);
+  if (speed > escapeSpeed) return null;
+  return {
+    x: clamp(point.x, 0, rect.width),
+    y: clamp(point.y, 0, rect.height),
+  };
 }
 
 function stageFromElectrode(scene, row, col) {
@@ -5400,6 +11340,316 @@ function drawMatrixBackground(ctx, geom) {
     ctx.stroke();
   }
   ctx.restore();
+}
+
+function drawCartridgeInputHoles(ctx, geom, scene, options = {}) {
+  const holes = cartridgeInputHoles(scene);
+  if (!holes.length) return;
+
+  ctx.save();
+  for (const hole of holes) {
+    const region = hole?.electrode_region || hole?.region || hole;
+    const bounds = matrixRegionBounds(region, geom);
+    if (!bounds) continue;
+    const rect = matrixBboxRect(geom, {
+      row_min: bounds.rowMin,
+      row_max: bounds.rowMax,
+      col_min: bounds.colMin,
+      col_max: bounds.colMax,
+    });
+    const normal = inputHoleDisplayNormal(hole, bounds, geom);
+    const port = inputHolePortRect(rect, normal, geom, options);
+    if (port.x + port.w < -18 || port.y + port.h < -18 || port.x > geom.width + 18 || port.y > geom.height + 18) {
+      continue;
+    }
+
+    const colors = inputHoleColors(hole);
+    ctx.shadowColor = colors.glow;
+    ctx.shadowBlur = options.compact ? 4 : Math.max(6, Math.min(18, geom.cell * 1.7));
+    ctx.fillStyle = colors.fill;
+    ctx.strokeStyle = colors.stroke;
+    ctx.lineWidth = options.compact ? 1 : Math.max(1.1, Math.min(2.2, geom.cell * 0.18));
+    roundedRect(ctx, port.x, port.y, port.w, port.h, Math.min(port.w, port.h) * 0.36);
+    ctx.fill();
+    ctx.stroke();
+
+    const centerX = rect.x + rect.w / 2;
+    const centerY = rect.y + rect.h / 2;
+    const dotRadius = Math.max(options.compact ? 1.1 : 2.2, Math.min(options.compact ? 3 : 6, geom.cell * 0.65));
+    ctx.shadowBlur = options.compact ? 0 : Math.max(2, Math.min(8, geom.cell));
+    ctx.fillStyle = colors.core;
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, dotRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (!options.compact && geom.cell >= 4.4) {
+      const label = inputHoleShortLabel(hole);
+      if (label) {
+        ctx.shadowBlur = 0;
+        ctx.font = `${Math.max(8, Math.min(10, geom.cell * 0.82))}px -apple-system, BlinkMacSystemFont, Segoe UI`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = colors.text;
+        ctx.fillText(label, centerX, centerY);
+      }
+    }
+  }
+  ctx.restore();
+}
+
+function drawMatrixCoordinateAxes(ctx, geom, scene) {
+  const cartridge = cartridgeMetadata(scene);
+  const tickEvery = Math.max(1, Number(cartridge?.axis_tick_every || 10));
+  const rowTicks = electrodeAxisTicks(geom.rows, tickEvery);
+  const colTicks = electrodeAxisTicks(geom.cols, tickEvery);
+  const topY = geom.originY;
+  const rightX = geom.originX + geom.gridWidth;
+  const tickLength = Math.max(5, Math.min(12, geom.cell * 2.1));
+  const fontSize = Math.max(8, Math.min(11, geom.cell * 1.45));
+
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.font = `${fontSize}px -apple-system, BlinkMacSystemFont, Segoe UI`;
+
+  if (topY > -36 && topY < geom.height + 36) {
+    const labelY = clamp(topY - tickLength - fontSize - 8, 12, geom.height - 12);
+    drawMatrixAxisRail(ctx, geom.originX, topY, geom.originX + geom.gridWidth, topY, "rgba(87, 222, 255, 0.68)");
+    ctx.strokeStyle = "rgba(87, 222, 255, 0.62)";
+    ctx.fillStyle = "rgba(199, 248, 255, 0.82)";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom";
+    for (const row of rowTicks) {
+      const x = geom.originX + (geom.rows - row - 0.5) * geom.cell;
+      if (x < -28 || x > geom.width + 28) continue;
+      ctx.beginPath();
+      ctx.moveTo(x, topY - tickLength);
+      ctx.lineTo(x, topY - 1);
+      ctx.stroke();
+      ctx.fillText(String(row), x, topY - tickLength - 2);
+    }
+    drawMatrixAxisLabel(ctx, "LEFT", clamp(geom.originX + geom.gridWidth / 2, 48, geom.width - 48), labelY, 0, {
+      color: "rgba(151, 240, 255, 0.76)",
+      glow: "rgba(87, 222, 255, 0.32)",
+    });
+  }
+
+  if (rightX > -36 && rightX < geom.width + 36) {
+    const labelX = clamp(rightX + tickLength + fontSize + 12, 12, geom.width - 12);
+    drawMatrixAxisRail(ctx, rightX, geom.originY, rightX, geom.originY + geom.gridHeight, "rgba(255, 196, 92, 0.68)");
+    ctx.strokeStyle = "rgba(255, 196, 92, 0.62)";
+    ctx.fillStyle = "rgba(255, 230, 184, 0.82)";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const col of colTicks) {
+      const y = geom.originY + (col + 0.5) * geom.cell;
+      if (y < -28 || y > geom.height + 28) continue;
+      ctx.beginPath();
+      ctx.moveTo(rightX + 1, y);
+      ctx.lineTo(rightX + tickLength, y);
+      ctx.stroke();
+      ctx.save();
+      ctx.translate(rightX + tickLength + 5, y);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(String(col), 0, 0);
+      ctx.restore();
+    }
+    drawMatrixAxisLabel(ctx, "TOP", labelX, clamp(geom.originY + geom.gridHeight / 2, 42, geom.height - 42), Math.PI / 2, {
+      color: "rgba(255, 219, 154, 0.78)",
+      glow: "rgba(255, 196, 92, 0.3)",
+    });
+  }
+
+  ctx.restore();
+}
+
+function drawMatrixAxisRail(ctx, x0, y0, x1, y1, color) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.2;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 5;
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawMatrixAxisLabel(ctx, text, x, y, angle, colors) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.font = `700 12px -apple-system, BlinkMacSystemFont, Segoe UI`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.shadowColor = colors.glow;
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = colors.color;
+  ctx.fillText(text, 0, 0);
+  ctx.restore();
+}
+
+function cartridgeMetadata(scene) {
+  const cartridge = scene?.cartridge
+    || scene?.metadata?.cartridge
+    || scene?.context?.cartridge
+    || scene?.result?.cartridge;
+  return cartridge && typeof cartridge === "object" ? cartridge : null;
+}
+
+function cartridgeInputHoles(scene) {
+  const cartridge = cartridgeMetadata(scene);
+  const holes = cartridge?.input_holes || cartridge?.inputHoles;
+  return Array.isArray(holes) ? holes.filter((hole) => hole && typeof hole === "object") : [];
+}
+
+function matrixRegionBounds(region, geom) {
+  if (!region || typeof region !== "object") return null;
+  let rowRange = normalizeElectrodeRange(firstDefined(
+    region.rows,
+    region.row_range,
+    region.rowRange,
+    region.row,
+    region.r,
+  ), geom.rows);
+  let colRange = normalizeElectrodeRange(firstDefined(
+    region.columns,
+    region.cols,
+    region.column_range,
+    region.columnRange,
+    region.column,
+    region.col,
+    region.c,
+  ), geom.cols);
+
+  const explicitRowMin = firstFiniteNumber(region.row_min, region.rowMin, region.r0, region.start_row);
+  const explicitRowMax = firstFiniteNumber(region.row_max, region.rowMax, region.r1, region.end_row);
+  const explicitColMin = firstFiniteNumber(region.column_min, region.columnMin, region.col_min, region.colMin, region.c0, region.start_column);
+  const explicitColMax = firstFiniteNumber(region.column_max, region.columnMax, region.col_max, region.colMax, region.c1, region.end_column);
+  if (!rowRange && Number.isFinite(explicitRowMin) && Number.isFinite(explicitRowMax)) {
+    rowRange = normalizeElectrodeRange([explicitRowMin, explicitRowMax], geom.rows);
+  }
+  if (!colRange && Number.isFinite(explicitColMin) && Number.isFinite(explicitColMax)) {
+    colRange = normalizeElectrodeRange([explicitColMin, explicitColMax], geom.cols);
+  }
+  if (!rowRange || !colRange) return null;
+  return {
+    rowMin: rowRange[0],
+    rowMax: rowRange[1],
+    colMin: colRange[0],
+    colMax: colRange[1],
+  };
+}
+
+function normalizeElectrodeRange(value, limit) {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return normalizeElectrodeRange([
+      firstDefined(value.min, value.start, value.first, value.from),
+      firstDefined(value.max, value.end, value.last, value.to),
+    ], limit);
+  }
+  const values = Array.isArray(value) ? value : [value, value];
+  if (!values.length) return null;
+  const first = Number(values[0]);
+  const last = Number(values.length > 1 ? values[1] : values[0]);
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return null;
+  const min = Math.trunc(clamp(Math.min(first, last), 0, limit - 1));
+  const max = Math.trunc(clamp(Math.max(first, last), 0, limit - 1));
+  return [min, max];
+}
+
+function inputHoleDisplayNormal(hole, bounds, geom) {
+  const side = String(hole?.side || "").toLowerCase();
+  if (side === "left") return { x: 0, y: -1 };
+  if (side === "right") return { x: 0, y: 1 };
+  if (side === "top") return { x: 1, y: 0 };
+  if (side === "bottom") return { x: -1, y: 0 };
+  if (bounds.colMin <= 0) return { x: 0, y: -1 };
+  if (bounds.colMax >= geom.cols - 1) return { x: 0, y: 1 };
+  if (bounds.rowMin <= 0) return { x: 1, y: 0 };
+  if (bounds.rowMax >= geom.rows - 1) return { x: -1, y: 0 };
+  return { x: 0, y: 0 };
+}
+
+function inputHolePortRect(rect, normal, geom, options = {}) {
+  const compact = !!options.compact;
+  const depth = compact ? Math.max(2.5, geom.cell * 1.8) : Math.max(10, Math.min(24, geom.cell * 3.4));
+  const alongPad = compact ? Math.max(0.8, geom.cell * 0.35) : Math.max(4, Math.min(10, geom.cell * 1.05));
+  const minAlong = compact ? 2 : 16;
+  let x = rect.x;
+  let y = rect.y;
+  let w = rect.w;
+  let h = rect.h;
+  if (normal.y < 0) {
+    x -= alongPad;
+    y -= depth * 0.62;
+    w += alongPad * 2;
+    h = Math.max(h + depth, minAlong);
+  } else if (normal.y > 0) {
+    x -= alongPad;
+    w += alongPad * 2;
+    h = Math.max(h + depth, minAlong);
+  } else if (normal.x > 0) {
+    y -= alongPad;
+    w = Math.max(w + depth, minAlong);
+    h += alongPad * 2;
+  } else if (normal.x < 0) {
+    x -= depth * 0.62;
+    y -= alongPad;
+    w = Math.max(w + depth, minAlong);
+    h += alongPad * 2;
+  } else {
+    x -= alongPad;
+    y -= alongPad;
+    w += alongPad * 2;
+    h += alongPad * 2;
+  }
+  return { x, y, w: Math.max(1, w), h: Math.max(1, h) };
+}
+
+function inputHoleColors(hole) {
+  const side = String(hole?.side || "").toLowerCase();
+  if (side === "right" || side === "bottom") {
+    return {
+      fill: "rgba(255, 181, 84, 0.28)",
+      stroke: "rgba(255, 202, 116, 0.92)",
+      core: "rgba(255, 232, 180, 0.94)",
+      glow: "rgba(255, 181, 84, 0.42)",
+      text: "rgba(255, 245, 222, 0.9)",
+    };
+  }
+  return {
+    fill: "rgba(83, 222, 255, 0.28)",
+    stroke: "rgba(126, 237, 255, 0.92)",
+    core: "rgba(211, 250, 255, 0.94)",
+    glow: "rgba(83, 222, 255, 0.42)",
+    text: "rgba(232, 253, 255, 0.9)",
+  };
+}
+
+function inputHoleShortLabel(hole) {
+  const id = String(hole?.id || "").trim();
+  if (!id) return "";
+  if (id.includes("upper")) return "IN";
+  if (id.includes("lower")) return "IN";
+  return "IN";
+}
+
+function electrodeAxisTicks(count, every = 10) {
+  const limit = Math.max(1, Math.trunc(Number(count) || 1));
+  const step = Math.max(1, Math.trunc(Number(every) || 10));
+  const ticks = [];
+  for (let value = 0; value < limit; value += step) ticks.push(value);
+  const last = limit - 1;
+  if (last > 0 && last - ticks[ticks.length - 1] >= Math.max(4, Math.floor(step / 2))) {
+    ticks.push(last);
+  }
+  return ticks;
+}
+
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null);
 }
 
 function drawMicroscopeFoV(ctx, geom, scene) {
@@ -5532,7 +11782,7 @@ function clearMatrixSelectionForPaintMode(options = {}) {
   state.matrixCommands.queues.clear();
   if (options.render !== false && hadSelection) {
     renderMatrixCommandPanel();
-    renderPlanTimeline();
+    schedulePlanTimelineRender();
   }
 }
 
@@ -5567,19 +11817,112 @@ function activeMatrixPaintValue() {
   return null;
 }
 
-function matrixElectrodeFromPointerEvent(event) {
-  const canvas = $("matrixScene");
-  const scene = state.live?.scene?.result || state.live?.scene;
-  if (!canvas || !scene?.available) return null;
-  const rect = canvas.getBoundingClientRect();
-  const shape = matrixShape(scene);
-  const geom = matrixSceneGeometry(
-    Math.max(1, Math.round(rect.width || canvas.clientWidth || 1)),
-    Math.max(1, Math.round(rect.height || canvas.clientHeight || 1)),
-    Math.max(1, Number(shape?.[0] || 128)),
-    Math.max(1, Number(shape?.[1] || 128)),
+function matrixElectrodeFromPointerEvent(event, options = {}) {
+  const pointer = matrixPointerInfoFromEvent(event, {
+    clampToGrid: options.clampToGrid === true,
+    magnetic: options.magnetic === true,
+  });
+  return pointer?.electrode || null;
+}
+
+function updateMatrixPaintDragFromPointer(pointer, options = {}) {
+  if (!state.matrixPaint.dragging || !pointer) return;
+  if (pointer.electrode) state.matrixPaint.current = pointer.electrode;
+  if (pointer.display) state.matrixPaint.currentDisplay = pointer.display;
+  if (options.render !== false) renderMatrixPanel(state.live || {});
+}
+
+function updateMatrixDragFromStoredPointer() {
+  const x = Number(state.matrixNav.lastPointerX);
+  const y = Number(state.matrixNav.lastPointerY);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  if (!state.matrixPaint.dragging && !state.matrixSelection.dragging) return;
+  const pointer = matrixPointerInfoFromCanvasPoint(
+    { x, y },
+    {
+      clampToGrid: true,
+      hover: state.matrixNav.lastCanvasPoint,
+    },
   );
-  return canvasPointToElectrode(geom, event.clientX - rect.left, event.clientY - rect.top);
+  if (!pointer) return;
+  if (state.matrixPaint.dragging) updateMatrixPaintDragFromPointer(pointer, { render: false });
+  if (state.matrixSelection.dragging) updateMatrixSelectionDragFromPointer(pointer, { render: false });
+}
+
+function matrixElectrodeRectFromDisplayDrag(start, current) {
+  const geometry = matrixGeometryForPointer();
+  if (!geometry?.geom || !start || !current) return null;
+  const geom = geometry.geom;
+  const left = Math.min(Number(start.col), Number(current.col));
+  const right = Math.max(Number(start.col), Number(current.col));
+  const top = Math.min(Number(start.row), Number(current.row));
+  const bottom = Math.max(Number(start.row), Number(current.row));
+  if (![left, right, top, bottom].every(Number.isFinite)) return null;
+
+  const pointDrag = Math.abs(right - left) < 1e-6 && Math.abs(bottom - top) < 1e-6;
+  if (pointDrag) {
+    if (!matrixDisplayPointInside(geom, start)) return null;
+    const electrode = matrixElectrodeFromDisplayPosition(geom, start);
+    return electrode
+      ? {
+          row_min: electrode.row,
+          row_max: electrode.row,
+          col_min: electrode.col,
+          col_max: electrode.col,
+        }
+      : null;
+  }
+
+  if (
+    right < 0
+    || left >= geom.displayCols
+    || bottom < 0
+    || top >= geom.displayRows
+  ) {
+    return null;
+  }
+
+  const displayColMin = clamp(Math.floor(Math.max(left, 0)), 0, geom.displayCols - 1);
+  const displayColMax = clamp(Math.floor(Math.min(right, geom.displayCols - 1e-9)), 0, geom.displayCols - 1);
+  const displayRowMin = clamp(Math.floor(Math.max(top, 0)), 0, geom.displayRows - 1);
+  const displayRowMax = clamp(Math.floor(Math.min(bottom, geom.displayRows - 1e-9)), 0, geom.displayRows - 1);
+  if (![displayColMin, displayColMax, displayRowMin, displayRowMax].every(Number.isFinite)) return null;
+
+  return {
+    row_min: geom.rows - displayColMax - 1,
+    row_max: geom.rows - displayColMin - 1,
+    col_min: displayRowMin,
+    col_max: displayRowMax,
+  };
+}
+
+function matrixCanvasRectFromDisplayDrag(start, current) {
+  const geometry = matrixGeometryForPointer();
+  if (!geometry?.geom || !start || !current) return null;
+  const geom = geometry.geom;
+  const left = Math.min(Number(start.col), Number(current.col));
+  const right = Math.max(Number(start.col), Number(current.col));
+  const top = Math.min(Number(start.row), Number(current.row));
+  const bottom = Math.max(Number(start.row), Number(current.row));
+  if (![left, right, top, bottom].every(Number.isFinite)) return null;
+  if (
+    right < 0
+    || left >= geom.displayCols
+    || bottom < 0
+    || top >= geom.displayRows
+  ) {
+    return null;
+  }
+  const clippedLeft = clamp(left, 0, geom.displayCols);
+  const clippedRight = clamp(right, 0, geom.displayCols);
+  const clippedTop = clamp(top, 0, geom.displayRows);
+  const clippedBottom = clamp(bottom, 0, geom.displayRows);
+  return {
+    x: geom.originX + clippedLeft * geom.cell,
+    y: geom.originY + clippedTop * geom.cell,
+    w: Math.max(0, (clippedRight - clippedLeft) * geom.cell),
+    h: Math.max(0, (clippedBottom - clippedTop) * geom.cell),
+  };
 }
 
 function matrixPaintRect() {
@@ -5587,6 +11930,13 @@ function matrixPaintRect() {
   const current = state.matrixPaint.current;
   const value = activeMatrixPaintValue();
   if (!start || !current || value === null) return null;
+  if (state.matrixPaint.startDisplay && state.matrixPaint.currentDisplay) {
+    const rect = matrixElectrodeRectFromDisplayDrag(
+      state.matrixPaint.startDisplay,
+      state.matrixPaint.currentDisplay,
+    );
+    return rect ? { ...rect, value } : null;
+  }
   return {
     row_min: Math.min(start.row, current.row),
     row_max: Math.max(start.row, current.row),
@@ -5637,6 +11987,8 @@ function endMatrixPaintDrag() {
   state.matrixPaint.dragging = false;
   state.matrixPaint.start = null;
   state.matrixPaint.current = null;
+  state.matrixPaint.startDisplay = null;
+  state.matrixPaint.currentDisplay = null;
   if (!rect) {
     renderMatrixPanel(state.live || {});
     return;
@@ -5780,6 +12132,8 @@ function cancelMatrixPaintDrag() {
   state.matrixPaint.dragging = false;
   state.matrixPaint.start = null;
   state.matrixPaint.current = null;
+  state.matrixPaint.startDisplay = null;
+  state.matrixPaint.currentDisplay = null;
   renderMatrixPanel(state.live || {});
 }
 
@@ -5950,7 +12304,7 @@ function planSelectedMatrixCommandQueue() {
   state.matrixCommands.planning = true;
   state.matrixCommands.lastError = "";
   renderMatrixCommandPanel();
-  renderPlanTimeline();
+  schedulePlanTimelineRender();
   send({
     type: "matrix_plan_waypoint_paths",
     droplet_id: dropletId,
@@ -6125,6 +12479,74 @@ function dropletDisplayCells(droplet) {
   return direct;
 }
 
+function dynamicDropletForSceneFrame(scene, droplet) {
+  if (!droplet || droplet.id === undefined || droplet.id === null) return droplet;
+  if (!sceneFrameIsLinearExtraction(scene, Number(droplet.id))) return droplet;
+  const summary = scene?.frame?.summary || scene?.matrix;
+  const activeCells = matrixSummaryCells(summary);
+  if (!activeCells.length) return droplet;
+
+  const siblingCells = new Set();
+  for (const sibling of scene?.droplets || []) {
+    if (!sibling || Number(sibling.id) === Number(droplet.id) || sibling.active === false) continue;
+    for (const cell of dropletDisplayCells(sibling)) {
+      siblingCells.add(matrixCellKey(cell[0], cell[1]));
+    }
+  }
+  const cells = activeCells.filter((cell) => !siblingCells.has(matrixCellKey(cell[0], cell[1])));
+  if (!cells.length) return droplet;
+  return {
+    ...droplet,
+    cells,
+    cells_truncated: false,
+    bbox: bboxFromCells(cells),
+    shape_size: cells.length,
+    dynamic_shape: true,
+  };
+}
+
+function sceneFrameIsLinearExtraction(scene, dropletId) {
+  const currentEvent = scene?.plan?.current_event;
+  const type = Array.isArray(currentEvent) ? String(currentEvent[1] || "").toLowerCase() : "";
+  const data = Array.isArray(currentEvent) && currentEvent[2] && typeof currentEvent[2] === "object"
+    ? currentEvent[2]
+    : {};
+  const primitive = String(data.primitive || type || "").toLowerCase();
+  const splitMode = String(data.split_mode || data.mode || "").toLowerCase();
+  const reservoirId = Number(data.reservoir_droplet_id);
+  return (
+    Number.isFinite(reservoirId)
+    && reservoirId === Number(dropletId)
+    && (primitive.includes("reservoir_extraction") || type.includes("extraction"))
+    && splitMode === "linear"
+  );
+}
+
+function matrixSummaryCells(summary, maxCells = 20000) {
+  if (!summary || typeof summary !== "object") return [];
+  if (Array.isArray(summary.active_cells)) return normalizeMatrixCells(summary.active_cells);
+  const rows = summary.rows;
+  if (!rows || typeof rows !== "object") return [];
+  const cells = [];
+  for (const [rowKey, ranges] of Object.entries(rows)) {
+    const row = Number(rowKey);
+    if (!Number.isFinite(row) || !Array.isArray(ranges)) continue;
+    for (const range of ranges) {
+      if (!Array.isArray(range) || range.length < 2) continue;
+      const start = Number(range[0]);
+      const end = Number(range[1]);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+      const lo = Math.trunc(Math.min(start, end));
+      const hi = Math.trunc(Math.max(start, end));
+      for (let col = lo; col <= hi; col += 1) {
+        cells.push([Math.trunc(row), col]);
+        if (cells.length >= maxCells) return cells;
+      }
+    }
+  }
+  return cells;
+}
+
 function normalizeMatrixCells(value) {
   if (!Array.isArray(value)) return [];
   const cells = [];
@@ -6220,8 +12642,10 @@ function drawMatrixOverlay(ctx, width, height, scene) {
     ? "executed"
     : scene.frame?.source === "state"
       ? "state"
-      : scene.frame?.source === "timeline_preview"
-        ? "preview"
+    : scene.frame?.source === "timeline_preview"
+      ? "preview"
+      : scene.frame?.source === "cartridge"
+        ? "cartridge"
       : "plan";
   const lines = [
     `${frameSource} ${frameLabel}/${scene.frame?.count || 0}`,
@@ -6379,15 +12803,26 @@ function syncMatrixPathState(scene) {
   state.matrixPaths.revision = revision;
   state.matrixPaths.hiddenActions = new Set();
   state.matrixPaths.hoveredActionId = "";
+  state.matrixPaths.renderKey = "";
+  state.matrixPaths.actionCache = {
+    movingKey: "",
+    movingActions: [],
+    staticKey: "",
+    staticActions: [],
+  };
 }
 
 function matrixPathRevision(scene) {
-  const actions = matrixPathActions(scene);
+  const actions = Array.isArray(scene?.plan?.actions) ? scene.plan.actions : [];
   return [
     scene?.plan?.frame_count || "",
     scene?.plan?.event_count || "",
     scene?.plan?.scene_plan_source || "",
-    actions.map((action) => `${action.id}:${action.frame_span?.join("-") || ""}:${action.paths?.length || 0}`).join("|"),
+    actions.map((action) => {
+      const paths = Array.isArray(action?.paths) ? action.paths : [];
+      const pathKey = paths.map((pathInfo) => matrixPathInfoSignature(pathInfo)).join(",");
+      return `${action?.id}:${action?.frame_span?.join("-") || ""}:${paths.length}:${pathKey}`;
+    }).join("|"),
   ].join("::");
 }
 
@@ -6395,19 +12830,44 @@ function matrixPathActions(scene, options = {}) {
   const actions = scene?.plan?.actions;
   if (!Array.isArray(actions)) return [];
   const includeStatic = options.includeStatic === true;
-  return actions
+  const revision = matrixPathRevision(scene);
+  const cacheKey = `${revision}::${includeStatic ? "static" : "moving"}`;
+  const cache = state.matrixPaths.actionCache || {};
+  if (includeStatic && cache.staticKey === cacheKey) return cache.staticActions || [];
+  if (!includeStatic && cache.movingKey === cacheKey) return cache.movingActions || [];
+  const prepared = actions
     .map((action) => {
       if (!action || !Array.isArray(action.paths)) return null;
-      const paths = action.paths.filter((pathInfo) => (
-        includeStatic ? compactDisplayPath(pathInfo?.path).length > 0 : matrixPathInfoIsMoving(pathInfo)
-      ));
+      const paths = [];
+      for (const pathInfo of action.paths) {
+        const path = compactDisplayPath(pathInfo?.path);
+        if (includeStatic ? path.length > 0 : path.length > 1) {
+          paths.push({ ...pathInfo, path });
+        }
+      }
       return paths.length ? { ...action, paths } : null;
     })
     .filter(Boolean);
+  if (includeStatic) {
+    state.matrixPaths.actionCache.staticKey = cacheKey;
+    state.matrixPaths.actionCache.staticActions = prepared;
+  } else {
+    state.matrixPaths.actionCache.movingKey = cacheKey;
+    state.matrixPaths.actionCache.movingActions = prepared;
+  }
+  return prepared;
 }
 
 function matrixPathInfoIsMoving(pathInfo) {
   return compactDisplayPath(pathInfo?.path).length > 1;
+}
+
+function matrixPathInfoSignature(pathInfo) {
+  if (!pathInfo || typeof pathInfo !== "object") return "";
+  const start = Array.isArray(pathInfo.start) ? pathInfo.start.join(",") : "";
+  const end = Array.isArray(pathInfo.end) ? pathInfo.end.join(",") : "";
+  const length = pathInfo.path_length ?? (Array.isArray(pathInfo.path) ? pathInfo.path.length : "");
+  return `${pathInfo.key || ""}:${pathInfo.droplet_id ?? ""}:${length}:${start}:${end}`;
 }
 
 function visibleMatrixPathActions(scene) {
@@ -6425,8 +12885,17 @@ function renderMatrixPathPanel(scene) {
     panel.hidden = true;
     body.textContent = "";
     count.textContent = "0";
+    state.matrixPaths.renderKey = "hidden";
     return;
   }
+  const renderKey = [
+    matrixPathRevision(scene),
+    state.matrixPaths.collapsed ? "collapsed" : "open",
+    [...state.matrixPaths.hiddenActions].sort().join(","),
+    state.matrixPaths.hoveredActionId || "",
+  ].join("::");
+  if (state.matrixPaths.renderKey === renderKey && !panel.hidden) return;
+  state.matrixPaths.renderKey = renderKey;
   panel.hidden = false;
   panel.classList.toggle("collapsed", state.matrixPaths.collapsed);
   toggle.setAttribute("aria-expanded", String(!state.matrixPaths.collapsed));
@@ -6492,33 +12961,46 @@ function startMatrixSelectionDrag(event) {
   const canvas = $("matrixScene");
   const scene = state.live?.scene?.result || state.live?.scene;
   if (!canvas || !scene?.available || activeMatrixPaintValue() !== null) return;
-  const point = matrixCanvasPointFromPointerEvent(event);
-  if (!point) return;
+  const pointer = matrixPointerInfoFromEvent(event, { clampToGrid: true });
+  if (!pointer) return;
   event.preventDefault();
   canvas.setPointerCapture?.(event.pointerId);
   state.matrixSelection.dragging = true;
   state.matrixSelection.moved = false;
-  state.matrixSelection.start = point;
-  state.matrixSelection.current = point;
+  state.matrixSelection.start = pointer.electrode;
+  state.matrixSelection.current = pointer.electrode;
+  state.matrixSelection.startPoint = pointer.raw;
+  state.matrixSelection.currentPoint = pointer.raw;
+  state.matrixSelection.startDisplay = pointer.display;
+  state.matrixSelection.currentDisplay = pointer.display;
   canvas.classList.add("dragging");
 }
 
-function updateMatrixSelectionDrag(event) {
+function updateMatrixSelectionDrag(pointer) {
+  updateMatrixSelectionDragFromPointer(pointer);
+}
+
+function updateMatrixSelectionDragFromPointer(pointer, options = {}) {
   if (!state.matrixSelection.dragging) return;
-  const point = matrixCanvasPointFromPointerEvent(event);
+  if (!pointer) return;
+  const point = pointer.raw || pointer.hover;
   if (!point) return;
-  const start = state.matrixSelection.start || point;
-  state.matrixSelection.current = point;
+  const start = state.matrixSelection.startPoint || point;
+  state.matrixSelection.current = pointer.electrode;
+  state.matrixSelection.currentPoint = point;
+  state.matrixSelection.currentDisplay = pointer.display;
   if (Math.hypot(point.x - start.x, point.y - start.y) >= 4) {
     state.matrixSelection.moved = true;
   }
-  if (state.matrixSelection.moved) renderMatrixPanel(state.live || {});
+  if (state.matrixSelection.moved && options.render !== false) renderMatrixPanel(state.live || {});
 }
 
 function endMatrixSelectionDrag(event) {
   if (!state.matrixSelection.dragging) return;
-  const point = matrixCanvasPointFromPointerEvent(event);
-  if (point) state.matrixSelection.current = point;
+  updateMatrixSelectionDragFromPointer(
+    matrixPointerInfoFromEvent(event, { clampToGrid: true }),
+    { render: false },
+  );
   const rect = matrixSelectionRect();
   const useSelectionBox = state.matrixSelection.moved && rect && (rect.w >= 3 || rect.h >= 3);
   resetMatrixSelectionDrag();
@@ -6540,6 +13022,10 @@ function resetMatrixSelectionDrag() {
   state.matrixSelection.moved = false;
   state.matrixSelection.start = null;
   state.matrixSelection.current = null;
+  state.matrixSelection.startPoint = null;
+  state.matrixSelection.currentPoint = null;
+  state.matrixSelection.startDisplay = null;
+  state.matrixSelection.currentDisplay = null;
 }
 
 function matrixCanvasPointFromPointerEvent(event) {
@@ -6555,6 +13041,9 @@ function matrixCanvasPointFromPointerEvent(event) {
 function matrixSelectionRect() {
   const selection = state.matrixSelection;
   if (!selection.dragging || !selection.start || !selection.current) return null;
+  if (selection.startDisplay && selection.currentDisplay) {
+    return matrixCanvasRectFromDisplayDrag(selection.startDisplay, selection.currentDisplay);
+  }
   const x0 = Number(selection.start.x);
   const y0 = Number(selection.start.y);
   const x1 = Number(selection.current.x);
@@ -6578,7 +13067,7 @@ function selectMatrixDropletFromRect(rect) {
   setMatrixSelectedDropletIds(ids);
   if (ids.length) setBottomTab("timeline");
   renderMatrixPanel(state.live || {});
-  renderPlanTimeline();
+  schedulePlanTimelineRender();
 }
 
 function bestMatrixSelectionHit(rect) {
@@ -6804,7 +13293,7 @@ function commitMatrixMovePreview() {
   if (!state.timeline.followLive) {
     state.matrixCommands.lastError = "Go Live before adding planned frames";
     renderMatrixCommandPanel();
-    renderPlanTimeline();
+    schedulePlanTimelineRender();
     return true;
   }
   const scene = state.live?.scene?.result || state.live?.scene;
@@ -6814,7 +13303,7 @@ function commitMatrixMovePreview() {
   if (!preview.valid) {
     state.matrixCommands.lastError = preview.reason || "Invalid droplet preview";
     renderMatrixCommandPanel();
-    renderPlanTimeline();
+    schedulePlanTimelineRender();
     return true;
   }
   const targets = preview.targets.map((item) => ({
@@ -6826,7 +13315,7 @@ function commitMatrixMovePreview() {
   state.matrixMovePreview.hover = null;
   renderMatrixPanel(state.live || {});
   renderMatrixCommandPanel();
-  renderPlanTimeline();
+  schedulePlanTimelineRender();
   send({
     type: "matrix_plan_selection_move",
     mode: "sipp",
@@ -6847,7 +13336,7 @@ function handleMatrixSceneClick(event) {
     moveStageToMatrixPoint(point);
     return;
   }
-  const hit = [...state.matrixSceneHitboxes].reverse().find((box) => matrixHitboxContains(box, point));
+  const hit = topMatrixHitboxAt(point);
   const dropletId = Number(hit?.droplet?.id);
   const selectedIds = selectedMatrixDropletIds();
   const hitIsSelected = Number.isFinite(dropletId) && selectedIds.includes(dropletId);
@@ -6863,7 +13352,7 @@ function handleMatrixSceneClick(event) {
   }
   if (Number.isFinite(dropletId)) setBottomTab("timeline");
   renderMatrixPanel(state.live || {});
-  renderPlanTimeline();
+  schedulePlanTimelineRender();
 }
 
 function moveStageToMatrixPoint(point) {
@@ -6888,7 +13377,7 @@ function matrixTargetForPoint(point) {
   const electrode = canvasPointToElectrode(geom, point.x, point.y);
   if (!electrode) return null;
   const stage = stageFromElectrode(scene, electrode.row, electrode.col);
-  const hit = [...state.matrixSceneHitboxes].reverse().find((box) => matrixHitboxContains(box, point));
+  const hit = topMatrixHitboxAt(point);
   return { point, electrode, stage, droplet: hit?.droplet || null };
 }
 
@@ -6917,6 +13406,11 @@ function moveStageToTarget(target) {
   } else if (Number.isFinite(Number(current?.Z))) {
     position.Z = Math.trunc(Number(current.Z));
   }
+  beginStageMotionFromCommand({
+    position,
+    source: "matrix",
+    wait_timeout_seconds: 20,
+  });
   send({
     type: "mcp_tool",
     tool: "move_stage",
@@ -6924,6 +13418,8 @@ function moveStageToTarget(target) {
       position,
       wait_timeout_seconds: 20,
       poll_interval: 0.1,
+      wait_for_queue: false,
+      wait_for_completion: false,
     },
   });
 }
@@ -6973,7 +13469,7 @@ function openMatrixContextMenu(event) {
       setMatrixSelectedDropletIds([Number(target.droplet.id)]);
       setBottomTab("timeline");
       renderMatrixPanel(state.live || {});
-      renderPlanTimeline();
+      schedulePlanTimelineRender();
     });
     menu.appendChild(select);
   }
@@ -7006,7 +13502,7 @@ function updateMatrixHover(hover) {
     tooltip.hidden = true;
     return;
   }
-  const hit = [...state.matrixSceneHitboxes].reverse().find((box) => matrixHitboxContains(box, hover));
+  const hit = topMatrixHitboxAt(hover);
   if (!hit) {
     tooltip.hidden = true;
     return;
@@ -7025,7 +13521,26 @@ function updateMatrixHover(hover) {
   tooltip.style.top = `${Math.min(maxY, Math.max(8, hover.y + 12))}px`;
 }
 
+function topMatrixHitboxAt(point) {
+  const hitboxes = state.matrixSceneHitboxes || [];
+  for (let index = hitboxes.length - 1; index >= 0; index -= 1) {
+    const box = hitboxes[index];
+    if (matrixHitboxContains(box, point)) return box;
+  }
+  return null;
+}
+
 function matrixHitboxContains(box, point) {
+  if (!box || !point) return false;
+  if (
+    Number.isFinite(Number(box.x))
+    && Number.isFinite(Number(box.y))
+    && Number.isFinite(Number(box.w))
+    && Number.isFinite(Number(box.h))
+    && (point.x < box.x || point.x > box.x + box.w || point.y < box.y || point.y > box.y + box.h)
+  ) {
+    return false;
+  }
   const cellHit = Array.isArray(box.cells) && box.cells.some((cell) => (
     point.x >= cell.x && point.x <= cell.x + cell.w && point.y >= cell.y && point.y <= cell.y + cell.h
   ));
@@ -7078,33 +13593,364 @@ function timestampForFilename() {
   return new Date().toISOString().replace(/[:.]/g, "-");
 }
 
+function applyTemperatureHistory(history) {
+  const runId = state.status?.run_id || state.selectedRunId || "";
+  const localHistory = readLocalTemperatureHistory(runId);
+  const samples = compactTemperatureHistorySamplesForStorage([
+    ...(Array.isArray(history?.samples) ? history.samples : []),
+    ...(Array.isArray(localHistory?.samples) ? localHistory.samples : []),
+    ...temperatureStorageSamplesFromEvents(state.events || []),
+  ]);
+  const measured = [];
+  const targets = [];
+  let lastTarget = null;
+  for (const sample of samples) {
+    const seconds = Number(sample?.t);
+    if (!Number.isFinite(seconds)) continue;
+    const timeMs = seconds * 1000;
+    const measuredValue = firstFiniteNumber(
+      sample?.measured_c,
+      sample?.temperature_c,
+      sample?.current_c,
+      sample?.current,
+    );
+    if (isValidMeasuredTemperature(measuredValue)) {
+      measured.push({
+        t: timeMs,
+        value: measuredValue,
+        source: sample?.source || "history",
+      });
+    }
+    const targetValue = firstFiniteNumber(
+      sample?.target_c,
+      sample?.tarjet_c,
+      sample?.target_temperature,
+      sample?.tarjet_temperature,
+    );
+    if (isValidTemperatureTarget(targetValue) && (lastTarget === null || Math.abs(targetValue - lastTarget) > 0.02)) {
+      targets.push({
+        t: timeMs,
+        value: targetValue,
+        source: sample?.source || "history",
+      });
+      lastTarget = targetValue;
+    }
+  }
+  state.temperatureSamples = dedupeTemperatureHistorySamples(measured);
+  state.temperatureTargetSamples = dedupeTemperatureHistorySamples(targets);
+  state.temperatureRevision += 1;
+  state.temperatureHistoryMeta = history
+    ? {
+        path: history.path || "temperature_history.json",
+        sampleCount: Number(history.sample_count || samples.length) || samples.length,
+        storedSampleCount: Number(history.stored_sample_count || samples.length) || samples.length,
+        downsampled: Boolean(history.downsampled),
+        compactedAt: history.compacted_at || null,
+      }
+    : null;
+  persistTemperatureHistoryLocal();
+}
+
+function dedupeTemperatureHistorySamples(samples) {
+  const result = [];
+  let lastKey = "";
+  for (const sample of (samples || []).sort((a, b) => Number(a.t) - Number(b.t))) {
+    const time = Number(sample?.t);
+    const value = Number(sample?.value);
+    if (!Number.isFinite(time) || !Number.isFinite(value)) continue;
+    const key = `${Math.round(time)}:${value.toFixed(4)}`;
+    if (key === lastKey) continue;
+    lastKey = key;
+    result.push({ ...sample, t: time, value });
+  }
+  return result;
+}
+
+function temperatureStorageSamplesFromEvents(events) {
+  const samples = [];
+  for (const event of events || []) {
+    const eventTime = eventTimeSeconds(event);
+    if (Number.isFinite(eventTime)) {
+      const measured = measuredTemperatureFromEvent(event);
+      const target = targetTemperatureFromEvent(event);
+      if (isValidMeasuredTemperature(measured) || isValidTemperatureTarget(target)) {
+        const sample = {
+          t: eventTime,
+          source: event.tool || event.type || "event",
+        };
+        if (event.ts) sample.ts = event.ts;
+        if (isValidMeasuredTemperature(measured)) sample.measured_c = measured;
+        if (isValidTemperatureTarget(target)) sample.target_c = target;
+        samples.push(sample);
+      }
+    }
+    for (const sample of timelineTemperatureSamplesFromEvent(event)) {
+      if (!Number.isFinite(Number(sample.time)) || !isValidMeasuredTemperature(sample.value)) continue;
+      samples.push({
+        t: Number(sample.time),
+        measured_c: Number(sample.value),
+        source: "event_samples",
+      });
+    }
+    for (const marker of timelineRoutineTargetMarkersFromEvent(event, null)) {
+      if (!Number.isFinite(Number(marker.time)) || !isValidTemperatureTarget(marker.value)) continue;
+      samples.push({
+        t: Number(marker.time),
+        target_c: Number(marker.value),
+        source: marker.source || "temperature_routine",
+      });
+    }
+    samples.push(...plannedTemperatureRoutineStorageSamples(event));
+  }
+  return compactTemperatureHistorySamplesForStorage(samples);
+}
+
+function plannedTemperatureRoutineStorageSamples(event) {
+  if (event?.type !== "mcp_tool_call" || event?.tool !== "start_temperature_routine") return [];
+  const eventTime = eventTimeSeconds(event);
+  const steps = getPath(event, "arguments.steps");
+  if (!Number.isFinite(eventTime) || !Array.isArray(steps)) return [];
+  let cursor = eventTime;
+  const samples = [];
+  steps.forEach((step, index) => {
+    if (!step || typeof step !== "object") return;
+    const target = firstFiniteNumber(
+      step.target_c,
+      step.target_temperature,
+      step.target,
+      step.tarjet_c,
+      step.tarjet_temperature,
+      step.tarjet,
+    );
+    if (isValidTemperatureTarget(target)) {
+      samples.push({
+        t: cursor,
+        target_c: target,
+        source: "routine_plan",
+        step_index: index,
+      });
+    }
+    const hold = firstFiniteNumber(step.hold_seconds, step.duration_seconds, step.seconds);
+    if (Number.isFinite(hold) && hold > 0) cursor += hold;
+  });
+  return samples;
+}
+
+function ingestTemperatureHistoryEvent(event) {
+  const sample = normalizeTemperatureHistoryStorageSample(event);
+  if (!sample) return;
+  appendTemperatureStorageSampleToState(sample);
+  scheduleTemperatureHistoryPersist();
+}
+
+function appendTemperatureStorageSampleToState(sample) {
+  const seconds = Number(sample?.t);
+  if (!Number.isFinite(seconds)) return;
+  const measured = firstFiniteNumber(sample?.measured_c, sample?.temperature_c, sample?.current_c, sample?.current);
+  const target = firstFiniteNumber(sample?.target_c, sample?.tarjet_c, sample?.target_temperature, sample?.tarjet_temperature);
+  const timeMs = seconds * 1000;
+  if (isValidMeasuredTemperature(measured)) {
+    state.temperatureSamples = dedupeTemperatureHistorySamples([
+      ...(state.temperatureSamples || []),
+      { t: timeMs, value: measured, source: sample.source || "event" },
+    ]);
+    state.temperatureRevision += 1;
+  }
+  if (isValidTemperatureTarget(target)) {
+    const lastTarget = state.temperatureTargetSamples[state.temperatureTargetSamples.length - 1];
+    if (!lastTarget || Math.abs(Number(lastTarget.value) - target) > 0.02) {
+      state.temperatureTargetSamples = dedupeTemperatureHistorySamples([
+        ...(state.temperatureTargetSamples || []),
+        { t: timeMs, value: target, source: sample.source || "event" },
+      ]);
+      state.temperatureRevision += 1;
+    }
+  }
+}
+
+function scheduleTemperatureHistoryPersist() {
+  if (state.temperaturePersistTimer !== null) return;
+  state.temperaturePersistTimer = window.setTimeout(() => {
+    state.temperaturePersistTimer = null;
+    persistTemperatureHistoryLocal();
+  }, TEMPERATURE_HISTORY_PERSIST_MS);
+}
+
+function persistTemperatureHistoryLocal() {
+  const runId = state.status?.run_id || state.selectedRunId || "";
+  if (!runId) return;
+  const samples = compactTemperatureHistorySamplesForStorage(temperatureHistorySamplesForStorage());
+  const limited = simplifyTemperatureHistoryStorageSamples(samples, 12000);
+  const payload = {
+    schema_version: 1,
+    run_id: runId,
+    updated_at: new Date().toISOString(),
+    samples: limited,
+  };
+  try {
+    window.localStorage?.setItem(temperatureHistoryStorageKey(runId), JSON.stringify(payload));
+  } catch {
+    try {
+      payload.samples = simplifyTemperatureHistoryStorageSamples(limited, 4000);
+      window.localStorage?.setItem(temperatureHistoryStorageKey(runId), JSON.stringify(payload));
+    } catch {
+      // Local cache is only a reload aid; the run JSON is the durable source.
+    }
+  }
+}
+
+function readLocalTemperatureHistory(runId) {
+  if (!runId) return null;
+  try {
+    const raw = window.localStorage?.getItem(temperatureHistoryStorageKey(runId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function temperatureHistoryStorageKey(runId) {
+  return `${TEMPERATURE_HISTORY_STORAGE_PREFIX}${runId}`;
+}
+
+function temperatureHistorySamplesForStorage() {
+  const samples = [];
+  for (const sample of state.temperatureSamples || []) {
+    const t = Number(sample?.t);
+    const value = Number(sample?.value);
+    if (!Number.isFinite(t) || !isValidMeasuredTemperature(value)) continue;
+    samples.push({
+      t: t / 1000,
+      measured_c: value,
+      source: sample.source || "state",
+    });
+  }
+  for (const sample of state.temperatureTargetSamples || []) {
+    const t = Number(sample?.t);
+    const value = Number(sample?.value);
+    if (!Number.isFinite(t) || !isValidTemperatureTarget(value)) continue;
+    samples.push({
+      t: t / 1000,
+      target_c: value,
+      source: sample.source || "state",
+    });
+  }
+  return samples;
+}
+
+function normalizeTemperatureHistoryStorageSample(sample) {
+  if (!sample || typeof sample !== "object") return null;
+  const seconds = firstFiniteNumber(sample.t, sample.time, sample.timestamp);
+  if (!Number.isFinite(seconds)) return null;
+  const measured = firstFiniteNumber(sample.measured_c, sample.temperature_c, sample.current_c, sample.current);
+  const target = firstFiniteNumber(sample.target_c, sample.tarjet_c, sample.target_temperature, sample.tarjet_temperature);
+  if (!isValidMeasuredTemperature(measured) && !isValidTemperatureTarget(target)) return null;
+  const normalized = {
+    t: Number(seconds),
+    source: String(sample.source || "").slice(0, 64) || "event",
+  };
+  if (sample.ts) normalized.ts = String(sample.ts);
+  if (isValidMeasuredTemperature(measured)) normalized.measured_c = Number(measured);
+  if (isValidTemperatureTarget(target)) normalized.target_c = Number(target);
+  return normalized;
+}
+
+function compactTemperatureHistorySamplesForStorage(samples) {
+  const normalized = (samples || [])
+    .map(normalizeTemperatureHistoryStorageSample)
+    .filter(Boolean)
+    .sort((a, b) => Number(a.t) - Number(b.t));
+  const compacted = [];
+  let lastKey = "";
+  for (const sample of normalized) {
+    const measured = Number(sample.measured_c);
+    const target = Number(sample.target_c);
+    const key = [
+      Math.round(Number(sample.t) * 1000),
+      Number.isFinite(measured) ? measured.toFixed(4) : "",
+      Number.isFinite(target) ? target.toFixed(4) : "",
+    ].join(":");
+    if (key === lastKey) continue;
+    lastKey = key;
+    compacted.push(sample);
+  }
+  return compacted;
+}
+
+function simplifyTemperatureHistoryStorageSamples(samples, maxSamples) {
+  const compacted = compactTemperatureHistorySamplesForStorage(samples);
+  const limit = Math.max(20, Number(maxSamples) || 12000);
+  if (compacted.length <= limit) return compacted;
+  const keepRecent = Math.min(1500, Math.max(100, Math.floor(limit / 5)));
+  const recent = compacted.slice(-keepRecent);
+  const older = compacted.slice(0, -keepRecent);
+  const targetChanges = [];
+  let lastTarget = null;
+  for (const sample of older) {
+    const target = Number(sample.target_c);
+    if (!isValidTemperatureTarget(target)) continue;
+    if (lastTarget === null || Math.abs(target - lastTarget) > 0.02) {
+      targetChanges.push(sample);
+      lastTarget = target;
+    }
+  }
+  const remaining = Math.max(20, limit - recent.length - targetChanges.length);
+  const measured = simplifyTimelineTemperatureSamplesForRender(
+    older
+      .filter((sample) => isValidMeasuredTemperature(sample.measured_c))
+      .map((sample) => ({ ...sample, time: Number(sample.t), value: Number(sample.measured_c) })),
+    { trackWidth: Math.max(20, remaining / 2.5) },
+  ).map((sample) => ({
+    t: Number(sample.time),
+    measured_c: Number(sample.value),
+    source: sample.source || "state",
+  }));
+  return compactTemperatureHistorySamplesForStorage([...targetChanges, ...measured, ...recent]).slice(-limit);
+}
+
 function updateTemperatureHistory(live) {
   const value = live?.state?.value || live?.state?.result?.value || live?.state;
-  const temp = extractTemperature(value);
+  const rawTemp = extractTemperature(value);
+  const temp = isValidMeasuredTemperature(rawTemp) ? rawTemp : null;
   const target = extractTemperatureTarget(value);
   const label = $("temperatureValue");
   if (label) label.textContent = Number.isFinite(temp) ? `${temp.toFixed(1)} C` : "-";
   const targetLabel = $("temperatureTarget");
   if (targetLabel && !targetLabel.closest(".temperature-readout")?.classList.contains("editing")) {
-    targetLabel.textContent = Number.isFinite(target) ? `target ${target.toFixed(1)} C` : "target -";
+    targetLabel.textContent = isValidTemperatureTarget(target) ? `target ${target.toFixed(1)} C` : "target -";
   }
-  if (!Number.isFinite(temp)) return;
-
-  const last = state.temperatureSamples[state.temperatureSamples.length - 1];
   const now = Date.now();
-  if (!last || now - last.t > 900 || Math.abs(last.value - temp) > 0.02) {
-    state.temperatureSamples.push({ t: now, value: temp });
-    if (state.temperatureSamples.length > 180) {
-      state.temperatureSamples.splice(0, state.temperatureSamples.length - 180);
+  let changed = false;
+  if (isValidTemperatureTarget(target)) {
+    const lastTarget = state.temperatureTargetSamples[state.temperatureTargetSamples.length - 1];
+    if (!lastTarget || Math.abs(Number(lastTarget.value) - target) > 0.02) {
+      state.temperatureTargetSamples.push({ t: now, value: target, source: "state" });
+      changed = true;
     }
   }
+  if (!Number.isFinite(temp)) {
+    if (changed) scheduleTemperatureHistoryPersist();
+    return;
+  }
+
+  const last = state.temperatureSamples[state.temperatureSamples.length - 1];
+  if (!last || now - last.t > 900 || Math.abs(last.value - temp) > 0.02) {
+    state.temperatureSamples.push({ t: now, value: temp });
+    changed = true;
+  }
+  if (changed) scheduleTemperatureHistoryPersist();
 }
 
 function extractTemperatureTarget(root) {
   const candidates = [
     getPath(root, "temperature.target"),
+    getPath(root, "temperature.tarjet"),
     getPath(root, "temperature.target_c"),
+    getPath(root, "temperature.tarjet_c"),
     getPath(root, "temperature.target_temperature"),
+    getPath(root, "temperature.tarjet_temperature"),
     getPath(root, "temperature.setpoint"),
     getPath(root, "temperature.setpoint_c"),
   ];
@@ -7114,7 +13960,7 @@ function extractTemperatureTarget(root) {
       if (/target|setpoint/i.test(key) && typeof value === "number") candidates.push(value);
     }
   }
-  return candidates.find((value) => Number.isFinite(value));
+  return candidates.find((value) => isValidTemperatureTarget(value));
 }
 
 function compactStatePanel() {
@@ -7126,15 +13972,20 @@ function compactStatePanel() {
   if (grid.scrollHeight > grid.clientHeight) panel.classList.add("state-ultra-tight");
 }
 
+function isTemperatureChartVisible() {
+  return state.bottomTab === "state" && !state.layout.collapsed.bottom;
+}
+
 function renderTemperatureChart() {
   const canvas = $("temperatureChart");
   if (!canvas) return;
+  if (!isTemperatureChartVisible()) return;
   const { ctx, width, height } = prepareCanvas(canvas);
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = "#151519";
   ctx.fillRect(0, 0, width, height);
 
-  const samples = state.temperatureSamples;
+  const samples = (state.temperatureSamples || []).slice(-180);
   ctx.strokeStyle = "rgba(255,255,255,0.08)";
   ctx.lineWidth = 1;
   for (let i = 1; i < 4; i++) {
@@ -7255,19 +14106,19 @@ function extractTemperature(root) {
       }
     }
   }
-  return candidates.find((value) => Number.isFinite(value));
+  return candidates.find((value) => isValidMeasuredTemperature(value));
 }
 
 function formatTemperatureSummary(root, options = {}) {
   const temp = extractTemperature(root);
-  const target = firstFinite([
+  const target = firstValidTemperatureTarget([
     getPath(root, "temperature.target"),
     getPath(root, "temperature.target_c"),
     getPath(root, "temperature.target_temperature"),
   ]);
   const parts = [];
   if (Number.isFinite(temp)) parts.push(options.compact ? `${temp.toFixed(2)} C` : `current ${temp.toFixed(2)} C`);
-  if (Number.isFinite(target)) parts.push(options.compact ? `target ${target.toFixed(2)}` : `target ${target.toFixed(2)} C`);
+  if (isValidTemperatureTarget(target)) parts.push(options.compact ? `target ${target.toFixed(2)}` : `target ${target.toFixed(2)} C`);
   return parts.join("\n") || shortJson(getPath(root, "temperature"));
 }
 
@@ -7336,6 +14187,10 @@ function formatVisualizerSummary(visualizers) {
 
 function firstFinite(values) {
   return values.find((value) => Number.isFinite(value));
+}
+
+function firstValidTemperatureTarget(values) {
+  return values.find((value) => isValidTemperatureTarget(value));
 }
 
 function formatPath(root, path) {

@@ -32,6 +32,7 @@ STATE_SNAPSHOT_TOOLS = {
     "advanced_drop_job_status",
     "execution_wait_status",
     "module_busy_status",
+    "timeline_status",
 }
 STATE_SNAPSHOT_KEEP_RECENT = 1
 RECENT_TOOL_EVENT_KEEP = 12

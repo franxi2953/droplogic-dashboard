@@ -1,15 +1,27 @@
 let activeMetricEdit = null;
+let pendingMetricEdit = null;
+let lastStateGridRenderKey = "";
+
+const STAGE_SPEED_PRESETS = {
+  slow: { label: "Slow", velocity: 1000, acceleration: 10000 },
+  medium: { label: "Medium", velocity: 5000, acceleration: 100000 },
+  fast: { label: "Fast", velocity: 10000, acceleration: 1000000 },
+};
 
 document.addEventListener("pointerdown", (event) => {
   if (!activeMetricEdit) return;
   if (activeMetricEdit.item?.contains?.(event.target)) return;
-  activeMetricEdit.close(true);
+  activeMetricEdit.close(false);
 });
 
 function renderStateGrid(live) {
   const container = $("stateGrid");
   if (!container) return;
   if (container.querySelector(".metric.editing")) return;
+  resolvePendingMetricEditFromLive(live);
+  const renderKey = stateGridRenderKey(live);
+  if (renderKey === lastStateGridRenderKey && container.childElementCount > 0) return;
+  lastStateGridRenderKey = renderKey;
   container.innerHTML = "";
 
   const value = live?.state?.value || live?.state?.result?.value || live?.state;
@@ -18,6 +30,12 @@ function renderStateGrid(live) {
       kind: "stage",
       label: "Stage",
       content: renderStageCard(getPath(value, "xy_stage")),
+      span: true,
+    },
+    {
+      kind: "matrix",
+      label: "Matrix",
+      content: renderMatrixCard(getPath(value, "electrode_matrix")),
       span: true,
     },
     {
@@ -53,6 +71,42 @@ function renderStateGrid(live) {
   }
 }
 
+function stateGridRenderKey(live) {
+  const value = live?.state?.value || live?.state?.result?.value || live?.state || {};
+  const stage = getPath(value, "xy_stage") || {};
+  const matrix = getPath(value, "electrode_matrix") || {};
+  const matrixSummary = matrix?.matrix && typeof matrix.matrix === "object" ? matrix.matrix : {};
+  const microscope = getPath(value, "microscope_settings") || {};
+  const camera = getPath(value, "camera_settings") || {};
+  const light = getPath(value, "light_settings") || {};
+  return JSON.stringify({
+    pending: pendingMetricEdit ? `${pendingMetricEdit.kind}:${pendingMetricEdit.field || pendingMetricEdit.axis || ""}:${pendingMetricEdit.value}` : "",
+    stage: {
+      position: stage.position || {},
+      motion: stage.motion_params || {},
+    },
+    matrix: {
+      active: firstDefined(matrixSummary.active_count, matrixSummary.active_electrode_count, matrix?.active_count),
+      shape: matrixShapeDisplay(matrix, matrixSummary),
+      voltages: matrixVoltageBoxValues(matrix, 9),
+    },
+    microscope: {
+      channel: firstDefined(microscope.current_channel, microscope.channel),
+      exposure: firstDefined(microscope.exposure_time, microscope.ExposureTime, microscope.exposure),
+      gain: firstDefined(microscope.gain, microscope.analog_gain, microscope.AnalogGain),
+    },
+    camera: {
+      exposure: firstDefined(camera.exposure_time, camera.ExposureTime, camera.exposure),
+      gain: firstDefined(camera.gain, camera.analog_gain, camera.AnalogGain),
+    },
+    light: {
+      coaxial: firstDefined(light.coaxial_intensity, light.coaxial, light.coaxial_light),
+      ring: firstDefined(light.ring_intensity, light.ring, light.ring_light),
+      on: firstDefined(light.light_on, light.enabled, light.on),
+    },
+  });
+}
+
 function renderStageCard(stage) {
   const position = stage?.position || {};
   const motion = stage?.motion_params || {};
@@ -63,12 +117,46 @@ function renderStageCard(stage) {
     editableMetric("Y", position.Y, { kind: "stage", axis: "Y", input: "number" }),
     editableMetric("Z", position.Z, { kind: "stage", axis: "Z", input: "number" }),
   ]));
+  const speedKey = stageSpeedKeyFromMotion(motion);
+  const speedOptions = Object.entries(STAGE_SPEED_PRESETS).map(([value, preset]) => ({
+    value,
+    label: preset.label,
+  }));
+  if (!speedKey) speedOptions.unshift({ value: "custom", label: "Custom" });
   wrapper.appendChild(metricGrid([
+    editableMetric("Speed", speedKey || "custom", {
+      kind: "stage_speed",
+      field: "speed",
+      input: "select",
+      display: stageSpeedDisplay(motion),
+      options: speedOptions,
+    }),
     ["dMaxV", motion.dMaxV],
     ["dMaxA", motion.dMaxA],
     ["Jerk", motion.dJerk],
-  ], "secondary"));
+  ], "secondary stage-speed"));
   return wrapper;
+}
+
+function stageSpeedKeyFromMotion(motion = {}) {
+  const velocity = Number(motion?.dMaxV);
+  const acceleration = Number(motion?.dMaxA);
+  if (!Number.isFinite(velocity) || !Number.isFinite(acceleration)) return "";
+  for (const [key, preset] of Object.entries(STAGE_SPEED_PRESETS)) {
+    if (
+      Math.abs(velocity - preset.velocity) <= 1
+      && Math.abs(acceleration - preset.acceleration) <= 1
+    ) {
+      return key;
+    }
+  }
+  return "";
+}
+
+function stageSpeedDisplay(motion = {}) {
+  const key = stageSpeedKeyFromMotion(motion);
+  if (key && STAGE_SPEED_PRESETS[key]) return STAGE_SPEED_PRESETS[key].label;
+  return "Custom";
 }
 
 function renderImagingCard(settings, title) {
@@ -136,6 +224,77 @@ function renderLightCard(settings) {
   ], "compact");
 }
 
+function renderMatrixCard(matrix) {
+  const matrixSummary = matrix?.matrix && typeof matrix.matrix === "object" ? matrix.matrix : {};
+  const shape = matrixShapeDisplay(matrix, matrixSummary);
+  const active = firstDefined(matrixSummary.active_count, matrixSummary.active_electrode_count, matrix?.active_count);
+  const wrapper = document.createElement("div");
+  wrapper.className = "instrument-block matrix-block";
+  wrapper.appendChild(metricGrid([
+    ["Active", active],
+    ["Shape", shape],
+  ], "matrix-summary"));
+  wrapper.appendChild(renderMatrixVoltageGrid(matrix));
+  return wrapper;
+}
+
+function matrixShapeDisplay(matrix, matrixSummary = {}) {
+  const shape = firstDefined(
+    matrixSummary.shape,
+    matrix?.shape,
+    matrix?.rows !== undefined && matrix?.columns !== undefined ? [matrix.rows, matrix.columns] : undefined,
+  );
+  return Array.isArray(shape) ? shape.join("x") : shape;
+}
+
+function matrixVoltageDisplay(matrix = {}) {
+  const status = matrix?.voltage_status && typeof matrix.voltage_status === "object"
+    ? matrix.voltage_status
+    : {};
+  if (status.display) return status.display;
+  const values = normalizeVoltageValues(firstDefined(status.values, matrix.initial_voltages, matrix.voltages, matrix.voltage));
+  if (!values.length) return formatValue(firstDefined(status.voltage, matrix.voltage));
+  const allEqual = values.every((value) => value === values[0]);
+  if (allEqual) return `${values[0]} V x${values.length}`;
+  return `${values.join("/")} V`;
+}
+
+function renderMatrixVoltageGrid(matrix = {}) {
+  const values = matrixVoltageBoxValues(matrix, 9);
+  const items = values.map((value, index) => ({
+    label: `V${index + 1}`,
+    value,
+    display: Number.isFinite(value) ? `${value}V` : "-",
+  }));
+  const grid = metricGrid(items, "matrix-voltage-boxes");
+  grid.title = matrixVoltageDisplay(matrix);
+  return grid;
+}
+
+function matrixVoltageBoxValues(matrix = {}, count = 9) {
+  const status = matrix?.voltage_status && typeof matrix.voltage_status === "object"
+    ? matrix.voltage_status
+    : {};
+  let values = normalizeVoltageValues(firstDefined(status.values, matrix.initial_voltages, matrix.voltages));
+  if (!values.length) values = normalizeVoltageValues(firstDefined(status.voltage, matrix.voltage));
+  if (values.length === 1 && count > 1) values = Array(count).fill(values[0]);
+  const result = values.slice(0, count);
+  while (result.length < count) result.push(null);
+  return result;
+}
+
+function normalizeVoltageValues(value) {
+  if (value === undefined || value === null) return [];
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => Number(item))
+      .filter((item) => Number.isFinite(item))
+      .map((item) => Math.round(item));
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? [Math.round(number)] : [];
+}
+
 function editableMetric(label, value, editor) {
   return {
     label,
@@ -156,10 +315,16 @@ function metricGrid(items, variant = "") {
     const spec = normalizeMetricItem(rawItem);
     const item = document.createElement("div");
     item.className = "metric";
+    const pending = pendingMetricEdit && pendingMetricEdit.key === metricEditorKey(spec.editor);
     if (spec.editor) {
       item.classList.add("editable-metric");
-      item.tabIndex = 0;
-      item.title = "Edit";
+      if (pendingMetricEdit) {
+        item.classList.add(pending ? "pending" : "disabled");
+        item.title = pending ? "Updating" : "Waiting for previous update";
+      } else {
+        item.tabIndex = 0;
+        item.title = "Edit";
+      }
     }
 
     const labelEl = document.createElement("span");
@@ -167,10 +332,14 @@ function metricGrid(items, variant = "") {
     labelEl.textContent = spec.label;
     const valueEl = document.createElement("strong");
     valueEl.className = "metric-value";
-    valueEl.textContent = metricValueText(spec);
+    if (pending) {
+      valueEl.replaceChildren(metricSpinnerNode());
+    } else {
+      valueEl.textContent = metricValueText(spec);
+    }
     item.append(labelEl, valueEl);
 
-    if (spec.editor) {
+    if (spec.editor && !pendingMetricEdit) {
       item.addEventListener("click", (event) => {
         event.stopPropagation();
         beginMetricEdit(spec, item, valueEl);
@@ -198,8 +367,9 @@ function metricValueText(spec) {
 }
 
 function beginMetricEdit(spec, item, valueEl) {
+  if (pendingMetricEdit) return;
   if (!spec.editor || item.classList.contains("editing")) return;
-  if (activeMetricEdit) activeMetricEdit.close(true);
+  if (activeMetricEdit) activeMetricEdit.close(false);
   item.classList.add("editing");
   const editor = spec.editor;
   const control = createMetricEditor(editor);
@@ -226,7 +396,17 @@ function beginMetricEdit(spec, item, valueEl) {
     if (activeMetricEdit?.item === item) activeMetricEdit = null;
     if (commit) {
       const result = commitMetricEdit(editor, control.value);
-      valueEl.textContent = result?.ok ? result.display : metricValueText(spec);
+      if (result?.ok && result.pending) {
+        pendingMetricEdit = {
+          ...result.pending,
+          display: result.display,
+          startedAt: Date.now(),
+        };
+        valueEl.replaceChildren(metricSpinnerNode());
+        renderStateGrid(state.live || {});
+      } else {
+        valueEl.textContent = result?.ok ? result.display : metricValueText(spec);
+      }
     } else {
       valueEl.textContent = metricValueText(spec);
     }
@@ -259,6 +439,13 @@ function beginMetricEdit(spec, item, valueEl) {
   });
 }
 
+function metricSpinnerNode() {
+  const spinner = document.createElement("span");
+  spinner.className = "metric-spinner";
+  spinner.setAttribute("aria-label", "Updating");
+  return spinner;
+}
+
 function createMetricEditor(editor) {
   if (editor.input === "select") {
     const select = document.createElement("select");
@@ -286,6 +473,7 @@ function createMetricEditor(editor) {
 
 function commitMetricEdit(editor, rawValue) {
   if (editor.kind === "stage") return commitStageMetric(editor, rawValue);
+  if (editor.kind === "stage_speed") return commitStageSpeedMetric(editor, rawValue);
   if (editor.kind === "light") return commitLightMetric(editor, rawValue);
   if (editor.kind === "microscope") return commitMicroscopeMetric(editor, rawValue);
   if (editor.kind === "camera") return commitCameraMetric(editor, rawValue);
@@ -308,6 +496,17 @@ function commitStageMetric(editor, rawValue) {
     appendStateEditError("Stage needs current X and Y before editing one axis.");
     return { ok: false };
   }
+  if (typeof beginStageMotionFromCommand === "function") {
+    beginStageMotionFromCommand({
+      position: {
+        X: Math.trunc(next.X),
+        Y: Math.trunc(next.Y),
+        ...(Number.isFinite(next.Z) ? { Z: Math.trunc(next.Z) } : {}),
+      },
+      source: "state_edit",
+      wait_timeout_seconds: 20,
+    });
+  }
   send({
     type: "mcp_tool",
     tool: "move_stage",
@@ -319,9 +518,47 @@ function commitStageMetric(editor, rawValue) {
       },
       wait_timeout_seconds: 20,
       poll_interval: 0.1,
+      wait_for_queue: false,
+      wait_for_completion: false,
     },
   });
-  return { ok: true, display: String(Math.trunc(value)) };
+  return {
+    ok: true,
+    display: String(Math.trunc(value)),
+    pending: {
+      key: metricEditorKey(editor),
+      expected: { kind: "stage", axis: editor.axis, value: Math.trunc(value) },
+    },
+  };
+}
+
+function commitStageSpeedMetric(editor, rawValue) {
+  const key = String(rawValue || "").trim().toLowerCase();
+  if (key === "custom") return { ok: true, display: "Custom" };
+  const preset = STAGE_SPEED_PRESETS[key];
+  if (!preset) {
+    appendStateEditError("Stage speed needs Slow, Medium, or Fast.");
+    return { ok: false };
+  }
+  send({
+    type: "mcp_tool",
+    tool: "set_stage_motion_speed",
+    arguments: {
+      speed_key: key,
+    },
+  });
+  return {
+    ok: true,
+    display: preset.label,
+    pending: {
+      key: metricEditorKey(editor),
+      expected: {
+        kind: "stage_speed",
+        velocity: preset.velocity,
+        acceleration: preset.acceleration,
+      },
+    },
+  };
 }
 
 function commitLightMetric(editor, rawValue) {
@@ -359,6 +596,16 @@ function commitLightMetric(editor, rawValue) {
   return {
     ok: true,
     display: editor.field === "light_on" ? formatValue(lightOn) : String(editor.field === "coaxial_intensity" ? coaxial : ring),
+    pending: {
+      key: metricEditorKey(editor),
+      expected: {
+        kind: "light",
+        field: editor.field,
+        light_on: lightOn,
+        coaxial_intensity: coaxial,
+        ring_intensity: ring,
+      },
+    },
   };
 }
 
@@ -405,7 +652,14 @@ function commitMicroscopeMetric(editor, rawValue) {
     },
   });
   const display = editor.field === "exposure_time" ? formatExposure(next.exposure_time) : String(next[editor.field]);
-  return { ok: true, display };
+  return {
+    ok: true,
+    display,
+    pending: {
+      key: metricEditorKey(editor),
+      expected: { kind: "microscope", field: editor.field, ...next },
+    },
+  };
 }
 
 function commitCameraMetric(editor, rawValue) {
@@ -431,7 +685,14 @@ function commitCameraMetric(editor, rawValue) {
     },
   });
   const display = editor.field === "exposure_time" ? formatExposure(next.exposure_time) : String(next[editor.field]);
-  return { ok: true, display };
+  return {
+    ok: true,
+    display,
+    pending: {
+      key: metricEditorKey(editor),
+      expected: { kind: "camera", field: editor.field, ...next },
+    },
+  };
 }
 
 function commitTemperatureMetric(editor, rawValue) {
@@ -450,7 +711,14 @@ function commitTemperatureMetric(editor, rawValue) {
       max_samples: 1,
     },
   });
-  return { ok: true, display: `target ${value.toFixed(1)} C` };
+  return {
+    ok: true,
+    display: `target ${value.toFixed(1)} C`,
+    pending: {
+      key: metricEditorKey(editor),
+      expected: { kind: "temperature", target: value },
+    },
+  };
 }
 
 function beginTemperatureTargetEdit() {
@@ -470,6 +738,88 @@ function beginTemperatureTargetEdit() {
   });
   beginMetricEdit(spec, item, valueEl);
 }
+
+function metricEditorKey(editor) {
+  if (!editor) return "";
+  if (editor.kind === "stage") return `stage.${editor.axis}`;
+  if (editor.kind === "stage_speed") return "stage.speed";
+  return `${editor.kind || "metric"}.${editor.field || editor.label || ""}`;
+}
+
+function resolvePendingMetricEditFromLive(live) {
+  if (!pendingMetricEdit) return;
+  if (pendingMetricEditMatchesLive(pendingMetricEdit, live)) {
+    pendingMetricEdit = null;
+    return;
+  }
+  if (Date.now() - Number(pendingMetricEdit.startedAt || 0) > 12000) {
+    pendingMetricEdit = null;
+  }
+}
+
+function pendingMetricEditMatchesLive(pending, live) {
+  const expected = pending?.expected || {};
+  const root = live?.state?.value || live?.state?.result?.value || live?.state || currentLiveState();
+  if (!root || !expected.kind) return false;
+  if (expected.kind === "stage") {
+    const value = Number(getPath(root, `xy_stage.position.${expected.axis}`));
+    return Number.isFinite(value) && Math.abs(value - Number(expected.value)) <= 2;
+  }
+  if (expected.kind === "stage_speed") {
+    const velocity = Number(getPath(root, "xy_stage.motion_params.dMaxV"));
+    const acceleration = Number(getPath(root, "xy_stage.motion_params.dMaxA"));
+    return (
+      Number.isFinite(velocity)
+      && Number.isFinite(acceleration)
+      && Math.abs(velocity - Number(expected.velocity)) <= 1
+      && Math.abs(acceleration - Number(expected.acceleration)) <= 1
+    );
+  }
+  if (expected.kind === "light") {
+    const value = getPath(root, `light_settings.${expected.field}`);
+    return valuesClose(value, expected[expected.field]);
+  }
+  if (expected.kind === "microscope") {
+    if (expected.field === "channel") {
+      const channel = firstDefined(
+        getPath(root, "microscope_settings.current_channel"),
+        getPath(root, "microscope_settings.channel"),
+      );
+      return String(channel || "") === String(expected.channel || "");
+    }
+    const value = getPath(root, `microscope_settings.${expected.field}`);
+    return valuesClose(value, expected[expected.field]);
+  }
+  if (expected.kind === "camera") {
+    const value = getPath(root, `camera_settings.${expected.field}`);
+    return valuesClose(value, expected[expected.field]);
+  }
+  if (expected.kind === "temperature") {
+    const target = typeof extractTemperatureTarget === "function"
+      ? extractTemperatureTarget(root)
+      : getPath(root, "temperature.target");
+    return Number.isFinite(Number(target)) && Math.abs(Number(target) - Number(expected.target)) <= 0.05;
+  }
+  return false;
+}
+
+function valuesClose(actual, expected) {
+  if (typeof expected === "boolean") return Boolean(actual) === expected;
+  const actualNumber = Number(actual);
+  const expectedNumber = Number(expected);
+  if (Number.isFinite(actualNumber) && Number.isFinite(expectedNumber)) {
+    return Math.abs(actualNumber - expectedNumber) <= 1;
+  }
+  return String(actual ?? "") === String(expected ?? "");
+}
+
+function clearPendingMetricEdit(options = {}) {
+  if (!pendingMetricEdit) return;
+  pendingMetricEdit = null;
+  if (options.render !== false) renderStateGrid(state.live || {});
+}
+
+window.clearPendingMetricEdit = clearPendingMetricEdit;
 
 function parseMetricNumber(rawValue, label, editor = {}) {
   const number = Number(String(rawValue ?? "").trim());
@@ -532,6 +882,10 @@ function currentLiveState() {
 }
 
 function currentStagePosition() {
+  if (typeof stageMotionPosition === "function") {
+    const animated = stageMotionPosition();
+    if (animated) return animated;
+  }
   return getPath(currentLiveState(), "xy_stage.position") || {};
 }
 

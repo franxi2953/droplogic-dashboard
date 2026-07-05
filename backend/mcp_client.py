@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
+from datetime import timedelta
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -19,7 +21,8 @@ class McpStdioClient:
         self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._lock = asyncio.Lock()
-        self._call_lock = asyncio.Lock()
+        self._exclusive_call_lock = asyncio.Lock()
+        self._call_semaphore = asyncio.Semaphore(8)
 
     @property
     def running(self) -> bool:
@@ -59,17 +62,58 @@ class McpStdioClient:
                     if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                         raise
 
-    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        read_timeout_seconds: float | None = None,
+        exclusive: bool = False,
+    ) -> Any:
+        result, _ = await self.call_tool_timed(
+            name,
+            arguments,
+            read_timeout_seconds=read_timeout_seconds,
+            exclusive=exclusive,
+        )
+        return result
+
+    async def call_tool_timed(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        read_timeout_seconds: float | None = None,
+        exclusive: bool = False,
+    ) -> tuple[Any, dict[str, float]]:
         if self._session is None:
             raise RuntimeError("MCP server is not running.")
-        async with self._call_lock:
-            result = await self._session.call_tool(name, arguments or {}, read_timeout_seconds=None)
-        return mcp_result_to_json(result)
+        started = time.perf_counter()
+        lock = self._exclusive_call_lock if exclusive else self._call_semaphore
+        async with lock:
+            acquired = time.perf_counter()
+            timeout = (
+                timedelta(seconds=max(0.001, float(read_timeout_seconds)))
+                if read_timeout_seconds is not None
+                else None
+            )
+            result = await self._session.call_tool(
+                name,
+                arguments or {},
+                read_timeout_seconds=timeout,
+            )
+            finished = time.perf_counter()
+        timing = {
+            "mcp_lock_wait_seconds": round(max(0.0, acquired - started), 4),
+            "mcp_call_seconds": round(max(0.0, finished - acquired), 4),
+            "mcp_total_seconds": round(max(0.0, finished - started), 4),
+        }
+        return mcp_result_to_json(result), timing
 
     async def list_tools(self) -> Any:
         if self._session is None:
             raise RuntimeError("MCP server is not running.")
-        async with self._call_lock:
+        async with self._exclusive_call_lock:
             result = await self._session.list_tools()
         return mcp_result_to_json(result)
 

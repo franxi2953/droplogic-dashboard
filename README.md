@@ -151,7 +151,9 @@ Minimal shape:
 
 ## Local Speech Input
 
-The **Audio** button records microphone audio in the browser and sends it to the local Dashboard backend for transcription. The transcript is inserted into the prompt box for review; it is not sent to the agent automatically.
+The **Load** button explicitly loads the local speech model. Audio is off by default: the dashboard does not preload Whisper, open the microphone, or start wake listening until the model is loaded. After that, the **Audio** button records microphone audio in the browser and sends it to the local Dashboard backend for transcription. Manual recordings insert the transcript into the prompt box for review.
+
+The **Wake** mode listens for a short browser wake phrase, then records the following command until word silence and sends that command through the same local transcription path. By default it uses `BoxMini` as the wake phrase and auto-submits recognized wake commands to the agent. Browser wake listening uses the Web Speech API when available; during the command it also uses that API only as a word-activity sensor, so music or steady room noise does not keep the recording open. The final transcript still comes from the local Whisper model. If browser speech recognition is unavailable, the dashboard falls back to audio-level silence detection. If the browser blocks automatic microphone activation, click **Load** and then **Wake** once.
 
 Install a local recognizer:
 
@@ -170,18 +172,27 @@ Then tune `config.example.json` or a private config:
     "device": "auto",
     "compute_type": "int8",
     "language": null,
-    "beam_size": 5,
-    "best_of": 5,
+    "beam_size": 1,
+    "best_of": 1,
     "temperature": 0,
     "condition_on_previous_text": false,
+    "preload": false,
+    "wake_enabled": true,
+    "wake_auto_start": false,
+    "wake_word": "BoxMini",
+    "wake_language": null,
+    "wake_auto_submit": true,
+    "wake_command_max_seconds": 24,
+    "wake_silence_ms": 1200,
+    "wake_initial_silence_ms": 5000,
     "hotwords": "BoxMini DropLogic droplet reservoir cartridge streamer visualizer Brightfield FAM stage temperature IVT TX TL MCP"
   }
 }
 ```
 
-Recommended defaults are `model: "large-v3-turbo"` and `compute_type: "int8"` for responsive local use on a CPU laptop. For maximum accuracy, use `model: "large-v3"`. For a CUDA GPU, use `device: "cuda"` and `compute_type: "float16"`.
+Recommended defaults are `model: "large-v3-turbo"`, `compute_type: "int8"`, `beam_size: 1`, and `best_of: 1` for responsive local use on a CPU laptop. Keep `preload: false` when running hardware protocols so Whisper does not compete with the dashboard until you click **Load**. Set `preload: true` only when you prefer paying the model-load cost at startup. For maximum accuracy, use `model: "large-v3"`. For a CUDA GPU, use `device: "cuda"` and `compute_type: "float16"`.
 
-The same backend path can later host wake-word/name detection or lab-specific command parsing without changing the MCP tool flow.
+Transcription events record `load_seconds`, `inference_seconds`, and `elapsed_seconds`, so slow runs can be separated into model startup versus recognition time.
 
 ## Run Logs
 

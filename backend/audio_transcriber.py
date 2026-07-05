@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ class AudioTranscript:
     engine: str | None = None
     model: str | None = None
     elapsed_seconds: float | None = None
+    load_seconds: float | None = None
+    inference_seconds: float | None = None
 
 
 class LocalAudioTranscriber:
@@ -52,6 +55,28 @@ class LocalAudioTranscriber:
         self.initial_prompt = initial_prompt or None
         self.hotwords = hotwords or None
         self._model: Any = None
+        self._model_lock = threading.Lock()
+
+    def preload(self) -> dict[str, Any]:
+        start = time.perf_counter()
+        if self.engine in {"faster_whisper", "faster-whisper", "ctranslate2"}:
+            load_seconds, cached = self._ensure_faster_whisper_model()
+            engine = "faster_whisper"
+        elif self.engine in {"whisper", "openai_whisper", "openai-whisper"}:
+            load_seconds, cached = self._ensure_openai_whisper_model()
+            engine = "whisper"
+        else:
+            raise RuntimeError(
+                f"Unsupported speech engine '{self.engine}'. "
+                "Use 'faster_whisper' or 'whisper'."
+            )
+        return {
+            "engine": engine,
+            "model": self.model,
+            "cached": cached,
+            "load_seconds": load_seconds,
+            "elapsed_seconds": time.perf_counter() - start,
+        }
 
     def transcribe(self, path: str | Path) -> AudioTranscript:
         audio_path = Path(path)
@@ -67,23 +92,9 @@ class LocalAudioTranscriber:
         )
 
     def _transcribe_faster_whisper(self, audio_path: Path) -> AudioTranscript:
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise RuntimeError(
-                "Local audio transcription needs faster-whisper. Install with: "
-                "py -3.13 -m pip install faster-whisper"
-            ) from exc
-
-        if self._model is None:
-            kwargs: dict[str, Any] = {}
-            if self.device != "auto":
-                kwargs["device"] = self.device
-            if self.compute_type != "auto":
-                kwargs["compute_type"] = self.compute_type
-            self._model = WhisperModel(self.model, **kwargs)
-
-        start = time.perf_counter()
+        overall_start = time.perf_counter()
+        load_seconds, _ = self._ensure_faster_whisper_model()
+        inference_start = time.perf_counter()
         segments, info = self._model.transcribe(
             str(audio_path),
             language=self.language,
@@ -96,16 +107,57 @@ class LocalAudioTranscriber:
             hotwords=self.hotwords,
         )
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+        inference_seconds = time.perf_counter() - inference_start
         return AudioTranscript(
             text=text,
             language=getattr(info, "language", None),
             duration_seconds=float(getattr(info, "duration", 0.0) or 0.0),
             engine="faster_whisper",
             model=self.model,
-            elapsed_seconds=time.perf_counter() - start,
+            elapsed_seconds=time.perf_counter() - overall_start,
+            load_seconds=load_seconds,
+            inference_seconds=inference_seconds,
         )
 
+    def _ensure_faster_whisper_model(self) -> tuple[float, bool]:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError(
+                "Local audio transcription needs faster-whisper. Install with: "
+                "py -3.13 -m pip install faster-whisper"
+            ) from exc
+
+        with self._model_lock:
+            if self._model is not None:
+                return 0.0, True
+            start = time.perf_counter()
+            kwargs: dict[str, Any] = {}
+            if self.device != "auto":
+                kwargs["device"] = self.device
+            if self.compute_type != "auto":
+                kwargs["compute_type"] = self.compute_type
+            self._model = WhisperModel(self.model, **kwargs)
+            return time.perf_counter() - start, False
+
     def _transcribe_openai_whisper(self, audio_path: Path) -> AudioTranscript:
+        overall_start = time.perf_counter()
+        load_seconds, _ = self._ensure_openai_whisper_model()
+        inference_start = time.perf_counter()
+        result = self._model.transcribe(str(audio_path), language=self.language)
+        inference_seconds = time.perf_counter() - inference_start
+        return AudioTranscript(
+            text=str(result.get("text") or "").strip(),
+            language=result.get("language"),
+            duration_seconds=None,
+            engine="whisper",
+            model=self.model,
+            elapsed_seconds=time.perf_counter() - overall_start,
+            load_seconds=load_seconds,
+            inference_seconds=inference_seconds,
+        )
+
+    def _ensure_openai_whisper_model(self) -> tuple[float, bool]:
         try:
             import whisper
         except ImportError as exc:
@@ -114,16 +166,9 @@ class LocalAudioTranscriber:
                 "py -3.13 -m pip install openai-whisper"
             ) from exc
 
-        if self._model is None:
+        with self._model_lock:
+            if self._model is not None:
+                return 0.0, True
+            start = time.perf_counter()
             self._model = whisper.load_model(self.model)
-
-        start = time.perf_counter()
-        result = self._model.transcribe(str(audio_path), language=self.language)
-        return AudioTranscript(
-            text=str(result.get("text") or "").strip(),
-            language=result.get("language"),
-            duration_seconds=None,
-            engine="whisper",
-            model=self.model,
-            elapsed_seconds=time.perf_counter() - start,
-        )
+            return time.perf_counter() - start, False

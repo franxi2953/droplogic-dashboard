@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DropLogic Dashboard</title>
-    <link rel="stylesheet" href="/styles.css?v=20260702-calibration" />
+    <link rel="stylesheet" href="/styles.css?v=20260704-composer-layout" />
   </head>
   <body>
     <main class="app">
@@ -29,7 +29,7 @@
         <div id="controlsPopover" class="controls-popover" hidden>
           <section>
             <strong>Matrix</strong>
-            <p><kbd>Wheel</kbd> zooms, hovering near an edge pans the cartridge, <kbd>Drag</kbd> box-selects droplets, and <kbd>Double click</kbd> resets the view.</p>
+            <p><kbd>Wheel</kbd> zooms, hovering near an edge pans the cartridge, <kbd>Middle drag</kbd> or <kbd>Ctrl</kbd><kbd>Drag</kbd> pans manually, <kbd>Drag</kbd> box-selects droplets, and <kbd>Double click</kbd> resets the view.</p>
             <p>Selected droplets show a translucent target preview over empty electrodes; <kbd>R</kbd> rotates the group and <kbd>Click</kbd> commits a SIPP move from Live view.</p>
             <p><kbd>Right click</kbd> queues a single selected droplet target; <kbd>Shift</kbd><kbd>Right click</kbd> appends another queued waypoint.</p>
           </section>
@@ -43,121 +43,153 @@
           </section>
           <section>
             <strong>Timeline</strong>
-            <p><kbd>Wheel</kbd> zooms frames, <kbd>Shift</kbd><kbd>Wheel</kbd> pans, drag scrubs preview frames, and <kbd>Go Live</kbd> returns to execution.</p>
-            <p><kbd>Trim Tail</kbd> deletes planned frames after the selected frame, never frames already executed or applied.</p>
+            <p><kbd>Wheel</kbd> zooms the visible time range around the cursor; <kbd>Shift</kbd><kbd>Wheel</kbd> pans time.</p>
+            <p><kbd>Drag</kbd> scrubs preview time; use the range bar handles to choose exactly which time window is shown.</p>
+            <p><kbd>Plan Executor</kbd> contains real matrix execution controls; <kbd>Trim Tail</kbd> deletes planned frames after the selected frame.</p>
           </section>
           <section>
             <strong>Streamer</strong>
-            <p><kbd>Wheel</kbd> zooms the camera stream, drag pans while zoomed, and <kbd>Double click</kbd> resets the camera view.</p>
+            <p><kbd>Wheel</kbd> zooms the camera stream, <kbd>Drag</kbd> or <kbd>Middle drag</kbd> pans while zoomed, and <kbd>Double click</kbd> resets the camera view.</p>
           </section>
           <section>
             <strong>Conversation</strong>
-            <p><kbd>Set</kbd> uses the prompt box as the active goal; <kbd>Ask</kbd> starts or steers the agent from the same composer.</p>
+            <p><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>N</kbd> creates and joins a new run; <kbd>Set</kbd> uses the prompt box as the active goal.</p>
+            <p><kbd>Send</kbd> starts the agent, <kbd>Steer</kbd> redirects it while busy, and <kbd>Queue</kbd> adds the prompt after the current turn.</p>
           </section>
         </div>
       </section>
 
       <section id="mainTab" class="tab-page active">
-        <section class="main-layout">
+        <section class="main-layout" id="mainLayout">
           <section class="control-surface">
-            <section class="visual-grid">
-              <article class="panel visual-panel streamer-panel">
-                <header>
-                  <h2>Streamer</h2>
-                  <div class="visual-actions">
-                    <code id="streamerMeta">waiting</code>
-                    <button id="downloadStreamer" class="frame-download download-frame" type="button" title="Download raw camera frame" aria-label="Download raw camera frame">
-                      <svg class="download-icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <circle class="download-icon-ring" cx="12" cy="12" r="8.25"></circle>
-                        <path class="download-icon-arrow" d="M12 6.75v8.1m0 0 3.35-3.35M12 14.85 8.65 11.5"></path>
-                        <path class="download-icon-base" d="M8.6 17.15h6.8"></path>
-                      </svg>
-                    </button>
-                  </div>
-                </header>
-                <div class="viewer streamer">
-                  <img id="streamerFrame" alt="Streamer visualizer frame" />
-                  <div id="streamerEmpty" class="empty">No streamer frame yet</div>
+            <section class="visual-section">
+              <header class="section-header">
+                <div class="panel-title">
+                  <button class="panel-collapse section-collapse" type="button" data-collapse-panel="visuals" title="Fold visual panels" aria-label="Fold visual panels" aria-expanded="true"></button>
+                  <h2>Visuals</h2>
                 </div>
-              </article>
+              </header>
+              <section class="visual-grid">
+                <article class="panel visual-panel streamer-panel">
+                  <header>
+                    <div class="panel-title">
+                      <button class="panel-collapse" type="button" data-collapse-panel="streamer" title="Fold streamer" aria-label="Fold streamer" aria-expanded="true"></button>
+                      <h2>Streamer</h2>
+                    </div>
+                    <div class="visual-actions">
+                      <code id="streamerMeta">waiting</code>
+                      <button id="downloadStreamer" class="frame-download download-frame" type="button" title="Download raw camera frame" aria-label="Download raw camera frame">
+                        <svg class="download-icon" viewBox="0 0 24 24" aria-hidden="true">
+                          <circle class="download-icon-ring" cx="12" cy="12" r="8.25"></circle>
+                          <path class="download-icon-arrow" d="M12 6.75v8.1m0 0 3.35-3.35M12 14.85 8.65 11.5"></path>
+                          <path class="download-icon-base" d="M8.6 17.15h6.8"></path>
+                        </svg>
+                      </button>
+                    </div>
+                  </header>
+                  <div class="viewer streamer">
+                    <img id="streamerFrame" alt="Streamer visualizer frame" />
+                    <div id="streamerEmpty" class="empty">No streamer frame yet</div>
+                  </div>
+                </article>
 
-              <article class="panel visual-panel matrix-panel">
-                <header>
-                  <h2>Matrix</h2>
-                  <div class="visual-actions">
-                    <code id="matrixMeta">waiting</code>
-                    <button id="downloadMatrix" class="frame-download download-frame" type="button" title="Download matrix snapshot" aria-label="Download matrix snapshot">
-                      <svg class="download-icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <circle class="download-icon-ring" cx="12" cy="12" r="8.25"></circle>
-                        <path class="download-icon-arrow" d="M12 6.75v8.1m0 0 3.35-3.35M12 14.85 8.65 11.5"></path>
-                        <path class="download-icon-base" d="M8.6 17.15h6.8"></path>
-                      </svg>
-                    </button>
-                  </div>
-                </header>
-                <div class="viewer matrix">
-                  <canvas id="matrixScene" aria-label="Matrix plan scene"></canvas>
-                  <img id="matrixFrame" alt="Matrix visualizer frame" />
-                  <div id="matrixEmpty" class="empty">No matrix frame yet</div>
-                  <div id="matrixCursorHud" class="matrix-cursor-hud" hidden></div>
-                  <div id="matrixHover" class="matrix-hover" hidden></div>
-                  <div id="matrixContextMenu" class="matrix-context-menu" hidden></div>
-                  <div id="matrixPaintCursor" class="matrix-paint-cursor" hidden><span aria-hidden="true"></span></div>
-                  <canvas id="matrixMinimap" class="matrix-minimap" width="180" height="180" aria-label="Matrix minimap"></canvas>
-                  <div id="matrixPaintPanel" class="matrix-paint-panel collapsed">
-                    <button id="matrixPaintToggle" class="matrix-paint-toggle" type="button" aria-label="Paint electrodes" aria-expanded="false" data-tooltip="Paint electrodes">
-                      <svg class="paint-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M16.8 3.9 20.1 7.2 8.9 18.4 4.6 19.4 5.6 15.1 16.8 3.9Z"></path>
-                        <path d="M14.9 5.8 18.2 9.1"></path>
-                      </svg>
-                    </button>
-                    <div id="matrixPaintTools" class="matrix-paint-tools" role="toolbar" aria-label="Matrix paint tools">
-                      <button class="matrix-paint-tool block" type="button" data-paint-tool="blocked" data-tooltip="Not allowed electrodes" aria-label="Not allowed electrodes">
-                        <span aria-hidden="true"></span>
-                      </button>
-                      <button class="matrix-paint-tool active" type="button" data-paint-tool="active" data-tooltip="Activate electrodes" aria-label="Activate electrodes">
-                        <span aria-hidden="true"></span>
-                      </button>
-                      <button class="matrix-paint-tool erase" type="button" data-paint-tool="erase" data-tooltip="Erase electrodes and droplets" aria-label="Clean electrodes">
-                        <span aria-hidden="true"></span>
+                <div class="layout-resizer visual-resizer" data-resizer="visual" role="separator" aria-label="Resize streamer and matrix panels" tabindex="0"></div>
+
+                <article class="panel visual-panel matrix-panel">
+                  <header>
+                    <div class="panel-title">
+                      <button class="panel-collapse" type="button" data-collapse-panel="matrix" title="Fold matrix" aria-label="Fold matrix" aria-expanded="true"></button>
+                      <h2>Matrix</h2>
+                    </div>
+                    <div class="visual-actions">
+                      <code id="matrixMeta">waiting</code>
+                      <button id="downloadMatrix" class="frame-download download-frame" type="button" title="Download matrix snapshot" aria-label="Download matrix snapshot">
+                        <svg class="download-icon" viewBox="0 0 24 24" aria-hidden="true">
+                          <circle class="download-icon-ring" cx="12" cy="12" r="8.25"></circle>
+                          <path class="download-icon-arrow" d="M12 6.75v8.1m0 0 3.35-3.35M12 14.85 8.65 11.5"></path>
+                          <path class="download-icon-base" d="M8.6 17.15h6.8"></path>
+                        </svg>
                       </button>
                     </div>
-                  </div>
-                  <div id="matrixCommandPanel" class="matrix-command-panel" hidden>
-                    <div class="matrix-command-status">
-                      <strong id="matrixCommandTitle">No droplet selected</strong>
-                      <span id="matrixCommandMeta">Queue empty</span>
-                    </div>
-                    <div class="matrix-command-actions">
-                      <button id="matrixCommandClear" type="button">Clear</button>
-                      <button id="matrixCommandPlan" type="button">Plan SIPP</button>
-                    </div>
-                  </div>
-                  <div id="matrixPathPanel" class="matrix-path-panel collapsed" hidden>
-                    <button id="matrixPathToggle" class="matrix-path-toggle" type="button" aria-expanded="false">
-                      <span>Paths</span>
-                      <code id="matrixPathCount">0</code>
+                  </header>
+                  <div class="viewer matrix">
+                    <canvas id="matrixScene" aria-label="Matrix plan scene"></canvas>
+                    <img id="matrixFrame" alt="Matrix visualizer frame" />
+                    <div id="matrixEmpty" class="empty">No matrix frame yet</div>
+                    <button id="matrixLiveBadge" class="matrix-live-badge" type="button" hidden>
+                      <strong>Preview mode</strong>
+                      <span>Matrix is paused</span>
+                      <code>Go Live</code>
                     </button>
-                    <div id="matrixPathBody" class="matrix-path-body"></div>
+                    <div id="matrixCursorHud" class="matrix-cursor-hud" hidden></div>
+                    <div id="matrixHover" class="matrix-hover" hidden></div>
+                    <div id="matrixContextMenu" class="matrix-context-menu" hidden></div>
+                    <div id="matrixPaintCursor" class="matrix-paint-cursor" hidden><span aria-hidden="true"></span></div>
+                    <canvas id="matrixMinimap" class="matrix-minimap" width="180" height="180" aria-label="Matrix minimap"></canvas>
+                    <div id="matrixPaintPanel" class="matrix-paint-panel collapsed">
+                      <button id="matrixPaintToggle" class="matrix-paint-toggle" type="button" aria-label="Paint electrodes" aria-expanded="false" data-tooltip="Paint electrodes">
+                        <svg class="paint-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
+                          <path d="M16.8 3.9 20.1 7.2 8.9 18.4 4.6 19.4 5.6 15.1 16.8 3.9Z"></path>
+                          <path d="M14.9 5.8 18.2 9.1"></path>
+                        </svg>
+                      </button>
+                      <div id="matrixPaintTools" class="matrix-paint-tools" role="toolbar" aria-label="Matrix paint tools">
+                        <button class="matrix-paint-tool block" type="button" data-paint-tool="blocked" data-tooltip="Not allowed electrodes" aria-label="Not allowed electrodes">
+                          <span aria-hidden="true"></span>
+                        </button>
+                        <button class="matrix-paint-tool active" type="button" data-paint-tool="active" data-tooltip="Activate electrodes" aria-label="Activate electrodes">
+                          <span aria-hidden="true"></span>
+                        </button>
+                        <button class="matrix-paint-tool erase" type="button" data-paint-tool="erase" data-tooltip="Erase electrodes and droplets" aria-label="Clean electrodes">
+                          <span aria-hidden="true"></span>
+                        </button>
+                      </div>
+                    </div>
+                    <div id="matrixCommandPanel" class="matrix-command-panel" hidden>
+                      <div class="matrix-command-status">
+                        <strong id="matrixCommandTitle">No droplet selected</strong>
+                        <span id="matrixCommandMeta">Queue empty</span>
+                      </div>
+                      <div class="matrix-command-actions">
+                        <button id="matrixCommandClear" type="button">Clear</button>
+                        <button id="matrixCommandPlan" type="button">Plan SIPP</button>
+                      </div>
+                    </div>
+                    <div id="matrixPathPanel" class="matrix-path-panel collapsed" hidden>
+                      <button id="matrixPathToggle" class="matrix-path-toggle" type="button" aria-expanded="false">
+                        <span>Paths</span>
+                        <code id="matrixPathCount">0</code>
+                      </button>
+                      <div id="matrixPathBody" class="matrix-path-body"></div>
+                    </div>
                   </div>
-                </div>
-              </article>
+                </article>
+              </section>
             </section>
+
+            <div class="layout-resizer bottom-resizer" data-resizer="bottom" role="separator" aria-label="Resize visual and bottom panels" tabindex="0"></div>
 
             <section class="bottom-panel">
               <nav class="bottom-tabs" aria-label="Telemetry panels">
+                <button class="bottom-tab collapse-tab" type="button" data-collapse-panel="bottom" title="Fold bottom panels" aria-label="Fold bottom panels" aria-expanded="true"></button>
                 <button class="bottom-tab active" type="button" data-bottom-tab="state" title="State">
                   State
                 </button>
                 <button class="bottom-tab" type="button" data-bottom-tab="timeline" title="Timeline">
                   Timeline
                 </button>
+                <button class="bottom-tab" type="button" data-bottom-tab="presets" title="Presets">
+                  Presets
+                </button>
               </nav>
               <div class="bottom-tab-pages">
                 <section id="stateBottomPanel" class="bottom-tab-page active">
                   <article class="panel temperature-panel">
                     <header>
-                      <h2>Temperature</h2>
+                      <div class="panel-title">
+                        <button class="panel-collapse" type="button" data-collapse-panel="bottom" title="Fold bottom panels" aria-label="Fold bottom panels" aria-expanded="true"></button>
+                        <h2>Temperature</h2>
+                      </div>
                       <div class="temperature-readout">
                         <strong id="temperatureValue">-</strong>
                         <span id="temperatureTarget">target -</span>
@@ -178,34 +210,90 @@
                 <section id="timelineBottomPanel" class="bottom-tab-page timeline-scrubber-panel">
                   <article class="panel plan-timeline-panel">
                     <header>
-                      <h2>Plan Timeline</h2>
+                      <div class="panel-title">
+                        <button class="panel-collapse" type="button" data-collapse-panel="bottom" title="Fold bottom panels" aria-label="Fold bottom panels" aria-expanded="true"></button>
+                        <h2>Plan Timeline</h2>
+                      </div>
                       <div class="timeline-controls">
-                        <button id="timelineRewind" type="button" title="Restart execution from frame 1" aria-label="Restart execution from frame 1">|&lt;</button>
-                        <button id="timelinePlay" type="button" title="Play or resume execution" aria-label="Play or resume execution">Play</button>
-                        <button id="timelinePause" type="button" title="Pause execution" aria-label="Pause execution">Pause</button>
-                        <label class="timeline-delay" title="Execution frame delay">
-                          <span>Delay</span>
-                          <input id="timelineFrameDelay" type="number" min="0.01" step="0.05" value="1.00" aria-label="Execution frame delay in seconds" />
-                        </label>
-                        <button id="timelineZoomOut" type="button" title="Zoom out" aria-label="Zoom out">-</button>
-                        <button id="timelineZoomIn" type="button" title="Zoom in" aria-label="Zoom in">+</button>
-                        <button id="timelineTrimTail" type="button" title="Delete planned frames after the selected frame">Trim Tail</button>
                         <button id="timelineLive" type="button" title="Return to the currently executing frame">Go Live</button>
+                        <button id="timelineStopToggle" class="timeline-stop-toggle" type="button" title="Stop or resume timeline recording">Stop Recording</button>
+                        <button id="timelineOverlayToggle" class="timeline-overlay-toggle" type="button" title="Choose timeline overlays" aria-expanded="false">Overlays</button>
+                        <button id="timelineExecutorToggle" class="timeline-executor-toggle" type="button" title="Matrix plan executor controls" aria-expanded="false">Plan Executor</button>
                         <code id="timelineFrameLabel">-</code>
                       </div>
                     </header>
                     <canvas id="planTimeline" width="960" height="220" aria-label="Plan timeline"></canvas>
+                    <div id="timelineRangeSelector" class="timeline-range-selector" aria-label="Visible timeline range">
+                      <span id="timelineRangeStart" class="timeline-range-label">+0s</span>
+                      <div id="timelineRangeTrack" class="timeline-range-track">
+                        <div id="timelineRangeWindow" class="timeline-range-window">
+                          <button class="timeline-range-handle start" type="button" data-timeline-range-handle="start" aria-label="Adjust visible range start"></button>
+                          <button class="timeline-range-handle end" type="button" data-timeline-range-handle="end" aria-label="Adjust visible range end"></button>
+                        </div>
+                      </div>
+                      <span id="timelineRangeEnd" class="timeline-range-label">+0s</span>
+                    </div>
+                    <div id="timelineExecutorMenu" class="timeline-executor-menu" hidden>
+                      <div class="timeline-executor-title">
+                        <strong>Matrix Plan Executor</strong>
+                        <span>Runs the electrode plan, not the preview timeline.</span>
+                      </div>
+                      <div class="timeline-executor-actions">
+                        <button id="timelineRewind" type="button" title="Restart execution from frame 1" aria-label="Restart execution from frame 1">|&lt;</button>
+                        <button id="timelinePlay" type="button" title="Play or resume execution" aria-label="Play or resume execution">Play</button>
+                        <button id="timelinePause" type="button" title="Pause execution" aria-label="Pause execution">Pause</button>
+                        <button id="timelineTrimTail" type="button" title="Delete planned frames after the selected frame">Trim Tail</button>
+                      </div>
+                      <label class="timeline-delay" title="Execution frame delay">
+                        <span>Frame delay</span>
+                        <input id="timelineFrameDelay" type="number" min="0.01" step="0.05" value="1.00" aria-label="Execution frame delay in seconds" />
+                      </label>
+                    </div>
+                    <div id="timelineOverlayMenu" class="timeline-overlay-menu" hidden>
+                      <label><input type="checkbox" data-timeline-overlay="plan" checked /> <span>Plan</span></label>
+                      <label><input type="checkbox" data-timeline-overlay="measuredTemperature" checked /> <span>Measured temp</span></label>
+                      <label><input type="checkbox" data-timeline-overlay="targetTemperature" checked /> <span>Target temp</span></label>
+                      <label><input type="checkbox" data-timeline-overlay="stage" checked /> <span>Stage</span></label>
+                      <label><input type="checkbox" data-timeline-overlay="photos" checked /> <span>Photos</span></label>
+                      <label><input type="checkbox" data-timeline-overlay="timelineStops" checked /> <span>Recording stops</span></label>
+                    </div>
                     <div id="timelineDropletPanel" class="timeline-droplet-panel" hidden></div>
                     <div id="timelineHover" class="timeline-hover" hidden></div>
+                  </article>
+                </section>
+
+                <section id="presetsBottomPanel" class="bottom-tab-page presets-panel">
+                  <article class="panel presets-editor-panel">
+                    <header>
+                      <div class="panel-title">
+                        <button class="panel-collapse" type="button" data-collapse-panel="bottom" title="Fold bottom panels" aria-label="Fold bottom panels" aria-expanded="true"></button>
+                        <h2>Presets</h2>
+                      </div>
+                      <div class="preset-actions">
+                        <button id="refreshPresets" type="button">Refresh</button>
+                        <input id="newPresetCategory" type="text" placeholder="category" aria-label="New preset category" />
+                        <button id="addPreset" type="button">Add</button>
+                        <code id="presetStatus">-</code>
+                      </div>
+                    </header>
+                    <div class="preset-editor-layout">
+                      <div id="presetCategories" class="preset-categories"></div>
+                      <div id="presetList" class="preset-list"></div>
+                    </div>
                   </article>
                 </section>
               </div>
             </section>
           </section>
 
+          <div class="layout-resizer chat-resizer" data-resizer="chat" role="separator" aria-label="Resize control and conversation panels" tabindex="0"></div>
+
           <aside class="panel conversation-panel">
             <header>
-              <h2>Conversation</h2>
+              <div class="panel-title">
+                <button class="panel-collapse" type="button" data-collapse-panel="chat" title="Fold conversation" aria-label="Fold conversation" aria-expanded="true"></button>
+                <h2>Conversation</h2>
+              </div>
               <div class="conversation-actions">
                 <button id="copyOutput" type="button">Copy Output</button>
                 <button id="cancelAgent" class="danger-button" type="button">Cancel</button>
@@ -241,13 +329,21 @@
               </div>
               <div class="composer-actions">
                 <div id="agentStatusLine" class="agent-status-line" aria-live="polite">Idle</div>
-                <div class="composer-button-row">
-                  <button id="askAgent" title="Send to agent">Ask</button>
+                <div class="agent-button-row">
+                  <button id="askAgent" title="Send to agent">Send</button>
+                  <button id="queueAgent" type="button" title="Queue for the agent">Queue</button>
                   <button id="stopAgent" class="danger-button" type="button" title="Stop agent">Stop</button>
+                </div>
+                <fieldset class="audio-control-group">
+                  <legend>Audio</legend>
+                  <button id="loadAudio" class="audio-load-button" type="button" title="Load local audio model">Load</button>
+                  <button id="wakeInput" class="wake-button" type="button" title="Listen for wake word" aria-label="Listen for wake word">
+                    Wake mode
+                  </button>
                   <button id="audioInput" class="audio-button" type="button" title="Record local speech-to-text audio" aria-label="Record audio">
                     <span class="mic-icon" aria-hidden="true"></span>
                   </button>
-                </div>
+                </fieldset>
               </div>
               <div id="audioStatus" class="audio-status" aria-live="polite"></div>
             </div>
@@ -467,10 +563,10 @@
                 <button id="calibrationAccept" type="button" title="Accept current target">Accept</button>
                 <button id="calibrationSave" type="button" title="Save calibration">Save</button>
               </div>
-              <div class="calibration-speed" role="group" aria-label="Jog step">
-                <button type="button" data-calibration-step="25">Fine</button>
-                <button type="button" data-calibration-step="100" class="active">Med</button>
-                <button type="button" data-calibration-step="500">Fast</button>
+              <div class="calibration-speed" role="group" aria-label="Jog speed">
+                <button type="button" data-calibration-speed="1">Fine</button>
+                <button type="button" data-calibration-speed="2" class="active">Med</button>
+                <button type="button" data-calibration-speed="3">Fast</button>
               </div>
             </aside>
           </div>
@@ -478,8 +574,8 @@
       </section>
     </main>
 
-    <script src="/js/state-panel.js?v=20260702-calibration"></script>
+    <script src="/js/state-panel.js?v=20260704-live-render-throttle"></script>
     <script src="/js/timeline-cursor.js?v=20260702-calibration"></script>
-    <script src="/app.js?v=20260702-calibration"></script>
+    <script src="/app.js?v=20260705-execution-auto-live"></script>
   </body>
 </html>
