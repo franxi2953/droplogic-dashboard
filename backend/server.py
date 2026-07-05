@@ -3222,10 +3222,19 @@ ARTIFACT_REF_CONTAINER_KEYS = {"artifact", "artifacts", "artifact_ref", "artifac
 CAPTURE_REF_CONTAINER_KEYS = {"capture", "captures"}
 ARTIFACT_REF_SKIP_KEYS = {"arguments", "dashboard_actual_arguments", "argument_overrides"}
 ARTIFACT_REF_TEXT_MAX_CHARS = 60000
+RECORDED_ARTIFACT_PATH_KEYS_CACHE: dict[tuple[str, tuple[str, ...]], tuple[tuple[int, int], frozenset[str]]] = {}
+RECORDED_ARTIFACT_PATH_KEYS_CACHE_LOCK = threading.Lock()
 
 
 def artifact_path_key(path: Path) -> str:
     return os.path.normcase(str(path.resolve()))
+
+
+def recorded_artifact_path_keys_cache_key(run_dir: Path, allowed_roots: list[Path]) -> tuple[str, tuple[str, ...]]:
+    return (
+        artifact_path_key(run_dir),
+        tuple(artifact_path_key(root) for root in allowed_roots),
+    )
 
 
 def add_recorded_artifact_path_key(
@@ -3300,20 +3309,37 @@ def collect_recorded_artifact_path_keys(
 
 def recorded_run_artifact_path_keys(run_dir: Path, allowed_roots: list[Path]) -> set[str]:
     events_path = run_dir / "events.jsonl"
-    if not events_path.exists():
-        return set()
+    cache_key = recorded_artifact_path_keys_cache_key(run_dir, allowed_roots)
     try:
-        lines = events_path.read_text(encoding="utf-8").splitlines()
+        stat = events_path.stat()
+    except OSError:
+        with RECORDED_ARTIFACT_PATH_KEYS_CACHE_LOCK:
+            RECORDED_ARTIFACT_PATH_KEYS_CACHE.pop(cache_key, None)
+        return set()
+    fingerprint = (stat.st_mtime_ns, stat.st_size)
+    with RECORDED_ARTIFACT_PATH_KEYS_CACHE_LOCK:
+        cached = RECORDED_ARTIFACT_PATH_KEYS_CACHE.get(cache_key)
+        if cached and cached[0] == fingerprint:
+            return set(cached[1])
+    try:
+        with events_path.open("r", encoding="utf-8") as lines:
+            keys: set[str] = set()
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(event, dict):
+                    collect_recorded_artifact_path_keys(event, run_dir, allowed_roots, keys)
     except OSError:
         return set()
-    keys: set[str] = set()
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            collect_recorded_artifact_path_keys(event, run_dir, allowed_roots, keys)
+    try:
+        final_stat = events_path.stat()
+    except OSError:
+        return keys
+    if (final_stat.st_mtime_ns, final_stat.st_size) == fingerprint:
+        with RECORDED_ARTIFACT_PATH_KEYS_CACHE_LOCK:
+            RECORDED_ARTIFACT_PATH_KEYS_CACHE[cache_key] = (fingerprint, frozenset(keys))
     return keys
 
 

@@ -8985,20 +8985,8 @@ function photoInfoFromEvent(event) {
       || getPath(root, "mime_type")
       || "";
     info.preset = info.preset || getPath(root, "preset.name") || getPath(root, "name") || "";
-    addCandidate({
-      path: getPath(root, "artifact.path"),
-      absolutePath: getPath(root, "artifact.absolute_path"),
-      mimeType: getPath(root, "artifact.mime_type"),
-      source: getPath(root, "artifact.frame_source") || getPath(root, "artifact.visualizer"),
-      preset: getPath(root, "artifact.preset"),
-    }, 0);
-    addCandidate({
-      path: getPath(root, "frame.artifact.path"),
-      absolutePath: getPath(root, "frame.artifact.absolute_path"),
-      mimeType: getPath(root, "frame.artifact.mime_type"),
-      source: getPath(root, "frame.artifact.frame_source") || getPath(root, "frame.artifact.visualizer"),
-      preset: getPath(root, "frame.artifact.preset"),
-    }, 0);
+    if (root === event?.arguments) continue;
+    addExplicitArtifactCandidates(root, addCandidate);
     for (const attachment of root?.model_attachments || []) {
       addCandidate({
         path: attachment?.artifact?.path,
@@ -9008,14 +8996,7 @@ function photoInfoFromEvent(event) {
         preset: attachment?.artifact?.preset,
       }, 1);
     }
-    addNestedCaptureCandidates(root, addCandidate);
-    addCandidate({
-      path: getPath(root, "frame.path") || getPath(root, "path") || getPath(root, "file") || getPath(root, "output_path"),
-      absolutePath: getPath(root, "frame.absolute_path") || getPath(root, "absolute_path"),
-      mimeType: getPath(root, "frame.mime_type") || getPath(root, "mime_type"),
-      source: getPath(root, "frame.frame_source") || getPath(root, "frame.visualizer") || getPath(root, "source"),
-      preset: getPath(root, "preset.name") || getPath(root, "name"),
-    }, 5);
+    addExplicitCaptureCandidates(root, addCandidate);
   }
   candidates.sort((a, b) => a.priority - b.priority);
   const best = candidates[0];
@@ -9030,22 +9011,63 @@ function photoInfoFromEvent(event) {
   return info;
 }
 
-function addNestedCaptureCandidates(root, addCandidate) {
-  const captures = root?.captures;
-  if (!Array.isArray(captures)) return;
-  for (const entry of captures) {
-    const nested = entry?.captures;
-    if (!Array.isArray(nested)) continue;
-    for (const capture of nested) {
-      addCandidate({
-        path: capture?.path,
-        absolutePath: capture?.absolute_path,
-        mimeType: capture?.mime_type,
-        source: capture?.channel,
-        preset: capture?.profile?.preset,
-      }, 3);
-    }
+function addExplicitArtifactCandidates(root, addCandidate) {
+  addArtifactRefCandidate(root?.artifact, addCandidate, 0);
+  addArtifactRefCandidate(root?.artifacts, addCandidate, 1);
+  addArtifactRefCandidate(root?.frame?.artifact, addCandidate, 0);
+  addArtifactRefCandidate(root?.frame?.artifacts, addCandidate, 1);
+  addArtifactRefCandidate(root?.artifact_ref, addCandidate, 1);
+  addArtifactRefCandidate(root?.artifact_refs, addCandidate, 1);
+  addArtifactRefCandidate(root?._artifact_ref, addCandidate, 1);
+  addArtifactRefCandidate(root?.frame?.artifact_ref, addCandidate, 1);
+  addArtifactRefCandidate(root?.frame?.artifact_refs, addCandidate, 1);
+  addArtifactRefCandidate(root?.frame?._artifact_ref, addCandidate, 1);
+  addArtifactRefCandidate(root?.model_image_attachment?.artifact, addCandidate, 1);
+}
+
+function addArtifactRefCandidate(ref, addCandidate, priority) {
+  if (!ref) return;
+  if (Array.isArray(ref)) {
+    for (const item of ref) addArtifactRefCandidate(item, addCandidate, priority);
+    return;
   }
+  if (typeof ref === "string") {
+    addCandidate({ path: ref }, priority);
+    return;
+  }
+  if (typeof ref !== "object") return;
+  addCandidate({
+    path: ref.path,
+    absolutePath: ref.absolute_path,
+    mimeType: ref.mime_type,
+    source: ref.frame_source || ref.visualizer || ref.source,
+    preset: ref.preset || ref.name,
+  }, priority);
+}
+
+function addExplicitCaptureCandidates(root, addCandidate) {
+  addCaptureRecordCandidates(root?.capture, addCandidate);
+  addCaptureRecordCandidates(root?.captures, addCandidate);
+  addCaptureRecordCandidates(root?.frame?.capture, addCandidate);
+  addCaptureRecordCandidates(root?.frame?.captures, addCandidate);
+}
+
+function addCaptureRecordCandidates(value, addCandidate) {
+  if (!value) return;
+  if (Array.isArray(value)) {
+    for (const item of value) addCaptureRecordCandidates(item, addCandidate);
+    return;
+  }
+  if (typeof value !== "object") return;
+  addCandidate({
+    path: value.path,
+    absolutePath: value.absolute_path,
+    mimeType: value.mime_type,
+    source: value.channel || value.frame_source || value.visualizer || value.source,
+    preset: value.profile?.preset || value.preset || value.name,
+  }, 3);
+  addCaptureRecordCandidates(value.capture, addCandidate);
+  addCaptureRecordCandidates(value.captures, addCandidate);
 }
 
 function eventPayloadRoots(event) {
