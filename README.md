@@ -207,6 +207,14 @@ runs/<run_id>/
 
 `events.jsonl` is the source of truth for the UI. Agent prose is treated as narration; hardware state should be refreshed through MCP tools before acting.
 
+Timeline photo markers and hover previews use saved image records from event results, content, and model attachments. Recorded `artifact`/`artifacts`, `artifact_ref`/`artifact_refs`, and `capture`/`captures` metadata can be previewed or revealed; requested `output_path` values in tool arguments are not treated as saved files on their own.
+
+Run-local artifacts are served from the selected run directory. External capture files are served only when the file was recorded in `events.jsonl` and lives under `DROPLOGIC_CAPTURE_ROOT` or `%USERPROFILE%\Documents\DropLogic\captures`. If capture tools save photos somewhere else, set the capture root before launching Dashboard:
+
+```powershell
+$env:DROPLOGIC_CAPTURE_ROOT="C:\path\to\captures"
+```
+
 ## Context Hygiene
 
 Dashboard tracks the size of every model request and compacts old context aggressively:

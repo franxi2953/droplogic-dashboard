@@ -475,7 +475,7 @@ button:disabled {
 .bottom-tab-pages {
   border-left: 1px solid rgba(100, 210, 255, 0.42);
   border-radius: 0 7px 7px 7px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .bottom-tab-page {
@@ -722,7 +722,7 @@ button:disabled {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 6px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .plan-timeline-panel.has-droplet-panel {
@@ -1120,7 +1120,7 @@ button:disabled {
 
 .timeline-hover {
   position: absolute;
-  z-index: 5;
+  z-index: 30;
   max-width: min(320px, calc(100% - 16px));
   padding: 7px 9px;
   border: 1px solid rgba(191, 90, 242, 0.36);
@@ -1152,6 +1152,21 @@ button:disabled {
   display: block;
   margin-top: 2px;
   color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.timeline-hover .timeline-click-hint {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  margin-top: 6px;
+  padding: 3px 7px;
+  border: 1px solid rgba(100, 210, 255, 0.34);
+  border-radius: 999px;
+  background: rgba(10, 132, 255, 0.14);
+  color: #dff7ff;
+  font-weight: 720;
+  letter-spacing: 0;
 }
 
 .timeline-hover.has-preview {
@@ -1169,6 +1184,18 @@ button:disabled {
   border-radius: 6px;
   border: 1px solid rgba(245, 245, 247, 0.14);
   background: #050607;
+}
+
+.timeline-preview-error {
+  display: block;
+  margin-top: 7px;
+  padding: 8px;
+  border: 1px solid rgba(255, 69, 58, 0.30);
+  border-radius: 6px;
+  background: rgba(255, 69, 58, 0.10);
+  color: #ffb3ad;
+  font-size: 11px;
+  font-weight: 650;
 }
 
 .timeline-droplet-panel {
