@@ -18,6 +18,9 @@ const TIMELINE_ACTIVE_EXECUTION_AUTO_FOLLOW_GRACE_MS = 1200;
 
 const state = {
   ws: null,
+  liveWs: null,
+  liveWsConnected: false,
+  liveWsReconnectTimer: null,
   events: [],
   eventKeys: new Set(),
   eventWindow: {
@@ -29,6 +32,7 @@ const state = {
   },
   status: null,
   live: null,
+  liveFrameFreshness: {},
   bottomTab: "state",
   agentBusy: false,
   runs: [],
@@ -144,6 +148,30 @@ const state = {
     queues: new Map(),
     planning: false,
     lastError: "",
+  },
+  matrixRenderStats: {
+    samples: [],
+    history: [],
+    fps: 0,
+    uniqueFps: 0,
+    lastFrameIndex: null,
+    lastFrameCount: null,
+    lastSource: "",
+    lastMode: "",
+    lastDelta: null,
+    lastStatus: "idle",
+    jumps: 0,
+    regressions: 0,
+    repeats: 0,
+    sourceSwitches: 0,
+    lastUpdatedAt: "",
+  },
+  matrixRenderQueue: {
+    raf: null,
+    timer: null,
+    lastAt: 0,
+    options: {},
+    fallbackScene: null,
   },
   presets: {
     loaded: false,
@@ -518,10 +546,18 @@ function persistMatrixScene(scene, live = {}) {
 }
 
 function mergeLiveWithMatrixCache(live) {
-  const nextLive = live || {};
+  const nextLive = mergeLiveWithFreshFrames(live || {});
   const scene = nextLive?.scene?.result || nextLive?.scene;
   if (scene?.available) {
     if (matrixSceneMatchesRuntimeSession(scene, nextLive)) {
+      const currentScene = state.live?.scene?.result || state.live?.scene;
+      if (matrixSceneIsStaleComparedTo(scene, currentScene)) {
+        return {
+          ...nextLive,
+          scene: state.live.scene,
+          matrix_scene_stale_ignored: matrixSceneFreshnessSummary(scene, currentScene),
+        };
+      }
       persistMatrixScene(scene, nextLive);
       return nextLive;
     }
@@ -544,6 +580,131 @@ function mergeLiveWithMatrixCache(live) {
     };
   }
   return nextLive;
+}
+
+function mergeLiveWithFreshFrames(live) {
+  if (!live || typeof live !== "object" || !live.frames || typeof live.frames !== "object") return live;
+  const frames = { ...(live.frames || {}) };
+  let changed = false;
+  for (const [visualizer, frame] of Object.entries(frames)) {
+    if (!frameIsFreshForVisualizer(visualizer, frame, live.updated_at)) {
+      const current = state.live?.frames?.[visualizer];
+      if (current) {
+        frames[visualizer] = current;
+        changed = true;
+      }
+      continue;
+    }
+    rememberFrameFreshness(visualizer, frame, live.updated_at);
+  }
+  return changed ? { ...live, frames } : live;
+}
+
+function frameFreshness(frame, updatedAt = "") {
+  const roots = [
+    frame,
+    frame?.dashboard_live,
+    frame?.result && typeof frame.result === "object" ? frame.result : null,
+    frame?.result?.dashboard_live,
+  ].filter(Boolean);
+  let sequence = null;
+  let capturedAt = "";
+  for (const root of roots) {
+    const rawSequence = root.dashboard_live_sequence ?? root.sequence;
+    const parsedSequence = Number(rawSequence);
+    if (sequence === null && Number.isFinite(parsedSequence)) sequence = Math.trunc(parsedSequence);
+    const rawTime = root.dashboard_live_captured_at || root.captured_at || root.updated_at || "";
+    if (!capturedAt && rawTime) capturedAt = String(rawTime);
+  }
+  if (!capturedAt && updatedAt) capturedAt = String(updatedAt);
+  const capturedMs = capturedAt ? Date.parse(capturedAt) : NaN;
+  return {
+    sequence,
+    capturedAt,
+    capturedMs: Number.isFinite(capturedMs) ? capturedMs : null,
+  };
+}
+
+function frameFreshnessIsNewer(next, previous) {
+  if (!previous) return true;
+  if (next.sequence !== null && previous.sequence !== null) return next.sequence >= previous.sequence;
+  if (next.sequence !== null && previous.sequence === null) return true;
+  if (next.sequence === null && previous.sequence !== null) return false;
+  if (next.capturedMs !== null && previous.capturedMs !== null) return next.capturedMs >= previous.capturedMs;
+  return true;
+}
+
+function frameIsFreshForVisualizer(visualizer, frame, updatedAt = "") {
+  const next = frameFreshness(frame, updatedAt);
+  return frameFreshnessIsNewer(next, state.liveFrameFreshness?.[visualizer]);
+}
+
+function rememberFrameFreshness(visualizer, frame, updatedAt = "") {
+  state.liveFrameFreshness[visualizer] = frameFreshness(frame, updatedAt);
+}
+
+function matrixSceneIsStaleComparedTo(incoming, current) {
+  if (!incoming?.available || !current?.available) return false;
+  const next = matrixSceneFreshness(incoming);
+  const prev = matrixSceneFreshness(current);
+  if (next.sessionId && prev.sessionId && next.sessionId !== prev.sessionId) return false;
+  if (next.planKey && prev.planKey && next.planKey !== prev.planKey) return false;
+  if (Number.isFinite(next.sequence) && Number.isFinite(prev.sequence) && next.sequence < prev.sequence) return true;
+  if (Number.isFinite(next.sequence) && Number.isFinite(prev.sequence) && next.sequence > prev.sequence) return false;
+  if (
+    Number.isFinite(next.frameCount)
+    && Number.isFinite(prev.frameCount)
+    && next.frameCount !== prev.frameCount
+  ) {
+    return false;
+  }
+  if (!Number.isFinite(next.frameIndex) || !Number.isFinite(prev.frameIndex)) return false;
+  if (next.frameIndex >= prev.frameIndex) return false;
+  const nextTime = firstFiniteNumber(next.appliedAt, next.updatedAt);
+  const prevTime = firstFiniteNumber(prev.appliedAt, prev.updatedAt);
+  if (Number.isFinite(nextTime) && Number.isFinite(prevTime) && nextTime > prevTime + 0.001) return false;
+  return true;
+}
+
+function matrixSceneFreshness(scene) {
+  const executor = scene?.executor || scene?.executor_status || {};
+  const applied = executor.last_applied_frame || scene?.last_applied_frame || {};
+  const frame = scene?.frame || {};
+  const plan = scene?.plan || {};
+  const frameIndex = firstFiniteNumber(
+    frame.index,
+    applied.index,
+    Number.isFinite(Number(executor.current_frame)) ? Number(executor.current_frame) - 1 : null,
+  );
+  const frameCount = firstFiniteNumber(
+    frame.count,
+    applied.plan_frame_count,
+    executor.total_frames,
+    plan.frame_count,
+  );
+  const planKey = firstNonEmptyString(
+    applied.plan_id,
+    frame.plan_id,
+    plan.plan_id,
+    plan.id,
+    frameCount,
+  );
+  return {
+    sessionId: matrixSceneSessionId(scene),
+    planKey: planKey ? String(planKey) : "",
+    frameIndex: Number.isFinite(frameIndex) ? Math.trunc(Number(frameIndex)) : NaN,
+    frameCount: Number.isFinite(frameCount) ? Math.trunc(Number(frameCount)) : NaN,
+    sequence: firstFiniteNumber(scene?.dashboard_live_sequence, scene?.dashboard_live?.sequence),
+    appliedAt: firstFiniteNumber(applied.applied_at, executor.last_update, executor.last_frame?.finished_at),
+    updatedAt: firstFiniteNumber(scene?.updated_at, frame.updated_at, plan.updated_at),
+  };
+}
+
+function matrixSceneFreshnessSummary(incoming, current) {
+  return {
+    incoming: matrixSceneFreshness(incoming),
+    current: matrixSceneFreshness(current),
+  };
 }
 
 function matrixSceneMatchesRuntimeSession(scene, live = state.live || {}) {
@@ -924,7 +1085,10 @@ function scheduleTimelineTelemetryRender() {
 }
 
 function schedulePlanTimelineRender() {
-  if (!isTimelinePanelVisible()) return;
+  if (!isTimelinePanelVisible()) {
+    updateTimelineLightweightControls();
+    return;
+  }
   if (state.timeline.renderQueued) return;
   state.timeline.renderQueued = true;
   requestAnimationFrame(() => {
@@ -1041,15 +1205,21 @@ function drawTimelineDynamicCursors(ctx, layout, scene) {
 }
 
 function updateTimelineLightweightControls(scene = state.live?.scene?.result || state.live?.scene) {
+  const count = timelineFrameCount(scene);
+  const processing = Boolean(state.matrixCommands.planning);
   const label = $("timelineFrameLabel");
   if (label) label.textContent = timelineFrameLabel(scene);
   const liveButton = $("timelineLive");
   if (liveButton) {
     liveButton.classList.toggle("active", state.timeline.followLive);
+    liveButton.disabled = !count || processing;
     liveButton.textContent = state.timeline.followLive ? "Live" : "Go Live";
+    liveButton.title = state.timeline.followLive
+      ? "Following the executing frame"
+      : "Return to the currently executing frame";
   }
   const trimButton = $("timelineTrimTail");
-  if (trimButton) trimButton.disabled = !canTrimTimelineTail(scene) || Boolean(state.matrixCommands.planning);
+  if (trimButton) trimButton.disabled = !canTrimTimelineTail(scene) || processing;
 }
 
 function resetRunEvents(events = [], eventWindow = {}) {
@@ -2897,6 +3067,58 @@ function send(message) {
   state.ws.send(JSON.stringify(message));
 }
 
+function handleRealtimeMessage(data) {
+  if (data.type === "live") {
+    state.live = mergeLiveWithMatrixCache(data.live);
+    bootstrapTimelineLiveFromScene(state.live?.scene?.result || state.live?.scene);
+    syncStageMotionWithLive();
+    scheduleLiveOnlyRender();
+    return true;
+  }
+  if (data.type === "live_scene") {
+    applyLiveScene(data);
+    return true;
+  }
+  if (data.type === "live_frame") {
+    applyLiveFrame(data);
+    return true;
+  }
+  if (data.type === "stage_motion") {
+    handleStageMotionMessage(data);
+    return true;
+  }
+  return false;
+}
+
+function connectLive() {
+  if (state.liveWs && [WebSocket.OPEN, WebSocket.CONNECTING].includes(state.liveWs.readyState)) return;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const basePort = Number(location.port || (location.protocol === "https:" ? 443 : 80));
+  const liveWsPort = basePort + 2;
+  const ws = new WebSocket(`${proto}://${location.hostname}:${liveWsPort}/live`);
+  state.liveWs = ws;
+  ws.onopen = () => {
+    if (state.liveWsReconnectTimer) {
+      window.clearTimeout(state.liveWsReconnectTimer);
+      state.liveWsReconnectTimer = null;
+    }
+    state.liveWsConnected = true;
+    ws.send(JSON.stringify({ type: "get_live" }));
+  };
+  ws.onclose = () => {
+    if (state.liveWs === ws) {
+      state.liveWsConnected = false;
+      state.liveWs = null;
+    }
+    if (state.liveWsReconnectTimer) window.clearTimeout(state.liveWsReconnectTimer);
+    state.liveWsReconnectTimer = window.setTimeout(connectLive, 1000);
+  };
+  ws.onmessage = (message) => {
+    const data = JSON.parse(message.data);
+    handleRealtimeMessage(data);
+  };
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const wsPort = Number(location.port || (location.protocol === "https:" ? 443 : 80)) + 1;
@@ -2906,6 +3128,7 @@ function connect() {
     send({ type: "get_status" });
     state.streamerView.lastRequestKey = "";
     requestStreamerResolutionUpdate();
+    connectLive();
   };
   state.ws.onclose = () => {
     state.audio.transcribing = false;
@@ -2935,15 +3158,8 @@ function connect() {
         replay: Boolean(data.replay),
         liveAgent: !data.replay && isTypewriterEvent(data.event),
       });
-    } else if (data.type === "live") {
-      state.live = mergeLiveWithMatrixCache(data.live);
-      bootstrapTimelineLiveFromScene(state.live?.scene?.result || state.live?.scene);
-      syncStageMotionWithLive();
-      scheduleLiveOnlyRender();
-    } else if (data.type === "live_frame") {
-      applyLiveFrame(data);
-    } else if (data.type === "stage_motion") {
-      handleStageMotionMessage(data);
+    } else if (handleRealtimeMessage(data)) {
+      return;
     } else if (data.type === "matrix_paint_result") {
       const result = data.result?.result || data.result;
       if (result?.ok === false || result?.error) {
@@ -4950,6 +5166,8 @@ function applyLiveFrame(data) {
   const frame = data?.frame;
   if (!visualizer || !frame) return;
   if (visualizer === "streamer" && state.streamerView.directActive) return;
+  if (!frameIsFreshForVisualizer(visualizer, frame, data.updated_at)) return;
+  rememberFrameFreshness(visualizer, frame, data.updated_at);
   const live = state.live && typeof state.live === "object" ? { ...state.live } : {};
   live.frames = { ...(live.frames || {}), [visualizer]: frame };
   live.updated_at = data.updated_at || live.updated_at || new Date().toISOString();
@@ -4958,6 +5176,20 @@ function applyLiveFrame(data) {
   setText("liveStateAdvanced", live.updated_at || state.status?.live?.updated_at || "-");
   renderFrame(visualizer, frame);
   if (visualizer === "streamer") renderCalibrationFrame(frame);
+}
+
+function applyLiveScene(data) {
+  const scene = data?.scene?.result || data?.scene;
+  if (!scene?.available) return;
+  const live = state.live && typeof state.live === "object" ? { ...state.live } : {};
+  live.scene = scene;
+  live.updated_at = data.updated_at || live.updated_at || new Date().toISOString();
+  state.live = mergeLiveWithMatrixCache(live);
+  bootstrapTimelineLiveFromScene(state.live?.scene?.result || state.live?.scene);
+  setText("liveState", state.live.updated_at || state.status?.live?.updated_at || "-");
+  setText("liveStateAdvanced", state.live.updated_at || state.status?.live?.updated_at || "-");
+  if (shouldRenderMatrixPanel()) renderMatrixPanel(state.live || {});
+  schedulePlanTimelineRender();
 }
 
 function configureDirectStreamer(live) {
@@ -5648,7 +5880,7 @@ function timelineSceneIsRunRelevant(scene) {
 }
 
 function timelineHasPlanOrExecutionEventsThisRun() {
-  return (state.events || []).some((event) => {
+  return timelineActiveRunEvents().some((event) => {
     const tool = String(event?.tool || "").toLowerCase();
     const type = String(event?.type || "").toLowerCase();
     return timelineToolIsPlanOrExecution(tool)
@@ -5660,7 +5892,7 @@ function timelineHasPlanOrExecutionEventsThisRun() {
 
 function timelineRunPlanEventFrameCount() {
   let maxFrame = -1;
-  for (const event of state.events || []) {
+  for (const event of timelineActiveRunEvents()) {
     const tool = String(event?.tool || "").toLowerCase();
     if (!timelineToolIsPlanOrExecution(tool)) continue;
     if (event?.type !== "mcp_tool_result" && event?.type !== "dashboard_tool_result") continue;
@@ -5700,6 +5932,39 @@ function timelineRunEventFrameExtent(event) {
   const fallback = eventFrameIndex(event);
   if (Number.isFinite(fallback)) maxFrame = Math.max(maxFrame, Number(fallback));
   return maxFrame >= 0 ? Math.trunc(maxFrame) : null;
+}
+
+function timelineActiveRunEvents() {
+  const events = state.events || [];
+  const resetIndex = timelineLastPlanResetEventIndex(events);
+  return resetIndex >= 0 ? events.slice(resetIndex + 1) : events;
+}
+
+function timelineLastPlanResetEventIndex(events = state.events || []) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (timelineEventClearsCurrentPlan(events[index])) return index;
+  }
+  return -1;
+}
+
+function timelineEventClearsCurrentPlan(event) {
+  if (!event || (event.type !== "mcp_tool_result" && event.type !== "dashboard_tool_result")) return false;
+  if (String(event.tool || "").toLowerCase() !== "clear_droplet_state") return false;
+  let sawSuccessfulClear = false;
+  let resetExecutor = false;
+  let zeroPlan = false;
+  for (const root of eventPayloadRoots(event)) {
+    if (!root || typeof root !== "object") continue;
+    if (root.ok === false) return false;
+    if (root.cleared === true || root.ok === true) sawSuccessfulClear = true;
+    if (root.reset_executor === true) resetExecutor = true;
+    const frameCount = firstFiniteNumber(
+      getPath(root, "plan.frame_count"),
+      getPath(root, "result.plan.frame_count"),
+    );
+    if (Number.isFinite(frameCount) && Number(frameCount) <= 0) zeroPlan = true;
+  }
+  return sawSuccessfulClear && resetExecutor && zeroPlan;
 }
 
 function matrixTimelineActions(scene) {
@@ -6653,7 +6918,7 @@ function timelineExecutionStartTime(scene, delay, pauses = [], executedFrameInde
     || (timelineHasFiniteNumber(executor?.total_frames) && Number(executor.total_frames) > 0)
     || (timelineHasFiniteNumber(executor?.current_frame) && Number(executor.current_frame) > 0);
   if (!hasExecutorPlan) return null;
-  for (const event of [...(state.events || [])].reverse()) {
+  for (const event of [...timelineActiveRunEvents()].reverse()) {
     if (event?.type !== "mcp_tool_call") continue;
     if (!["start_plan", "execute_segment_to_breakpoint"].includes(String(event.tool || ""))) continue;
     const time = eventTimeSeconds(event);
@@ -6697,7 +6962,7 @@ function timelineTimeBelongsToRun(time) {
 }
 
 function timelineHasExecutionEventsThisRun() {
-  return (state.events || []).some((event) => (
+  return timelineActiveRunEvents().some((event) => (
     (event?.type === "mcp_tool_result" || event?.type === "dashboard_tool_result")
     && timelineToolIsExecution(String(event.tool || "").toLowerCase())
   ));
@@ -6842,10 +7107,11 @@ function timelineSemanticTimes(scene = null, timeline = null, range = null) {
   };
   const runStart = timelineRunStartTime();
   push(runStart);
+  const activePlanEvents = new Set(timelineActiveRunEvents());
   for (const event of state.events || []) {
     if (timelineEventIsSemantic(event)) push(eventTimeSeconds(event));
     const markerTime = timelineToolExecutionStartTime(event) ?? eventTimeSeconds(event);
-    if (timelineToolIsPlanOrExecution(String(event?.tool || "").toLowerCase())) push(markerTime);
+    if (activePlanEvents.has(event) && timelineToolIsPlanOrExecution(String(event?.tool || "").toLowerCase())) push(markerTime);
   }
   for (const marker of timelineStageMarkers(scene)) push(marker.time);
   for (const marker of timelinePhotoMarkers(scene)) push(marker.time);
@@ -7277,7 +7543,7 @@ function timelinePlanEvents(scene, timeline, count) {
     .filter(Boolean);
   const seen = new Set(events.map((event) => `plan:${event?.id || event?.event_id || event?.label || ""}:${event?.frame_span?.join("-") || ""}`));
   const hasPlanPrimitiveEvents = events.length > 0;
-  for (const runEvent of state.events || []) {
+  for (const runEvent of timelineActiveRunEvents()) {
     const marker = timelineToolMarkerFromRunEvent(runEvent, count, {
       includeToolMarkers: !hasPlanPrimitiveEvents,
     });
@@ -8544,7 +8810,7 @@ function drawTimelineTargetTemperatureBubble(ctx, layout, range, marker, y, hitb
 function compactTemperatureLabel(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "";
-  return Math.abs(number) >= 10 ? String(Math.round(number)) : number.toFixed(1).replace(/\.0$/, "");
+  return number.toFixed(1);
 }
 
 function drawTimelineTimeAxis(ctx, layout, range, fullRange = null) {
@@ -9268,13 +9534,13 @@ function renderTimelineDropletPanel(scene) {
     row.addEventListener("mouseenter", () => {
       state.matrixPaths.hoveredActionId = String(action.id || "");
       if (state.matrixPaths.hoveredActionId) {
-        renderMatrixScene(matrixSceneForTimeline(state.live?.scene?.result || state.live?.scene), { skipPathPanel: true });
+        scheduleMatrixSceneRender(null, { skipPathPanel: true });
       }
     });
     row.addEventListener("mouseleave", () => {
       if (state.matrixPaths.hoveredActionId === String(action.id || "")) {
         state.matrixPaths.hoveredActionId = "";
-        renderMatrixScene(matrixSceneForTimeline(state.live?.scene?.result || state.live?.scene), { skipPathPanel: true });
+        scheduleMatrixSceneRender(null, { skipPathPanel: true });
       }
     });
     const label = document.createElement("span");
@@ -9703,10 +9969,16 @@ function positionTimelineHover(tooltip, hover) {
   const maxY = panelRect
     ? Math.max(minY, window.innerHeight - panelRect.top - tooltipHeight - 8)
     : Math.max(8, (panel?.clientHeight || 220) - tooltipHeight - 8);
+  const previewOffset = tooltip.classList.contains("has-preview") ? 24 : 12;
+  const preferredX = baseX + previewOffset;
+  const flippedX = baseX - tooltipWidth - previewOffset;
+  const left = preferredX + tooltipWidth <= maxX
+    ? preferredX
+    : Math.max(minX, flippedX);
   const preferredY = baseY + 12;
   const flippedY = baseY - tooltipHeight - 12;
   const top = preferredY > maxY ? Math.min(maxY, Math.max(minY, flippedY)) : preferredY;
-  tooltip.style.left = `${Math.min(maxX, Math.max(minX, baseX + 12))}px`;
+  tooltip.style.left = `${Math.min(maxX, Math.max(minX, left))}px`;
   tooltip.style.top = `${Math.min(maxY, Math.max(minY, top))}px`;
 }
 
@@ -10261,6 +10533,13 @@ function renderFrame(name, frame) {
       requestStreamerResolutionUpdate();
     }
   } else {
+    if (name === "streamer" && img.getAttribute("src")) {
+      const previous = meta.dataset.baseText || "last frame";
+      const message = frame?.error ? `${frame.error} - showing ${previous}` : previous;
+      meta.textContent = streamerMetaText(message);
+      viewer.classList.add("has-frame");
+      return;
+    }
     img.removeAttribute("src");
     viewer.classList.remove("has-frame");
     delete meta.dataset.baseText;
@@ -10772,7 +11051,61 @@ function moveCalibrationStage(delta) {
   });
 }
 
+function currentMatrixSceneForRender(fallbackScene = null) {
+  const scene = state.live?.scene?.result || state.live?.scene || fallbackScene;
+  return scene ? matrixSceneForTimeline(scene) : null;
+}
+
+function scheduleMatrixSceneRender(fallbackScene = null, options = {}) {
+  state.matrixRenderQueue.fallbackScene = fallbackScene || state.matrixRenderQueue.fallbackScene || null;
+  state.matrixRenderQueue.options = {
+    ...(state.matrixRenderQueue.options || {}),
+    ...(options || {}),
+  };
+  if (state.matrixRenderQueue.raf !== null || state.matrixRenderQueue.timer !== null) return;
+  const renderQueued = () => {
+    state.matrixRenderQueue.raf = requestAnimationFrame(() => {
+      const queued = state.matrixRenderQueue;
+      queued.raf = null;
+      queued.lastAt = performance.now();
+      const scene = currentMatrixSceneForRender(queued.fallbackScene);
+      const renderOptions = queued.options || {};
+      queued.options = {};
+      queued.fallbackScene = null;
+      if (scene?.available) renderMatrixScene(scene, renderOptions);
+    });
+  };
+  const elapsed = performance.now() - Number(state.matrixRenderQueue.lastAt || 0);
+  if (elapsed >= 33) {
+    renderQueued();
+    return;
+  }
+  state.matrixRenderQueue.timer = window.setTimeout(() => {
+    state.matrixRenderQueue.timer = null;
+    renderQueued();
+  }, Math.max(0, 33 - elapsed));
+}
+
+function cancelScheduledMatrixSceneRender() {
+  if (state.matrixRenderQueue.timer !== null) {
+    window.clearTimeout(state.matrixRenderQueue.timer);
+    state.matrixRenderQueue.timer = null;
+  }
+  if (state.matrixRenderQueue.raf !== null) {
+    cancelAnimationFrame(state.matrixRenderQueue.raf);
+    state.matrixRenderQueue.raf = null;
+  }
+  state.matrixRenderQueue.options = {};
+  state.matrixRenderQueue.fallbackScene = null;
+}
+
 function renderMatrixScene(scene, options = {}) {
+  cancelScheduledMatrixSceneRender();
+  state.matrixRenderQueue.lastAt = performance.now();
+  renderMatrixSceneNow(scene, options);
+}
+
+function renderMatrixSceneNow(scene, options = {}) {
   const canvas = $("matrixScene");
   const meta = $("matrixMeta");
   const img = $("matrixFrame");
@@ -10809,7 +11142,8 @@ function renderMatrixScene(scene, options = {}) {
   drawMatrixSelectionBox(ctx);
   drawMatrixCoordinateAxes(ctx, geom, scene);
   drawCartridgeInputHoles(ctx, geom, scene);
-  drawMatrixOverlay(ctx, width, height, scene);
+  const renderStats = recordMatrixRenderStats(scene);
+  drawMatrixOverlay(ctx, width, height, scene, renderStats);
   state.matrixSceneHitboxes = hitboxes;
   renderMatrixMinimap(scene, geom);
   renderMatrixPaintPanel();
@@ -10824,22 +11158,104 @@ function renderMatrixScene(scene, options = {}) {
     : "-";
   const count = Number.isFinite(Number(frame.count)) ? Number(frame.count) : "-";
   const active = renderedSummary?.active_count ?? 0;
-  const source = scene.frame?.source === "executor_last_applied_frame"
-    ? "executed"
-    : scene.frame?.source === "state"
-      ? "state"
-    : scene.frame?.source === "timeline_preview"
-      ? "preview"
-      : scene.frame?.source === "cartridge"
-        ? "cartridge"
-      : "plan";
+  const source = matrixFrameSource(scene);
   const zoomLabel = Math.abs(geom.zoom - 1) > 0.01 ? ` z${geom.zoom.toFixed(1)}x` : "";
   const pathCount = matrixPathActions(scene).length
     || droplets.filter((droplet) => Array.isArray(droplet.path) && droplet.path.length > 1).length;
   const pathLabel = pathCount ? ` paths ${pathCount}` : "";
   const fovLabel = microscopeFoV ? ` fov ${formatElectrodeCoordinate(microscopeFoV.row)},${formatElectrodeCoordinate(microscopeFoV.col)}` : "";
-  meta.textContent = `${source} ${index}/${count} active ${active}${pathLabel}${fovLabel}${zoomLabel}`;
+  const fpsLabel = renderStats ? ` render ${formatMatrixRenderFps(renderStats.fps)}/s` : "";
+  meta.textContent = `${source} ${index}/${count} active ${active}${pathLabel}${fovLabel}${zoomLabel}${fpsLabel}`;
   updateMatrixLiveBadge(scene);
+}
+
+function matrixFrameSource(scene) {
+  return scene?.frame?.source === "executor_last_applied_frame"
+    ? "executed"
+    : scene?.frame?.source === "state"
+      ? "state"
+      : scene?.frame?.source === "timeline_preview"
+        ? "preview"
+        : scene?.frame?.source === "cartridge"
+          ? "cartridge"
+          : "plan";
+}
+
+function recordMatrixRenderStats(scene) {
+  const stats = state.matrixRenderStats || {};
+  state.matrixRenderStats = stats;
+  const now = performance.now();
+  const rawFrameIndex = Number(scene?.frame?.index);
+  const frameIndex = Number.isFinite(rawFrameIndex) ? Math.trunc(rawFrameIndex) : null;
+  const rawFrameCount = Number(scene?.frame?.count);
+  const frameCount = Number.isFinite(rawFrameCount) ? Math.trunc(rawFrameCount) : null;
+  const source = matrixFrameSource(scene);
+  const mode = state.timeline.followLive ? "live" : "preview";
+  const previousFrameIndex = Number.isFinite(Number(stats.lastFrameIndex)) ? Number(stats.lastFrameIndex) : null;
+  const previousSource = stats.lastSource || "";
+  const previousMode = stats.lastMode || "";
+  const sourceChanged = Boolean(previousSource && (previousSource !== source || previousMode !== mode));
+  let delta = null;
+  let status = "steady";
+
+  if (frameIndex !== null && previousFrameIndex !== null) {
+    delta = frameIndex - previousFrameIndex;
+    if (delta < 0) {
+      status = "regress";
+      stats.regressions = Number(stats.regressions || 0) + 1;
+    } else if (delta > 1) {
+      status = "jump";
+      stats.jumps = Number(stats.jumps || 0) + 1;
+    } else if (delta === 0) {
+      status = sourceChanged ? "switch" : "repeat";
+      stats.repeats = Number(stats.repeats || 0) + 1;
+    } else {
+      status = sourceChanged ? "switch" : "advance";
+    }
+  } else if (sourceChanged) {
+    status = "switch";
+  }
+  if (sourceChanged) stats.sourceSwitches = Number(stats.sourceSwitches || 0) + 1;
+
+  const sample = { t: now, frameIndex, source, mode, status };
+  const recent = [...(Array.isArray(stats.samples) ? stats.samples : []), sample]
+    .filter((item) => now - Number(item.t || 0) <= 1000);
+  stats.samples = recent;
+  stats.fps = recent.length;
+  stats.uniqueFps = new Set(
+    recent
+      .map((item) => item.frameIndex)
+      .filter((value) => Number.isFinite(Number(value)))
+      .map((value) => Number(value))
+  ).size;
+  stats.lastFrameIndex = frameIndex;
+  stats.lastFrameCount = frameCount;
+  stats.lastSource = source;
+  stats.lastMode = mode;
+  stats.lastDelta = delta;
+  stats.lastStatus = status;
+  stats.lastUpdatedAt = new Date().toISOString();
+  stats.history = [
+    ...(Array.isArray(stats.history) ? stats.history : []),
+    {
+      at: stats.lastUpdatedAt,
+      frameIndex,
+      frameCount,
+      source,
+      mode,
+      delta,
+      status,
+      fps: stats.fps,
+      uniqueFps: stats.uniqueFps,
+    },
+  ].slice(-120);
+  return stats;
+}
+
+function formatMatrixRenderFps(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "0";
+  return number >= 10 ? String(Math.round(number)) : number.toFixed(1);
 }
 
 function matrixShape(scene) {
@@ -10956,7 +11372,7 @@ function zoomMatrixScene(event) {
   view.panY = y - displayPoint.row * cell - centeredOriginY;
   clampMatrixView(width, height, gridWidth, gridHeight, oldGeom.pad);
   saveMatrixView();
-  renderMatrixPanel(state.live || {});
+  scheduleMatrixSceneRender();
 }
 
 function startMatrixManualPan(event) {
@@ -10983,7 +11399,7 @@ function updateMatrixManualPan(event) {
   state.matrixView.panY = Number(state.matrixView.dragPanY || 0) + dy;
   if (Math.hypot(dx, dy) >= 3) state.matrixView.moved = true;
   clampMatrixPanForCurrentScene();
-  renderMatrixPanel(state.live || {});
+  scheduleMatrixSceneRender();
 }
 
 function endMatrixManualPan() {
@@ -11067,7 +11483,7 @@ function stepMatrixEdgePan(now) {
   state.matrixView.panY += state.matrixNav.edgePanVy * dt;
   clampMatrixPanForCurrentScene();
   updateMatrixDragFromStoredPointer();
-  renderMatrixPanel(state.live || {});
+  scheduleMatrixSceneRender();
   state.matrixNav.edgePanRaf = requestAnimationFrame(stepMatrixEdgePan);
 }
 
@@ -11221,7 +11637,7 @@ function centerMatrixViewportOnDisplay(displayCol, displayRow) {
   state.matrixView.panX = geom.width / 2 - displayCol * cell - centeredOriginX;
   state.matrixView.panY = geom.height / 2 - displayRow * cell - centeredOriginY;
   clampMatrixView(geom.width, geom.height, gridWidth, gridHeight, geom.pad);
-  renderMatrixPanel(state.live || {});
+  scheduleMatrixSceneRender();
 }
 
 function canvasPointToDisplayCell(geom, x, y, options = {}) {
@@ -11967,7 +12383,7 @@ function updateMatrixPaintDragFromPointer(pointer, options = {}) {
   if (!state.matrixPaint.dragging || !pointer) return;
   if (pointer.electrode) state.matrixPaint.current = pointer.electrode;
   if (pointer.display) state.matrixPaint.currentDisplay = pointer.display;
-  if (options.render !== false) renderMatrixPanel(state.live || {});
+  if (options.render !== false) scheduleMatrixSceneRender();
 }
 
 function updateMatrixDragFromStoredPointer() {
@@ -12770,29 +13186,28 @@ function drawMatrixSelectionBox(ctx) {
   ctx.restore();
 }
 
-function drawMatrixOverlay(ctx, width, height, scene) {
+function drawMatrixOverlay(ctx, width, height, scene, renderStats = null) {
   const status = scene.executor || {};
   const running = status.is_executing ? "running" : "idle";
   const eventType = Array.isArray(scene.plan?.current_event) ? scene.plan.current_event[1] : "";
   const frameIndex = scene.frame?.index !== null && scene.frame?.index !== undefined ? Number(scene.frame.index) : null;
   const frameLabel = Number.isFinite(frameIndex) ? frameIndex + 1 : "-";
-  const frameSource = scene.frame?.source === "executor_last_applied_frame"
-    ? "executed"
-    : scene.frame?.source === "state"
-      ? "state"
-    : scene.frame?.source === "timeline_preview"
-      ? "preview"
-      : scene.frame?.source === "cartridge"
-        ? "cartridge"
-      : "plan";
-  const lines = [
-    `${frameSource} ${frameLabel}/${scene.frame?.count || 0}`,
-    eventType ? `${running} - ${eventType}` : running,
-  ];
+  const frameSource = matrixFrameSource(scene);
+  const mode = state.timeline.followLive ? "live" : "preview";
+  const metricLine = renderStats
+    ? `render ${formatMatrixRenderFps(renderStats.fps)}/s - unique ${renderStats.uniqueFps || 0}/s`
+    : "";
+  const deltaLine = renderStats ? matrixRenderDeltaLabel(renderStats) : "";
+  const lineItems = [
+    { text: `${mode} ${frameSource} ${frameLabel}/${scene.frame?.count || 0}`, color: "#f5f5f7" },
+    { text: eventType ? `${running} - ${eventType}` : running, color: "#a1a1a6" },
+    metricLine ? { text: metricLine, color: "#64d2ff" } : null,
+    deltaLine ? { text: deltaLine, color: matrixRenderDeltaColor(renderStats) } : null,
+  ].filter(Boolean);
   ctx.save();
   ctx.font = "12px -apple-system, BlinkMacSystemFont, Segoe UI";
-  const boxWidth = Math.max(...lines.map((line) => ctx.measureText(line).width)) + 20;
-  const boxHeight = 40;
+  const boxWidth = Math.max(...lineItems.map((line) => ctx.measureText(line.text).width)) + 20;
+  const boxHeight = 10 + lineItems.length * 15;
   const x = width - boxWidth - 10;
   const y = 10;
   roundedRect(ctx, x, y, boxWidth, boxHeight, 7);
@@ -12800,11 +13215,30 @@ function drawMatrixOverlay(ctx, width, height, scene) {
   ctx.fill();
   ctx.strokeStyle = "rgba(255,255,255,0.12)";
   ctx.stroke();
-  lines.forEach((line, index) => {
-    ctx.fillStyle = index === 0 ? "#f5f5f7" : "#a1a1a6";
-    ctx.fillText(line, x + 10, y + 16 + index * 15);
+  lineItems.forEach((line, index) => {
+    ctx.fillStyle = line.color;
+    ctx.fillText(line.text, x + 10, y + 16 + index * 15);
   });
   ctx.restore();
+}
+
+function matrixRenderDeltaLabel(stats) {
+  const delta = Number(stats?.lastDelta);
+  if (!Number.isFinite(delta)) return stats?.lastStatus === "switch" ? "source changed" : "";
+  const prefix = delta > 0 ? "+" : "";
+  if (stats.lastStatus === "regress") return `back ${delta}`;
+  if (stats.lastStatus === "jump") return `jump ${prefix}${delta}`;
+  if (stats.lastStatus === "repeat") return "repeat frame";
+  if (stats.lastStatus === "switch") return `source changed ${prefix}${delta}`;
+  return `delta ${prefix}${delta}`;
+}
+
+function matrixRenderDeltaColor(stats) {
+  if (stats?.lastStatus === "regress") return "#ff453a";
+  if (stats?.lastStatus === "jump") return "#ffd60a";
+  if (stats?.lastStatus === "switch") return "#bf5af2";
+  if (stats?.lastStatus === "repeat") return "#8e8e93";
+  return "#30d158";
 }
 
 function matrixCellCenter(geom, point) {
@@ -13048,12 +13482,12 @@ function renderMatrixPathPanel(scene) {
     row.addEventListener("mouseenter", () => {
       if (state.matrixPaths.hoveredActionId === actionId) return;
       state.matrixPaths.hoveredActionId = actionId;
-      renderMatrixScene(matrixSceneForTimeline(state.live?.scene?.result || state.live?.scene), { skipPathPanel: true });
+      scheduleMatrixSceneRender(null, { skipPathPanel: true });
     });
     row.addEventListener("mouseleave", () => {
       if (state.matrixPaths.hoveredActionId === actionId) {
         state.matrixPaths.hoveredActionId = "";
-        renderMatrixScene(matrixSceneForTimeline(state.live?.scene?.result || state.live?.scene), { skipPathPanel: true });
+        scheduleMatrixSceneRender(null, { skipPathPanel: true });
       }
     });
 
@@ -13130,7 +13564,7 @@ function updateMatrixSelectionDragFromPointer(pointer, options = {}) {
   if (Math.hypot(point.x - start.x, point.y - start.y) >= 4) {
     state.matrixSelection.moved = true;
   }
-  if (state.matrixSelection.moved && options.render !== false) renderMatrixPanel(state.live || {});
+  if (state.matrixSelection.moved && options.render !== false) scheduleMatrixSceneRender();
 }
 
 function endMatrixSelectionDrag(event) {
@@ -13279,7 +13713,7 @@ function updateMatrixMovePreviewFromPointer(event) {
   ) {
     if (state.matrixMovePreview.hover) {
       state.matrixMovePreview.hover = null;
-      renderMatrixPanel(state.live || {});
+      scheduleMatrixSceneRender();
     }
     return;
   }
@@ -13291,7 +13725,7 @@ function updateMatrixMovePreviewFromPointer(event) {
     || (previous && next && (previous.row !== next.row || previous.col !== next.col));
   if (!changed) return;
   state.matrixMovePreview.hover = next;
-  renderMatrixPanel(state.live || {});
+  scheduleMatrixSceneRender();
 }
 
 function matrixMovePreviewState(scene, droplets) {

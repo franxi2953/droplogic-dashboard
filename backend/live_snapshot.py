@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback as traceback_module
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,11 +18,18 @@ class LiveSnapshotMixin:
             self._poll_task = asyncio.create_task(self.live_poll_loop())
         if getattr(self, "_stream_task", None) is None or self._stream_task.done():
             self._stream_task = asyncio.create_task(self.streamer_frame_loop())
+        if getattr(self, "_scene_task", None) is None or self._scene_task.done():
+            self._scene_task = asyncio.create_task(self.scene_snapshot_loop())
 
     async def stop_live_polling(self) -> None:
-        tasks = [self._poll_task, getattr(self, "_stream_task", None)]
+        tasks = [
+            self._poll_task,
+            getattr(self, "_stream_task", None),
+            getattr(self, "_scene_task", None),
+        ]
         self._poll_task = None
         self._stream_task = None
+        self._scene_task = None
         for task in tasks:
             if task is None or task.done():
                 continue
@@ -47,12 +55,13 @@ class LiveSnapshotMixin:
                 )
                 if include_state:
                     last_state_poll = now
+                live = self.merge_newer_live_frames(live, self.live or {})
                 self.live = live
                 if include_state:
                     await self.record_live_temperature_sample(live)
-                await self.broadcast_json({"type": "live", "live": live})
+                await self.broadcast_live_json({"type": "live", "live": live})
             except Exception as exc:
-                await self.record("live_poll_error", level="warning", message=str(exc))
+                await self.record_live_loop_error("live_poll_error", exc)
             await asyncio.sleep(max(0.05, self.config.live_frame_interval_seconds))
 
     async def streamer_frame_loop(self) -> None:
@@ -64,19 +73,85 @@ class LiveSnapshotMixin:
                     continue
                 frame = await self.collect_streamer_frame()
                 self.live = self.merge_live_frame(self.live or {}, "streamer", frame)
-                await self.broadcast_json(
+                await self.broadcast_live_json(
                     {
                         "type": "live_frame",
                         "visualizer": "streamer",
                         "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "sequence": live_frame_sequence(frame),
                         "frame": frame,
                     }
                 )
             except Exception as exc:
-                await self.record("live_stream_error", level="warning", message=str(exc))
+                await self.record_live_loop_error("live_stream_error", exc)
             elapsed = time.monotonic() - started
             interval = max(0.05, float(getattr(self.config, "live_streamer_interval_seconds", 0.12)))
             await asyncio.sleep(max(0.01, interval - elapsed))
+
+    async def scene_snapshot_loop(self) -> None:
+        last_key = ""
+        while self.mcp.running:
+            started = time.monotonic()
+            try:
+                runtime = self.live.get("runtime") if isinstance(self.live, dict) else None
+                runtime_session_id = live_runtime_session_id(runtime)
+                scene = self.read_dashboard_scene_snapshot(runtime_session_id=runtime_session_id)
+                if (
+                    runtime_session_id
+                    and isinstance(scene, dict)
+                    and scene.get("reason") == "scene_session_mismatch"
+                ):
+                    # Runtime polling can lag behind long MCP calls. The scene file is written
+                    # by the executor-side writer, so prefer the newest scene stream over a stale
+                    # runtime session id when keeping the matrix visualizer live.
+                    fresh_scene = self.read_dashboard_scene_snapshot(runtime_session_id=None)
+                    if isinstance(fresh_scene, dict) and fresh_scene.get("available"):
+                        scene = fresh_scene
+                if isinstance(scene, dict) and scene.get("available"):
+                    key = scene_snapshot_key(scene)
+                    if key and key != last_key:
+                        last_key = key
+                        scene = self.compact_live_scene(self.annotate_live_scene(scene))
+                        self.live = self.merge_live_scene(self.live or {}, scene)
+                        await self.broadcast_live_json(
+                            {
+                                "type": "live_scene",
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                                "sequence": live_scene_sequence(scene),
+                                "scene": scene,
+                            }
+                        )
+            except Exception as exc:
+                await self.record_live_loop_error("live_scene_error", exc)
+            elapsed = time.monotonic() - started
+            interval = max(0.05, float(getattr(self.config, "live_streamer_interval_seconds", 0.12)))
+            await asyncio.sleep(max(0.01, interval - elapsed))
+
+    async def record_live_loop_error(self, event_type: str, exc: Exception) -> None:
+        message = str(exc)
+        now = time.monotonic()
+        states = getattr(self, "_live_loop_error_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._live_loop_error_states = states
+        key = (event_type, message)
+        state = states.get(key) or {"count": 0, "last_emit": 0.0}
+        state["count"] = int(state.get("count") or 0) + 1
+        elapsed = now - float(state.get("last_emit") or 0.0)
+        if state["count"] == 1 or elapsed >= 10.0:
+            suppressed = max(0, state["count"] - 1)
+            await self.record(
+                event_type,
+                level="warning",
+                message=message,
+                suppressed_repeats=suppressed,
+                error_traceback="".join(
+                    traceback_module.format_exception(type(exc), exc, exc.__traceback__, limit=8)
+                ),
+            )
+            state["count"] = 0
+            state["last_emit"] = now
+        states[key] = state
 
     async def collect_live_snapshot(
         self,
@@ -108,6 +183,7 @@ class LiveSnapshotMixin:
             prefer_file=prefer_scene_file,
             runtime=runtime,
         )
+        scene = self.compact_live_scene(scene)
 
         streamer_options = getattr(self, "streamer_frame_options", {}) or {}
         streamer_full_resolution = bool(streamer_options.get("full_resolution"))
@@ -118,23 +194,26 @@ class LiveSnapshotMixin:
         streamer_frame = None
         if not direct_stream_available:
             if include_streamer_frame:
-                streamer_frame = await self.safe_frame(
+                streamer_frame = self.annotate_live_frame("streamer", await self.safe_frame(
                     "streamer",
                     "snapshot",
                     max_width=streamer_max_width,
                     max_height=streamer_max_height,
                     image_quality=72,
-                )
+                ))
             else:
                 streamer_frame = previous_frames.get("streamer")
         matrix_frame = previous_frames.get("matrix")
         if not (isinstance(scene, dict) and scene.get("available")):
-            matrix_frame = await self.safe_frame("matrix", "snapshot", max_width=520, max_height=360)
+            matrix_frame = self.annotate_live_frame(
+                "matrix",
+                await self.safe_frame("matrix", "snapshot", max_width=520, max_height=360),
+            )
         frames = {
             "matrix": matrix_frame,
             "streamer": streamer_frame,
         }
-        return {
+        snapshot = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "runtime": runtime,
             "state": state,
@@ -142,19 +221,20 @@ class LiveSnapshotMixin:
             "scene": scene,
             "frames": frames,
         }
+        return self.merge_newer_live_frames(snapshot, self.live or {})
 
     async def collect_streamer_frame(self) -> dict[str, Any]:
         streamer_options = getattr(self, "streamer_frame_options", {}) or {}
         streamer_full_resolution = bool(streamer_options.get("full_resolution"))
         streamer_max_width = None if streamer_full_resolution else int(streamer_options.get("max_width") or 720)
         streamer_max_height = None if streamer_full_resolution else int(streamer_options.get("max_height") or 460)
-        return await self.safe_frame(
+        return self.annotate_live_frame("streamer", await self.safe_frame(
             "streamer",
             "snapshot",
             max_width=streamer_max_width,
             max_height=streamer_max_height,
             image_quality=72,
-        )
+        ))
 
     @staticmethod
     def merge_live_frame(live: dict[str, Any], visualizer: str, frame: dict[str, Any]) -> dict[str, Any]:
@@ -164,6 +244,107 @@ class LiveSnapshotMixin:
         next_live["frames"] = frames
         next_live["updated_at"] = datetime.now(timezone.utc).isoformat()
         return next_live
+
+    def merge_live_scene(self, live: dict[str, Any], scene: dict[str, Any]) -> dict[str, Any]:
+        next_live = dict(live or {})
+        next_live["scene"] = self.compact_live_scene(scene)
+        next_live["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return next_live
+
+    def next_live_sequence(self, channel: str) -> int:
+        sequences = getattr(self, "_live_frame_sequences", None)
+        if not isinstance(sequences, dict):
+            sequences = {}
+            self._live_frame_sequences = sequences
+        next_value = int(sequences.get(channel, 0)) + 1
+        sequences[channel] = next_value
+        return next_value
+
+    def annotate_live_frame(self, visualizer: str, frame: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(frame, dict):
+            return frame
+        sequence = self.next_live_sequence(f"frame:{visualizer}")
+        captured_at = datetime.now(timezone.utc).isoformat()
+        annotated = dict(frame)
+        metadata = {
+            "visualizer": visualizer,
+            "sequence": sequence,
+            "captured_at": captured_at,
+            "emitted_at": captured_at,
+        }
+        annotated["dashboard_live"] = metadata
+        annotated["dashboard_live_sequence"] = sequence
+        annotated["dashboard_live_captured_at"] = captured_at
+        annotated["dashboard_live_visualizer"] = visualizer
+        return annotated
+
+    def annotate_live_scene(self, scene: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(scene, dict):
+            return scene
+        sequence = self.next_live_sequence("scene:matrix")
+        captured_at = datetime.now(timezone.utc).isoformat()
+        annotated = dict(scene)
+        annotated["dashboard_live"] = {
+            "visualizer": "matrix",
+            "sequence": sequence,
+            "captured_at": captured_at,
+            "emitted_at": captured_at,
+        }
+        annotated["dashboard_live_sequence"] = sequence
+        annotated["dashboard_live_captured_at"] = captured_at
+        return annotated
+
+    def merge_newer_live_frames(self, incoming: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(incoming, dict):
+            return incoming
+        incoming_frames = incoming.get("frames") if isinstance(incoming.get("frames"), dict) else {}
+        current_frames = current.get("frames") if isinstance(current.get("frames"), dict) else {}
+        if not incoming_frames or not current_frames:
+            return incoming
+        merged = dict(incoming_frames)
+        for visualizer, current_frame in current_frames.items():
+            incoming_frame = merged.get(visualizer)
+            if incoming_frame is None:
+                merged[visualizer] = current_frame
+                continue
+            if live_frame_is_newer(current_frame, incoming_frame):
+                merged[visualizer] = current_frame
+        next_live = dict(incoming)
+        next_live["frames"] = merged
+        return next_live
+
+    def compact_live_scene(self, scene: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(scene, dict):
+            return scene
+        timeline = scene.get("timeline")
+        if not isinstance(timeline, dict):
+            return scene
+        frames = timeline.get("frames")
+        if not isinstance(frames, list) or not frames:
+            return scene
+        heavy = len(frames) > 80 or len(json.dumps(frames, ensure_ascii=True)) > 160_000
+        if not heavy:
+            return scene
+        compact_frames = []
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            compact_frames.append({
+                "index": frame.get("index"),
+                "event_id": frame.get("event_id"),
+                "event_type": frame.get("event_type"),
+                "active_droplet_ids": frame.get("active_droplet_ids") if isinstance(frame.get("active_droplet_ids"), list) else [],
+            })
+        compact_timeline = dict(timeline)
+        compact_timeline["frames"] = compact_frames
+        compact_timeline["frames_compact"] = True
+        compact_timeline["live_frames_compacted"] = True
+        compact_timeline["live_omitted_frame_details"] = True
+        compact_timeline["encoding"] = "compact_frame_index"
+        compact_timeline["detailed_frame_limit"] = min(int(timeline.get("detailed_frame_limit") or 0) or 80, 80)
+        compact_scene = dict(scene)
+        compact_scene["timeline"] = compact_timeline
+        return compact_scene
 
     async def record_live_temperature_sample(self, live: dict[str, Any]) -> None:
         state = unwrap_live_state(live.get("state"))
@@ -294,9 +475,23 @@ class LiveSnapshotMixin:
         scene_path = Path(path)
         if not scene_path.is_file():
             return {"available": False, "reason": "scene_snapshot_not_ready"}
+        last_error: Exception | None = None
+        scene: Any = None
+        for attempt in range(4):
+            try:
+                with scene_path.open("r", encoding="utf-8") as handle:
+                    scene = json.load(handle)
+                last_error = None
+                break
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                time.sleep(0.03 * (attempt + 1))
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.03 * (attempt + 1))
+        if last_error is not None:
+            return {"available": False, "reason": "scene_snapshot_read_error", "error": str(last_error)}
         try:
-            with scene_path.open("r", encoding="utf-8") as handle:
-                scene = json.load(handle)
             if not isinstance(scene, dict):
                 return {"available": False, "reason": "scene_snapshot_invalid"}
             snapshot_session_id = scene_session_id(scene)
@@ -467,6 +662,61 @@ def unwrap_live_state(payload: Any) -> Any:
     return next((root for root in roots if isinstance(root, dict)), payload)
 
 
+def live_frame_sequence(frame: Any) -> int | None:
+    if not isinstance(frame, dict):
+        return None
+    roots = [
+        frame,
+        frame.get("dashboard_live"),
+        frame.get("result") if isinstance(frame.get("result"), dict) else None,
+    ]
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        value = root.get("dashboard_live_sequence") or root.get("sequence")
+        try:
+            sequence = int(value)
+        except (TypeError, ValueError):
+            continue
+        return sequence
+    return None
+
+
+def live_scene_sequence(scene: Any) -> int | None:
+    return live_frame_sequence(scene)
+
+
+def live_frame_captured_at(frame: Any) -> str:
+    if not isinstance(frame, dict):
+        return ""
+    roots = [
+        frame,
+        frame.get("dashboard_live"),
+        frame.get("result") if isinstance(frame.get("result"), dict) else None,
+    ]
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        value = root.get("dashboard_live_captured_at") or root.get("captured_at") or root.get("updated_at")
+        if value:
+            return str(value)
+    return ""
+
+
+def live_frame_is_newer(candidate: Any, baseline: Any) -> bool:
+    candidate_sequence = live_frame_sequence(candidate)
+    baseline_sequence = live_frame_sequence(baseline)
+    if candidate_sequence is not None and baseline_sequence is not None:
+        return candidate_sequence > baseline_sequence
+    if candidate_sequence is not None and baseline_sequence is None:
+        return True
+    if candidate_sequence is None and baseline_sequence is not None:
+        return False
+    candidate_time = live_frame_captured_at(candidate)
+    baseline_time = live_frame_captured_at(baseline)
+    return bool(candidate_time and baseline_time and candidate_time > baseline_time)
+
+
 def attach_matrix_voltage_status(state_payload: Any, voltage_status: Any) -> Any:
     if not isinstance(state_payload, dict):
         return state_payload
@@ -559,6 +809,28 @@ def streamer_direct_stream_available(payload: Any) -> bool:
         if isinstance(stream, dict) and stream.get("available") and stream.get("url"):
             return True
     return False
+
+
+def scene_snapshot_key(scene: Any) -> str:
+    if not isinstance(scene, dict):
+        return ""
+    frame = scene.get("frame") if isinstance(scene.get("frame"), dict) else {}
+    summary = frame.get("summary") if isinstance(frame.get("summary"), dict) else {}
+    executor = scene.get("executor") if isinstance(scene.get("executor"), dict) else {}
+    return ":".join(
+        str(item)
+        for item in (
+            scene.get("session_id"),
+            frame.get("source"),
+            frame.get("index"),
+            frame.get("count"),
+            summary.get("active_mask_sha256"),
+            summary.get("matrix_values_sha256"),
+            executor.get("current_frame"),
+            executor.get("frames_executed"),
+            scene.get("updated_at"),
+        )
+    )
 
 
 def extract_live_temperature(root: Any) -> float | None:

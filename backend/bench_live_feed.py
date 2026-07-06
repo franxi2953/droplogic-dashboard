@@ -27,6 +27,74 @@ def frame_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) and payload.get("base64") else None
 
 
+def live_payloads(data: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    msg_type = data.get("type")
+    payloads: list[tuple[str, dict[str, Any]]] = []
+    if msg_type == "live":
+        live = data.get("live") if isinstance(data.get("live"), dict) else {}
+        frames = live.get("frames") if isinstance(live.get("frames"), dict) else {}
+        streamer = frames.get("streamer")
+        if isinstance(streamer, dict):
+            payloads.append(("streamer", streamer))
+        scene = live.get("scene")
+        if isinstance(scene, dict) and scene.get("available"):
+            payloads.append(("matrix_scene", scene))
+    elif msg_type == "live_frame":
+        frame = data.get("frame")
+        visualizer = str(data.get("visualizer") or "frame")
+        if isinstance(frame, dict):
+            payloads.append((visualizer, frame))
+    elif msg_type == "live_scene":
+        scene = data.get("scene")
+        if isinstance(scene, dict):
+            payloads.append(("matrix_scene", scene))
+    return payloads
+
+
+def live_sequence(payload: dict[str, Any]) -> int | None:
+    roots = [
+        payload,
+        payload.get("dashboard_live") if isinstance(payload.get("dashboard_live"), dict) else None,
+        payload.get("result") if isinstance(payload.get("result"), dict) else None,
+    ]
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        raw = root.get("dashboard_live_sequence") or root.get("sequence")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def live_captured_at(payload: dict[str, Any]) -> float | None:
+    roots = [
+        payload,
+        payload.get("dashboard_live") if isinstance(payload.get("dashboard_live"), dict) else None,
+        payload.get("result") if isinstance(payload.get("result"), dict) else None,
+    ]
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        raw = root.get("dashboard_live_captured_at") or root.get("captured_at")
+        if not raw:
+            continue
+        try:
+            parsed = datetime_from_iso(str(raw))
+        except ValueError:
+            continue
+        return parsed
+    return None
+
+
+def datetime_from_iso(value: str) -> float:
+    from datetime import datetime
+
+    normalized = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(normalized).timestamp()
+
+
 async def run_benchmark(url: str, seconds: float) -> None:
     counts: dict[str, int] = {}
     bytes_by_type: dict[str, int] = {}
@@ -34,10 +102,17 @@ async def run_benchmark(url: str, seconds: float) -> None:
     frame_bytes = 0
     gaps: list[float] = []
     last_frame_at: float | None = None
+    channel_counts: dict[str, int] = {}
+    channel_gaps: dict[str, list[float]] = {}
+    channel_ages_ms: dict[str, list[float]] = {}
+    channel_last_at: dict[str, float] = {}
+    channel_last_sequence: dict[str, int] = {}
+    channel_regressions: dict[str, int] = {}
+    channel_repeats: dict[str, int] = {}
     started = time.perf_counter()
 
     async with websockets.connect(url, max_size=None) as ws:
-        await ws.send(json.dumps({"type": "get_status"}))
+        await ws.send(json.dumps({"type": "get_live" if url.rstrip("/").endswith("/live") else "get_status"}))
         deadline = time.perf_counter() + seconds
         while time.perf_counter() < deadline:
             timeout = max(0.01, deadline - time.perf_counter())
@@ -54,10 +129,29 @@ async def run_benchmark(url: str, seconds: float) -> None:
             counts[msg_type] = counts.get(msg_type, 0) + 1
             bytes_by_type[msg_type] = bytes_by_type.get(msg_type, 0) + len(message)
 
+            now = time.perf_counter()
+            wall_now = time.time()
+            for channel, payload in live_payloads(data):
+                channel_counts[channel] = channel_counts.get(channel, 0) + 1
+                if channel in channel_last_at:
+                    channel_gaps.setdefault(channel, []).append(now - channel_last_at[channel])
+                channel_last_at[channel] = now
+                captured = live_captured_at(payload)
+                if captured is not None:
+                    channel_ages_ms.setdefault(channel, []).append(max(0.0, (wall_now - captured) * 1000.0))
+                sequence = live_sequence(payload)
+                if sequence is not None:
+                    previous = channel_last_sequence.get(channel)
+                    if previous is not None:
+                        if sequence < previous:
+                            channel_regressions[channel] = channel_regressions.get(channel, 0) + 1
+                        elif sequence == previous:
+                            channel_repeats[channel] = channel_repeats.get(channel, 0) + 1
+                    channel_last_sequence[channel] = sequence
+
             frame = frame_payload(data)
             if frame is None:
                 continue
-            now = time.perf_counter()
             if last_frame_at is not None:
                 gaps.append(now - last_frame_at)
             last_frame_at = now
@@ -75,6 +169,19 @@ async def run_benchmark(url: str, seconds: float) -> None:
     if streamer_frames:
         print(f"avg_streamer_base64_bytes={int(frame_bytes / streamer_frames)}")
     print("message_counts=" + json.dumps(counts, sort_keys=True))
+    if channel_counts:
+        print("live_channel_counts=" + json.dumps(channel_counts, sort_keys=True))
+        print("live_sequence_last=" + json.dumps(channel_last_sequence, sort_keys=True))
+        print("live_sequence_regressions=" + json.dumps(channel_regressions, sort_keys=True))
+        print("live_sequence_repeats=" + json.dumps(channel_repeats, sort_keys=True))
+        for channel, values in sorted(channel_gaps.items()):
+            if values:
+                print(f"{channel}_gap_median_seconds={statistics.median(values):.3f}")
+                print(f"{channel}_gap_max_seconds={max(values):.3f}")
+        for channel, values in sorted(channel_ages_ms.items()):
+            if values:
+                print(f"{channel}_age_median_ms={statistics.median(values):.1f}")
+                print(f"{channel}_age_max_ms={max(values):.1f}")
     avg_bytes = {
         key: int(bytes_by_type[key] / max(1, counts.get(key, 1)))
         for key in sorted(bytes_by_type)

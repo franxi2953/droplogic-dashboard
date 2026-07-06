@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 from typing import Any
@@ -88,9 +88,36 @@ MCP_STATEFUL_EXECUTION_TOOLS = {
     "execute_segment_to_breakpoint",
     "execution_wait_status",
 }
+MCP_HEALTH_GUARDED_TOOLS = {
+    "capture_camera_image",
+    "capture_microscope_image",
+    "configure_camera_imaging",
+    "configure_microscope_imaging",
+    "execute_segment_to_breakpoint",
+    "execution_wait_status",
+    "move_stage",
+    "resume_plan",
+    "set_execution_view_mode",
+    "set_light_state",
+    "set_matrix_cells",
+    "set_matrix_voltage",
+    "set_streamer_source",
+    "set_temperature_target",
+    "start_execute_until_breakpoint",
+    "start_plan",
+    "start_temperature_routine",
+    "start_visualizer",
+    "temperature_hold",
+    "verify_droplets",
+}
 RUN_EVENT_WINDOW_LIMIT = 420
 RUN_EVENT_OLDER_LIMIT = 260
-FRONTEND_OMITTED_EVENT_TYPES = {"temperature_sample"}
+FRONTEND_OMITTED_EVENT_TYPES = {
+    "temperature_sample",
+    "live_poll_error",
+    "live_scene_error",
+    "live_stream_error",
+}
 
 
 class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
@@ -108,6 +135,8 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             cwd=str(DROPLOGIC_ROOT),
         )
         self.clients: set[Any] = set()
+        self.live_clients: set[Any] = set()
+        self._client_send_locks: dict[Any, asyncio.Lock] = {}
         self.now = "Idle"
         self.live: dict[str, Any] = {}
         self.streamer_frame_options: dict[str, Any] = {
@@ -120,6 +149,10 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         self._agent_task: asyncio.Task | None = None
         self._agent_queue: list[dict[str, Any]] = []
         self._direct_stream_available = False
+        self._scene_task: asyncio.Task | None = None
+        self._live_frame_sequences: dict[str, int] = {}
+        self._melting_curve_monitor_tasks: dict[str, asyncio.Task] = {}
+        self._melting_curve_seen_captures: set[str] = set()
 
     @staticmethod
     def should_background_temperature_hold(arguments: dict[str, Any]) -> bool:
@@ -314,6 +347,38 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             ),
         }
 
+    async def mcp_health_guard_result(self, tool: str, via: str) -> dict[str, Any] | None:
+        if tool not in MCP_HEALTH_GUARDED_TOOLS or not self.mcp.running:
+            return None
+        health_result = await self.safe_tool("health_check", timeout_seconds=3.0)
+        health = compact_tool_payload(health_result)
+        if isinstance(health, dict) and health.get("ok") is True:
+            return None
+        if not isinstance(health, dict):
+            health = {
+                "ok": False,
+                "error": "health_check did not return a structured payload",
+                "raw": health,
+            }
+        return {
+            "ok": False,
+            "isError": True,
+            "reason": "mcp_runtime_health_failed",
+            "tool_not_run": tool,
+            "via": via,
+            "health": health,
+            "error": (
+                f"Refusing to run {tool}: the MCP runtime health check failed. "
+                "Do not continue hardware execution until the BoxMini system is restarted "
+                "or the queue workers are healthy."
+            ),
+            "recovery_steps": [
+                "Inspect health.queue_workers and health.last_error.",
+                "Use restart_system(reset_matrix=false) if the existing logical state can be discarded.",
+                "After restart, re-load or rebuild the intended plan from the current physical state.",
+            ],
+        }
+
     def pinned_context_roots(self) -> list[tuple[str, Path]]:
         roots: list[tuple[str, Path]] = []
         override = Path(self.config.mcp.env.get("DROPLOGIC_MCP_CONTEXT_DIR", ""))
@@ -378,6 +443,206 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         event = self.recorder.append(event_type, **fields)
         await self.broadcast_event(event)
         return event
+
+    def maybe_start_melting_curve_monitor(
+        self,
+        tool: str,
+        *payloads: Any,
+        call_event_id: Any = None,
+        via: str = "",
+    ) -> None:
+        if str(tool or "") != "start_melting_curve_capture":
+            return
+        reference = self.extract_melting_curve_status_reference(*payloads)
+        if not reference:
+            return
+        routine_id = str(reference.get("routine_id") or "").strip()
+        metadata_path = str(reference.get("metadata_path") or "").strip()
+        task_key = routine_id or metadata_path
+        if not task_key:
+            return
+        existing = self._melting_curve_monitor_tasks.get(task_key)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self.monitor_melting_curve_capture(
+                routine_id=routine_id,
+                metadata_path=metadata_path,
+                call_event_id=call_event_id,
+                via=via,
+            )
+        )
+        self._melting_curve_monitor_tasks[task_key] = task
+
+    def extract_melting_curve_status_reference(self, *payloads: Any) -> dict[str, Any] | None:
+        for payload in payloads:
+            for root in self.iter_payload_roots(payload):
+                if not isinstance(root, dict):
+                    continue
+                candidate = root.get("result") if isinstance(root.get("result"), dict) else root
+                routine_id = str(candidate.get("routine_id") or "").strip()
+                metadata_path = str(candidate.get("metadata_path") or "").strip()
+                if routine_id or metadata_path:
+                    return {
+                        "routine_id": routine_id,
+                        "metadata_path": metadata_path,
+                    }
+        return None
+
+    def iter_payload_roots(self, payload: Any) -> list[Any]:
+        roots: list[Any] = []
+
+        def add(value: Any) -> None:
+            if value is not None:
+                roots.append(value)
+
+        add(payload)
+        compact = compact_tool_payload(payload)
+        add(compact)
+        if isinstance(payload, dict):
+            add(payload.get("result"))
+            add(self.deep_get(payload, "result.result"))
+            add(self.deep_get(payload, "structuredContent"))
+            add(self.deep_get(payload, "structuredContent.result"))
+            add(self.deep_get(payload, "result.structuredContent"))
+            add(self.deep_get(payload, "result.structuredContent.result"))
+            content = payload.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parsed = self.parse_json_object(part["text"])
+                        add(parsed)
+        if isinstance(compact, dict):
+            add(compact.get("result"))
+        return roots
+
+    @staticmethod
+    def parse_json_object(text: str) -> Any:
+        value = str(text or "").strip()
+        if not value or value[0] not in "{[":
+            return None
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+
+    async def monitor_melting_curve_capture(
+        self,
+        routine_id: str,
+        metadata_path: str,
+        call_event_id: Any = None,
+        via: str = "",
+    ) -> None:
+        path = Path(metadata_path) if metadata_path else None
+        idle_after_finished = 0
+        missing_since = time.monotonic()
+        while self.mcp.running:
+            try:
+                status = None
+                if path is not None and path.is_file():
+                    with path.open("r", encoding="utf-8") as handle:
+                        status = json.load(handle)
+                elif time.monotonic() - missing_since > 20.0:
+                    payload = compact_tool_payload(await self.safe_tool("melting_curve_capture_status", {}))
+                    if isinstance(payload, dict):
+                        status = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+                if isinstance(status, dict):
+                    await self.emit_melting_curve_capture_events(
+                        status,
+                        routine_id=routine_id or str(status.get("routine_id") or ""),
+                        call_event_id=call_event_id,
+                        via=via,
+                    )
+                    if status.get("running") is False:
+                        idle_after_finished += 1
+                        if idle_after_finished >= 2:
+                            await self.record(
+                                "melting_curve_capture_finished",
+                                tool="start_melting_curve_capture",
+                                routine_id=routine_id or status.get("routine_id"),
+                                ok=bool(status.get("ok")),
+                                completed=bool(status.get("completed")),
+                                completed_steps=status.get("completed_steps"),
+                                requested_steps=status.get("requested_steps"),
+                                output_dir=status.get("output_dir"),
+                                metadata_path=status.get("metadata_path") or metadata_path,
+                                parent_call_event_id=call_event_id,
+                                via=via,
+                            )
+                            break
+            except Exception as exc:
+                await self.record(
+                    "melting_curve_capture_monitor_error",
+                    level="warning",
+                    routine_id=routine_id,
+                    metadata_path=metadata_path,
+                    message=str(exc),
+                    parent_call_event_id=call_event_id,
+                    via=via,
+                )
+            await asyncio.sleep(1.0)
+
+    async def emit_melting_curve_capture_events(
+        self,
+        status: dict[str, Any],
+        routine_id: str = "",
+        call_event_id: Any = None,
+        via: str = "",
+    ) -> None:
+        results = status.get("results")
+        if not isinstance(results, list):
+            return
+        for step in results:
+            if not isinstance(step, dict):
+                continue
+            capture = step.get("capture")
+            if not isinstance(capture, dict):
+                continue
+            paths = []
+            if capture.get("path"):
+                paths.append(capture.get("path"))
+            for item in capture.get("paths_sample") or []:
+                if item:
+                    paths.append(item)
+            for raw_path in dict.fromkeys(str(item) for item in paths if str(item or "").strip()):
+                capture_key = f"{routine_id}:{raw_path}"
+                if capture_key in self._melting_curve_seen_captures:
+                    continue
+                self._melting_curve_seen_captures.add(capture_key)
+                image_path = Path(raw_path)
+                captured_t = time.time()
+                captured_ts = datetime.now(timezone.utc).isoformat()
+                if image_path.is_file():
+                    try:
+                        captured_t = image_path.stat().st_mtime
+                        captured_ts = datetime.fromtimestamp(captured_t, timezone.utc).isoformat()
+                    except Exception:
+                        pass
+                capture_event = {
+                    "path": raw_path,
+                    "absolute_path": raw_path,
+                    "mime_type": capture.get("mime_type") or "image/png",
+                    "source": capture.get("source") or capture.get("capture_mode") or status.get("capture_mode"),
+                    "temperature_label": capture.get("temperature_label"),
+                    "target_c": step.get("target_c"),
+                    "step_index": step.get("index"),
+                    "output_dir": capture.get("output_dir"),
+                    "metadata_path": capture.get("metadata_path") or status.get("metadata_path"),
+                }
+                await self.record(
+                    "melting_curve_capture_photo",
+                    t=captured_t,
+                    ts=captured_ts,
+                    tool="start_melting_curve_capture",
+                    routine_id=routine_id or status.get("routine_id"),
+                    step_index=step.get("index"),
+                    target_c=step.get("target_c"),
+                    temperature_label=capture.get("temperature_label"),
+                    capture=capture_event,
+                    result={"capture": capture_event},
+                    parent_call_event_id=call_event_id,
+                    via=via,
+                )
 
     async def call_stage_motion_tool(
         self,
@@ -601,7 +866,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 step_event_id=step_event_id,
                 via=source,
             )
-            await self.broadcast_json(
+            await self.broadcast_realtime_json(
                 {
                     "type": "stage_motion",
                     "phase": "end",
@@ -620,7 +885,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             return
         try:
             self.live = await self.collect_live_snapshot(include_state=True, include_streamer_frame=False, prefer_scene_file=True)
-            await self.broadcast_json({"type": "live", "live": self.live})
+            await self.broadcast_live_json({"type": "live", "live": self.live})
         except Exception as exc:
             await self.record("live_poll_error", level="warning", message=f"verify_droplets live refresh failed: {exc}")
 
@@ -636,7 +901,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             return False
         start = self.current_stage_position()
         wait_timeout = parse_optional_float(arguments.get("wait_timeout_seconds")) if isinstance(arguments, dict) else None
-        await self.broadcast_json(
+        await self.broadcast_realtime_json(
             {
                 "type": "stage_motion",
                 "phase": "start",
@@ -682,7 +947,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if error:
             payload["error"] = error
             payload["ok"] = False
-        await self.broadcast_json(payload)
+        await self.broadcast_realtime_json(payload)
 
     def current_stage_position(self) -> dict[str, int] | None:
         root = self.live.get("state") if isinstance(self.live, dict) else None
@@ -846,6 +1111,23 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     await websocket.send(json.dumps({"type": "event", "event": event}))
         finally:
             self.clients.discard(websocket)
+            self._client_send_locks.pop(websocket, None)
+
+    async def handle_live_ws(self, websocket: Any) -> None:
+        self.live_clients.add(websocket)
+        try:
+            if self.live:
+                await self.safe_send(websocket, {"type": "live", "live": self.live})
+            async for raw in websocket:
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("type") == "get_live" and self.live:
+                    await self.safe_send(websocket, {"type": "live", "live": self.live})
+        finally:
+            self.live_clients.discard(websocket)
+            self._client_send_locks.pop(websocket, None)
 
     async def handle_message(self, websocket: Any, message: dict[str, Any]) -> None:
         msg_type = message.get("type")
@@ -1072,7 +1354,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             await websocket.send(json.dumps({"type": "preset_apply_result", "result": result}, ensure_ascii=True))
             if self.mcp.running and result.get("ok") is not False:
                 self.live = await self.collect_live_snapshot(include_state=True)
-                await self.broadcast_json({"type": "live", "live": self.live})
+                await self.broadcast_live_json({"type": "live", "live": self.live})
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
@@ -1120,27 +1402,32 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     result = self.mcp_runtime_restarted_result(actual_tool, via="dashboard_user")
                     mcp_timing = {}
                 else:
-                    if actual_tool == "move_stage":
-                        await self.broadcast_stage_motion_start(
-                            actual_arguments,
-                            source="dashboard_user",
-                            call_event_id=event.get("t"),
-                        )
-                    if actual_tool == "verify_droplets":
-                        result, mcp_timing = await self.call_verify_droplets_observed_timed(
-                            actual_arguments,
-                            source="dashboard_user",
-                            call_event_id=event.get("t"),
-                        )
+                    guard_result = await self.mcp_health_guard_result(actual_tool, via="dashboard_user")
+                    if guard_result is not None:
+                        result = guard_result
+                        mcp_timing = {}
                     else:
-                        result, mcp_timing = await self.mcp.call_tool_timed(
-                            actual_tool,
-                            actual_arguments,
-                            read_timeout_seconds=self.dashboard_user_tool_timeout_seconds(
+                        if actual_tool == "move_stage":
+                            await self.broadcast_stage_motion_start(
+                                actual_arguments,
+                                source="dashboard_user",
+                                call_event_id=event.get("t"),
+                            )
+                        if actual_tool == "verify_droplets":
+                            result, mcp_timing = await self.call_verify_droplets_observed_timed(
+                                actual_arguments,
+                                source="dashboard_user",
+                                call_event_id=event.get("t"),
+                            )
+                        else:
+                            result, mcp_timing = await self.mcp.call_tool_timed(
                                 actual_tool,
                                 actual_arguments,
-                            ),
-                        )
+                                read_timeout_seconds=self.dashboard_user_tool_timeout_seconds(
+                                    actual_tool,
+                                    actual_arguments,
+                                ),
+                            )
                     if routed_tool:
                         result = self.annotate_routed_tool_result(result, tool, actual_tool)
                 result = mark_failed_mcp_payload(result)
@@ -1186,6 +1473,13 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 result_event = await self.record(
                     "mcp_tool_result",
                     **result_fields,
+                )
+                self.maybe_start_melting_curve_monitor(
+                    actual_tool,
+                    result,
+                    event_result,
+                    call_event_id=event.get("t"),
+                    via="dashboard_user",
                 )
                 await websocket.send(
                     json.dumps({"type": "tool_result", "event": result_event, "result": event_result})
@@ -1308,7 +1602,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             )
             if self.mcp.running:
                 self.live = await self.collect_live_snapshot(include_state=True)
-                await self.broadcast_json({"type": "live", "live": self.live})
+                await self.broadcast_live_json({"type": "live", "live": self.live})
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
@@ -1496,7 +1790,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
                 self.live = live
-                await self.broadcast_json({"type": "live", "live": live})
+                await self.broadcast_live_json({"type": "live", "live": live})
             return
 
         if msg_type == "matrix_update_droplet_position":
@@ -1529,7 +1823,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
                 self.live = live
-                await self.broadcast_json({"type": "live", "live": live})
+                await self.broadcast_live_json({"type": "live", "live": live})
             return
 
         if msg_type == "matrix_plan_waypoint_paths":
@@ -1637,7 +1931,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
                 self.live = live
-                await self.broadcast_json({"type": "live", "live": live})
+                await self.broadcast_live_json({"type": "live", "live": live})
             return
 
         if msg_type == "matrix_plan_selection_move":
@@ -1736,7 +2030,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
                 self.live = live
-                await self.broadcast_json({"type": "live", "live": live})
+                await self.broadcast_live_json({"type": "live", "live": live})
             return
 
         if msg_type == "matrix_trim_plan_tail":
@@ -1766,7 +2060,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
                 self.live = live
-                await self.broadcast_json({"type": "live", "live": live})
+                await self.broadcast_live_json({"type": "live", "live": live})
             return
 
         if msg_type == "set_streamer_view":
@@ -1908,7 +2202,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if self.mcp.running:
             live = await self.collect_live_snapshot(include_state=True)
             self.live = live
-            await self.broadcast_json({"type": "live", "live": live})
+            await self.broadcast_live_json({"type": "live", "live": live})
         await websocket.send(json.dumps({"type": "status", "status": self.status()}))
 
     async def read_stage_motion_params(self) -> dict[str, float] | None:
@@ -2533,20 +2827,24 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     if mcp_auto_started and tool in MCP_STATEFUL_EXECUTION_TOOLS:
                         result = self.mcp_runtime_restarted_result(tool, via="agent")
                     else:
-                        if tool == "move_stage":
-                            await self.broadcast_stage_motion_start(
-                                call_arguments,
-                                source="agent",
-                                call_event_id=call_event.get("t"),
-                            )
-                        if tool == "verify_droplets":
-                            result = await self.call_verify_droplets_observed(
-                                call_arguments,
-                                source="agent",
-                                call_event_id=call_event.get("t"),
-                            )
+                        guard_result = await self.mcp_health_guard_result(tool, via="agent")
+                        if guard_result is not None:
+                            result = guard_result
                         else:
-                            result = await self.call_agent_mcp_tool(tool, call_arguments)
+                            if tool == "move_stage":
+                                await self.broadcast_stage_motion_start(
+                                    call_arguments,
+                                    source="agent",
+                                    call_event_id=call_event.get("t"),
+                                )
+                            if tool == "verify_droplets":
+                                result = await self.call_verify_droplets_observed(
+                                    call_arguments,
+                                    source="agent",
+                                    call_event_id=call_event.get("t"),
+                                )
+                            else:
+                                result = await self.call_agent_mcp_tool(tool, call_arguments)
                     tool_total_seconds = time.monotonic() - tool_started
                     result = mark_failed_mcp_payload(result)
                     if tool == "move_stage":
@@ -2580,9 +2878,16 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     if attachment_details:
                         result_fields["model_attachments"] = attachment_details
                         result_fields.update(tool_attachment_metrics(attachment_details))
-                    await self.record(
+                    result_event = await self.record(
                         "mcp_tool_result",
                         **result_fields,
+                    )
+                    self.maybe_start_melting_curve_monitor(
+                        tool,
+                        result,
+                        event_result,
+                        call_event_id=call_event.get("t"),
+                        via="agent",
                     )
                     return model_result
                 except asyncio.CancelledError:
@@ -2966,6 +3271,20 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if call_arguments.get("planning_timeout") is None:
                 call_arguments["planning_timeout"] = 120.0
                 overrides["planning_timeout"] = 120.0
+        if tool == "execution_status_summary":
+            for key, reason in {
+                "include_visualizers": "Use visualizer_status only when visualizer metadata is specifically needed.",
+                "include_planning_job": "Use planning_job_status only while a planning job is actively running.",
+                "include_execution_wait": "Use execution_wait_status only while a background execution wait is actively running.",
+            }.items():
+                if call_arguments.get(key) is not False:
+                    requested = call_arguments.get(key)
+                    call_arguments[key] = False
+                    overrides[key] = {
+                        "from": requested,
+                        "to": False,
+                        "reason": reason,
+                    }
         if tool == "execute_segment_to_breakpoint":
             requested_wait_mode = call_arguments.get("wait_mode")
             if requested_wait_mode != "background":
@@ -3123,22 +3442,57 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         return artifact, image_bytes
 
     async def broadcast_json(self, payload: dict[str, Any]) -> None:
+        await self.broadcast_to_clients(self.clients, payload, timeout_seconds=5.0)
+
+    async def broadcast_live_json(self, payload: dict[str, Any]) -> None:
+        await self.broadcast_to_clients(self.live_clients, payload, timeout_seconds=1.0)
+
+    async def broadcast_realtime_json(self, payload: dict[str, Any]) -> None:
+        await asyncio.gather(
+            self.broadcast_json(payload),
+            self.broadcast_live_json(payload),
+        )
+
+    async def broadcast_to_clients(
+        self,
+        clients: set[Any],
+        payload: dict[str, Any],
+        timeout_seconds: float = 5.0,
+    ) -> None:
         message = json.dumps(payload, ensure_ascii=True)
-        stale = []
-        for client in list(self.clients):
+        snapshot = list(clients)
+        if not snapshot:
+            return
+
+        async def send_one(client: Any) -> Any | None:
             try:
-                await client.send(message)
+                await self.send_text(client, message, timeout_seconds=timeout_seconds)
+                return None
             except Exception:
-                stale.append(client)
+                return client
+
+        stale = [item for item in await asyncio.gather(*(send_one(client) for client in snapshot)) if item is not None]
         for client in stale:
-            self.clients.discard(client)
+            clients.discard(client)
+            self._client_send_locks.pop(client, None)
 
     async def safe_send(self, websocket: Any, payload: dict[str, Any]) -> None:
         try:
-            await websocket.send(json.dumps(payload, ensure_ascii=True))
+            await self.send_text(websocket, json.dumps(payload, ensure_ascii=True), timeout_seconds=None)
         except Exception as exc:
             if not websocket_closed_ok(exc):
                 raise
+
+    async def send_text(self, websocket: Any, message: str, timeout_seconds: float | None = None) -> None:
+        lock = self._client_send_locks.get(websocket)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_send_locks[websocket] = lock
+        async with lock:
+            if timeout_seconds is None:
+                await websocket.send(message)
+            else:
+                await asyncio.wait_for(websocket.send(message), timeout=max(0.05, float(timeout_seconds)))
 
     async def broadcast_run_loaded(self) -> None:
         await self.broadcast_json(self.run_loaded_payload())
@@ -3175,14 +3529,24 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             self._audio_preload_task = asyncio.create_task(self.preload_audio_transcriber_background())
         httpd = start_http_server(self.config.host, self.config.port, self.recorder.runs_dir)
         ws_port = self.config.port + 1
-        async with websockets.serve(
-            self.handle_ws,
-            self.config.host,
-            ws_port,
-            max_size=None,
+        live_ws_port = self.config.port + 2
+        async with (
+            websockets.serve(
+                self.handle_ws,
+                self.config.host,
+                ws_port,
+                max_size=None,
+            ),
+            websockets.serve(
+                self.handle_live_ws,
+                self.config.host,
+                live_ws_port,
+                max_size=None,
+            ),
         ):
             print(f"DropLogic Dashboard: http://{self.config.host}:{self.config.port}")
             print(f"DropLogic Dashboard WS: ws://{self.config.host}:{ws_port}")
+            print(f"DropLogic Dashboard Live WS: ws://{self.config.host}:{live_ws_port}")
             try:
                 await asyncio.Future()
             finally:
