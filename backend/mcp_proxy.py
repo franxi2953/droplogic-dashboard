@@ -52,7 +52,7 @@ def as_call_tool_result(result: Any) -> types.CallToolResult:
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(result, ensure_ascii=True, indent=2))],
         structuredContent=result if isinstance(result, dict) else None,
-        isError=False,
+        isError=bool(result.get("isError")) if isinstance(result, dict) else False,
     )
 
 
@@ -67,15 +67,6 @@ async def run_proxy(config_path: str | None = None) -> None:
     config = load_config(config_path)
     app = CockpitApp(config)
     await app.record("cockpit_proxy_started", host=config.host, port=config.port)
-
-    httpd = start_http_server(config.host, config.port, app.recorder.runs_dir)
-    ws_port = config.port + 1
-    ws_server = await websockets.serve(
-        app.handle_ws,
-        config.host,
-        ws_port,
-        max_size=None,
-    )
 
     server = Server(
         "DropLogic Dashboard",
@@ -117,21 +108,29 @@ async def run_proxy(config_path: str | None = None) -> None:
         try:
             if mcp_auto_started and actual_name in MCP_STATEFUL_EXECUTION_TOOLS:
                 result = app.mcp_runtime_restarted_result(actual_name, via="cockpit_proxy")
-            elif actual_name == "verify_droplets":
-                result = await app.call_verify_droplets_observed(
-                    actual_arguments,
-                    source="cockpit_proxy",
-                    call_event_id=call_event.get("t"),
-                )
             else:
-                result = await app.mcp.call_tool(
+                guard_result = await app.mcp_health_guard_result(
                     actual_name,
-                    actual_arguments,
-                    read_timeout_seconds=app.dashboard_user_tool_timeout_seconds(
+                    via="cockpit_proxy",
+                    arguments=actual_arguments,
+                )
+                if guard_result is not None:
+                    result = guard_result
+                elif actual_name == "verify_droplets":
+                    result = await app.call_verify_droplets_observed(
+                        actual_arguments,
+                        source="cockpit_proxy",
+                        call_event_id=call_event.get("t"),
+                    )
+                else:
+                    result = await app.mcp.call_tool(
                         actual_name,
                         actual_arguments,
-                    ),
-                )
+                        read_timeout_seconds=app.dashboard_user_tool_timeout_seconds(
+                            actual_name,
+                            actual_arguments,
+                        ),
+                    )
             if routed_tool:
                 result = app.annotate_routed_tool_result(result, name, actual_name)
             ok = mcp_tool_call_succeeded(result)
@@ -150,6 +149,12 @@ async def run_proxy(config_path: str | None = None) -> None:
                     if routed_tool
                     else {}
                 ),
+            )
+            app.maybe_start_melting_curve_monitor(
+                actual_name,
+                result,
+                call_event_id=call_event.get("t"),
+                via="cockpit_proxy",
             )
             return as_call_tool_result(result)
         except Exception as exc:
@@ -172,7 +177,25 @@ async def run_proxy(config_path: str | None = None) -> None:
             )
             return error_result(str(exc))
 
+    httpd = None
+    ws_server = None
+    live_ws_server = None
     try:
+        httpd = start_http_server(config.host, config.port, app.recorder.runs_dir)
+        ws_port = config.port + 1
+        live_ws_port = config.port + 2
+        ws_server = await websockets.serve(
+            app.handle_ws,
+            config.host,
+            ws_port,
+            max_size=None,
+        )
+        live_ws_server = await websockets.serve(
+            app.handle_live_ws,
+            config.host,
+            live_ws_port,
+            max_size=None,
+        )
         await ensure_mcp_started(app)
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
@@ -183,9 +206,15 @@ async def run_proxy(config_path: str | None = None) -> None:
     finally:
         await app.stop_live_polling()
         await app.mcp.stop()
-        ws_server.close()
-        await ws_server.wait_closed()
-        httpd.shutdown()
+        for active_server in (ws_server, live_ws_server):
+            if active_server is not None:
+                active_server.close()
+        for active_server in (ws_server, live_ws_server):
+            if active_server is not None:
+                await active_server.wait_closed()
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 def parse_args() -> argparse.Namespace:

@@ -27,11 +27,14 @@ Make the matrix visualizer behave like an RTS control surface for droplet plans:
 - Add play/pause/rewind controls wired to DropLogic execution tools.
 - Show the planned cursor separately from executed progress.
 - Keep the live/preview toggle so the user can inspect history and return to live execution.
+- Treat compact live timelines as sparse exact-index frame sets, not dense arrays.
+- Treat successful `clear_droplet_state(reset_executor=true)` empty-plan results as the boundary for current plan/execution markers.
 - Add a frame-delay editor, defaulting to 1.0 s, and use it for execution start/resume commands when available.
 
 ## Phase 4: Verification And Cleanup
 
 - Run syntax checks for edited JavaScript and Python files.
+- Run live responsiveness checks when matrix rendering or live payloads change: `npm run bench:matrix:motion`, `npm run bench:live`, and the agent matrix benchmark when agent-driven motion is affected.
 - Restart the dashboard backend.
 - Open the dashboard and visually inspect the matrix minimap, command panel, and timeline controls.
 - Remove temporary inspection artifacts after verification.

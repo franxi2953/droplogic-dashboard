@@ -24,10 +24,10 @@ RETRY_PAYLOAD_EVENT_LOG_TARGET_CHARS = 70_000
 RETRY_PAYLOAD_MIN_EVENT_LOG_TARGET_CHARS = 16_000
 RETRY_PAYLOAD_MIN_TOOL_OUTPUT_CHARS = 1_500
 MODEL_ATTACHMENTS_KEY = "_cockpit_model_attachments"
-RECENT_INPUT_TOOL_PAIRS_KEEP = 4
-MAX_ACTIVE_TOOL_OUTPUT_CHARS = 4_000
-MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS = 12_000
-MIN_ACTIVE_TOOL_OUTPUT_CHARS = 800
+RECENT_INPUT_TOOL_PAIRS_KEEP = 2
+MAX_ACTIVE_TOOL_OUTPUT_CHARS = 2_500
+MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS = 6_000
+MIN_ACTIVE_TOOL_OUTPUT_CHARS = 500
 
 
 class AiProvider:
@@ -234,7 +234,7 @@ class AiProvider:
                 on_retry=on_retry,
                 on_retry_compact=retry_payload_compactor(
                     anthropic_payload,
-                    max_tool_output_chars=12_000,
+                    max_tool_output_chars=6_000,
                     on_context_compacted=on_context_compacted,
                 ),
             )
@@ -263,7 +263,7 @@ class AiProvider:
                 on_retry=on_retry,
                 on_retry_compact=retry_payload_compactor(
                     chat_payload,
-                    max_tool_output_chars=12_000,
+                    max_tool_output_chars=6_000,
                     on_context_compacted=on_context_compacted,
                 ),
             )
@@ -276,7 +276,7 @@ class AiProvider:
             on_retry=on_retry,
             on_retry_compact=retry_payload_compactor(
                 payload,
-                max_tool_output_chars=12_000,
+                max_tool_output_chars=6_000,
                 on_context_compacted=on_context_compacted,
             ),
         )
@@ -297,7 +297,7 @@ class AiProvider:
         on_model_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         max_tool_rounds: int | None = None,
-        max_tool_output_chars: int = 12_000,
+        max_tool_output_chars: int = 6_000,
         on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         if not self.configured:
@@ -512,7 +512,7 @@ class AiProvider:
         on_model_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         max_tool_rounds: int | None = None,
-        max_tool_output_chars: int = 12_000,
+        max_tool_output_chars: int = 6_000,
         on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         context = json.dumps(events, ensure_ascii=True, default=str)
@@ -660,7 +660,7 @@ class AiProvider:
         on_model_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         max_tool_rounds: int | None = None,
-        max_tool_output_chars: int = 12_000,
+        max_tool_output_chars: int = 6_000,
         on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         context = json.dumps(events, ensure_ascii=True, default=str)
@@ -1074,7 +1074,7 @@ def payload_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
 
 def retry_payload_compactor(
     payload: dict[str, Any],
-    max_tool_output_chars: int = 12_000,
+    max_tool_output_chars: int = 6_000,
     on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> Callable[[int], Awaitable[None]]:
     async def compact(attempt: int) -> None:

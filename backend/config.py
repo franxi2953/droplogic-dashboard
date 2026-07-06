@@ -83,10 +83,10 @@ class AiConfig:
     # The cockpit budgets model context in characters. Use ~4 chars/token as
     # a conservative conversion, so 800k chars is roughly 200k tokens.
     max_context_chars: int = 800_000
-    target_context_chars: int = 90_000
+    target_context_chars: int = 60_000
     recent_event_target: int = 120
     large_event_chars: int = 8_000
-    max_tool_output_chars: int = 12_000
+    max_tool_output_chars: int = 6_000
     ai_context_summary_enabled: bool = True
     ai_context_summary_trigger_chars: int = 300_000
     ai_context_summary_max_chars: int = 12_000
@@ -186,10 +186,10 @@ def load_config(path: str | None = None) -> CockpitConfig:
                 if isinstance(item, dict)
             ],
             max_context_chars=int(ai_raw.get("max_context_chars", 800_000)),
-            target_context_chars=int(ai_raw.get("target_context_chars", 90_000)),
+            target_context_chars=int(ai_raw.get("target_context_chars", 60_000)),
             recent_event_target=int(ai_raw.get("recent_event_target", 120)),
             large_event_chars=int(ai_raw.get("large_event_chars", 8_000)),
-            max_tool_output_chars=int(ai_raw.get("max_tool_output_chars", 12_000)),
+            max_tool_output_chars=int(ai_raw.get("max_tool_output_chars", 6_000)),
             ai_context_summary_enabled=bool(ai_raw.get("ai_context_summary_enabled", True)),
             ai_context_summary_trigger_chars=int(ai_raw.get("ai_context_summary_trigger_chars", 300_000)),
             ai_context_summary_max_chars=int(ai_raw.get("ai_context_summary_max_chars", 12_000)),

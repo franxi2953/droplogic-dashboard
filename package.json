@@ -6,9 +6,12 @@
   "scripts": {
     "bench:ui": "node scripts/bench_dashboard_ui.mjs",
     "bench:ui:stress:generate": "py -3 scripts/generate_ui_stress_run.py --activate",
+    "bench:agent:matrix": "node scripts/bench_agent_matrix_motion.mjs",
+    "bench:live": "py -3 backend/bench_live_feed.py --url ws://127.0.0.1:8789/live",
+    "bench:matrix:motion": "node scripts/bench_matrix_motion_live.mjs",
     "bench:move:sim": "py -3 scripts/bench_random_droplet_move.py",
     "bench:move:real": "node scripts/bench_real_dashboard_move.mjs",
-    "test": "node --check scripts/bench_dashboard_ui.mjs"
+    "test": "node --check scripts/bench_dashboard_ui.mjs && node --check scripts/bench_matrix_motion_live.mjs && node --check scripts/bench_agent_matrix_motion.mjs"
   },
   "keywords": [],
   "author": "",

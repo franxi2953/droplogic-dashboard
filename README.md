@@ -56,7 +56,7 @@ The browser UI runs at:
 http://127.0.0.1:8787
 ```
 
-The WebSocket API runs on `8788`.
+The main WebSocket API runs on `8788`. Live frame and scene updates use a dedicated WebSocket on `8789` so matrix and streamer rendering can keep moving while the main socket is busy with agent or tool traffic.
 
 By default the Dashboard does not load real hardware until you press **Start MCP** and explicitly call tools such as `load_system`.
 
@@ -98,14 +98,19 @@ Dashboard contributes only the extra `cockpit-mode.md`/dashboard-mode context. B
 DropLogic/droplogic/mcp/context/boxmini/
 ```
 
-Frame polling is faster than state polling by default:
+Live polling is split by cadence so state refreshes, matrix scene snapshots, and streamer frames do not block each other. By default, the state loop is slower than the visual loops:
 
 ```json
 {
   "live_frame_interval_seconds": 0.33,
+  "live_streamer_interval_seconds": 0.12,
   "live_state_interval_seconds": 1.0
 }
 ```
+
+Large live matrix scenes are compacted before broadcast. When a plan timeline is heavy, Dashboard sends sampled compact frames around the first frames, final frames, and current execution focus; the full run record remains on disk.
+
+Live frame and scene payloads carry dashboard sequence metadata. The browser keeps the newest payload per channel, resets freshness on live WebSocket reconnect, and ignores older matrix scenes from stale sessions.
 
 ## AI Provider
 
@@ -207,7 +212,11 @@ runs/<run_id>/
 
 `events.jsonl` is the source of truth for the UI. Agent prose is treated as narration; hardware state should be refreshed through MCP tools before acting.
 
+Timeline plan/execution overlays focus on the active plan window. A successful `clear_droplet_state(reset_executor=true)` that leaves an empty plan is treated as a boundary for later plan and execution markers.
+
 Timeline photo markers and hover previews use saved image records from event results, content, and model attachments. Recorded `artifact`/`artifacts`, `artifact_ref`/`artifact_refs`, and `capture`/`captures` metadata can be previewed or revealed; requested `output_path` values in tool arguments are not treated as saved files on their own.
+
+For `start_melting_curve_capture`, Dashboard watches the returned capture metadata and records `melting_curve_capture_photo` events as images appear, so those photos can show up in the same timeline preview path.
 
 Run-local artifacts are served from the selected run directory. External capture files are served only when the file was recorded in `events.jsonl` and lives under `DROPLOGIC_CAPTURE_ROOT` or `%USERPROFILE%\Documents\DropLogic\captures`. If capture tools save photos somewhere else, set the capture root before launching Dashboard:
 
@@ -219,12 +228,18 @@ $env:DROPLOGIC_CAPTURE_ROOT="C:\path\to\captures"
 
 Dashboard tracks the size of every model request and compacts old context aggressively:
 
+- the default AI context target is `60000` characters, and active tool outputs are trimmed to `6000` characters for model requests;
 - old state snapshots are pruned from model context when newer snapshots exist;
 - large tool outputs are replaced with compact summaries for the model while full logs stay on disk;
 - visualizer images are attached once, then degraded to artifact references;
+- repeated live polling/streaming errors are summarized for the model while full events stay in `events.jsonl`;
 - persistent context checkpoints keep old conversations reloadable without replaying huge logs.
 
 This is especially important for BoxMini runs, where matrix state and visualizer data can otherwise explode a provider request.
+
+## Benchmarks
+
+Dashboard performance benchmarks are documented in [benchmarks/README.md](benchmarks/README.md), including the live WebSocket feed check, synthetic live matrix motion, and agent-driven matrix motion scripts.
 
 ## Configuration
 
@@ -243,6 +258,8 @@ $env:DROPLOGIC_REPO="C:\path\to\DropLogic"
 ## Safety Note
 
 Dashboard can control real hardware through DropLogic MCP. Treat every hardware action as live unless the MCP session is explicitly in simulation/debug mode. The UI records tool results, but it does not replace physical inspection or protocol-specific validation.
+
+Before running hardware-sensitive MCP tools from the agent, dashboard UI, or proxy, Dashboard checks MCP runtime health and refuses the tool call if the runtime reports unhealthy queue workers. Guarded calls include stage, camera, light, matrix, execution, temperature, and melting-capture tools; `calibration_stage_jog(stop_all=true)` remains available as a stop path.
 
 ## License
 

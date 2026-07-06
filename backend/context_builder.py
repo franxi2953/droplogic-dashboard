@@ -8,10 +8,10 @@ from typing import Any
 
 
 DEFAULT_MAX_CONTEXT_CHARS = 800_000
-DEFAULT_TARGET_CONTEXT_CHARS = 90_000
+DEFAULT_TARGET_CONTEXT_CHARS = 60_000
 DEFAULT_LARGE_EVENT_CHARS = 8_000
 DEFAULT_RECENT_EVENT_TARGET = 120
-DEFAULT_TOOL_OUTPUT_CHARS = 12_000
+DEFAULT_TOOL_OUTPUT_CHARS = 6_000
 FORCED_EVENT_SUMMARY_CHARS = 1_500
 MAX_STRING_CHARS = 2_000
 MAX_COLLECTION_ITEMS = 12
@@ -37,6 +37,11 @@ STATE_SNAPSHOT_TOOLS = {
 STATE_SNAPSHOT_KEEP_RECENT = 1
 RECENT_TOOL_EVENT_KEEP = 12
 RECENT_TOOL_EVENT_ALWAYS_KEEP = 4
+NOISY_LIVE_EVENT_TYPES = {
+    "live_poll_error",
+    "live_scene_error",
+    "live_stream_error",
+}
 
 
 @dataclass
@@ -56,6 +61,7 @@ def build_model_context(
     ai_summary: str | None = None,
     protect_latest_tool_result: bool = True,
 ) -> ModelContext:
+    events = compact_repeated_noisy_live_events(events)
     before_chars = encoded_json_length(events)
     target_chars = normalize_target_chars(target_chars, max_chars)
     stale_state_indices = stale_state_snapshot_indices(events)
@@ -164,6 +170,53 @@ def build_model_context(
         "max_context_chars": max_chars,
     }
     return ModelContext(events=model_events, compacted=compacted, details=details)
+
+
+def compact_repeated_noisy_live_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    counts: dict[tuple[str, str], int] = {}
+    first_event: dict[tuple[str, str], dict[str, Any]] = {}
+    last_event: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in events:
+        event_type = str(event.get("type") or "")
+        if event_type not in NOISY_LIVE_EVENT_TYPES:
+            compacted.append(event)
+            continue
+        message = str(event.get("message") or event.get("error") or "")
+        key = (event_type, message)
+        counts[key] = counts.get(key, 0) + 1
+        first_event.setdefault(key, event)
+        last_event[key] = event
+    if not counts:
+        return events
+    for key, count in sorted(counts.items()):
+        event_type, message = key
+        first = first_event[key]
+        last = last_event[key]
+        compacted.append(
+            {
+                "type": "compacted_live_error",
+                "source_event_type": event_type,
+                "level": "warning",
+                "message": message,
+                "count": count,
+                "t": last.get("t") or first.get("t"),
+                "ts": last.get("ts") or first.get("ts"),
+                "first_t": first.get("t"),
+                "first_ts": first.get("ts"),
+                "last_t": last.get("t"),
+                "last_ts": last.get("ts"),
+                "note": "Repeated live-dashboard errors were compacted for model context only; full events remain in events.jsonl.",
+            }
+        )
+    return sorted(compacted, key=event_sort_time)
+
+
+def event_sort_time(event: dict[str, Any]) -> float:
+    try:
+        return float(event.get("t") or event.get("last_t") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def normalize_target_chars(target_chars: int | None, max_chars: int) -> int:

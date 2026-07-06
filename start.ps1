@@ -18,7 +18,7 @@ function Stop-ProcessTree {
 }
 
 if (-not $Proxy) {
-    $owners = Get-NetTCPConnection -LocalPort 8787,8788 -ErrorAction SilentlyContinue |
+    $owners = Get-NetTCPConnection -LocalPort 8787,8788,8789 -ErrorAction SilentlyContinue |
         Select-Object -ExpandProperty OwningProcess -Unique |
         Where-Object { $_ -and $_ -ne 0 }
     foreach ($owner in $owners) {

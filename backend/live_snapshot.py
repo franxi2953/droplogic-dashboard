@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback as traceback_module
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,17 +12,30 @@ from .config import DROPLOGIC_ROOT
 from .tool_payloads import compact_tool_payload
 
 
+LIVE_TIMELINE_FRAME_SAMPLE_LIMIT = 160
+LIVE_TIMELINE_FRAME_FOCUS_WINDOW = 24
+LIVE_TIMELINE_EDGE_FRAME_COUNT = 4
+LIVE_SCENE_SESSION_FALLBACK_MAX_AGE_SECONDS = 5.0
+
+
 class LiveSnapshotMixin:
     def ensure_live_polling(self) -> None:
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self.live_poll_loop())
         if getattr(self, "_stream_task", None) is None or self._stream_task.done():
             self._stream_task = asyncio.create_task(self.streamer_frame_loop())
+        if getattr(self, "_scene_task", None) is None or self._scene_task.done():
+            self._scene_task = asyncio.create_task(self.scene_snapshot_loop())
 
     async def stop_live_polling(self) -> None:
-        tasks = [self._poll_task, getattr(self, "_stream_task", None)]
+        tasks = [
+            self._poll_task,
+            getattr(self, "_stream_task", None),
+            getattr(self, "_scene_task", None),
+        ]
         self._poll_task = None
         self._stream_task = None
+        self._scene_task = None
         for task in tasks:
             if task is None or task.done():
                 continue
@@ -47,12 +61,13 @@ class LiveSnapshotMixin:
                 )
                 if include_state:
                     last_state_poll = now
+                live = self.merge_newer_live_frames(live, self.live or {})
                 self.live = live
                 if include_state:
                     await self.record_live_temperature_sample(live)
-                await self.broadcast_json({"type": "live", "live": live})
+                await self.broadcast_live_json({"type": "live", "live": live})
             except Exception as exc:
-                await self.record("live_poll_error", level="warning", message=str(exc))
+                await self.record_live_loop_error("live_poll_error", exc)
             await asyncio.sleep(max(0.05, self.config.live_frame_interval_seconds))
 
     async def streamer_frame_loop(self) -> None:
@@ -64,19 +79,99 @@ class LiveSnapshotMixin:
                     continue
                 frame = await self.collect_streamer_frame()
                 self.live = self.merge_live_frame(self.live or {}, "streamer", frame)
-                await self.broadcast_json(
+                await self.broadcast_live_json(
                     {
                         "type": "live_frame",
                         "visualizer": "streamer",
                         "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "sequence": live_frame_sequence(frame),
                         "frame": frame,
                     }
                 )
             except Exception as exc:
-                await self.record("live_stream_error", level="warning", message=str(exc))
+                await self.record_live_loop_error("live_stream_error", exc)
             elapsed = time.monotonic() - started
             interval = max(0.05, float(getattr(self.config, "live_streamer_interval_seconds", 0.12)))
             await asyncio.sleep(max(0.01, interval - elapsed))
+
+    async def scene_snapshot_loop(self) -> None:
+        last_key = ""
+        loop_started_at = time.time()
+        self._scene_snapshot_loop_started_at = loop_started_at
+        while self.mcp.running:
+            started = time.monotonic()
+            try:
+                runtime = self.live.get("runtime") if isinstance(self.live, dict) else None
+                runtime_session_id = live_runtime_session_id(runtime)
+                scene = await self.read_dashboard_scene_snapshot_async(runtime_session_id=runtime_session_id)
+                if (
+                    runtime_session_id
+                    and isinstance(scene, dict)
+                    and scene.get("reason") == "scene_session_mismatch"
+                ):
+                    fresh_scene = await self.read_dashboard_scene_snapshot_async(runtime_session_id=None)
+                    state_interval = number_or_none(getattr(self.config, "live_state_interval_seconds", 1.0))
+                    max_age = max(
+                        LIVE_SCENE_SESSION_FALLBACK_MAX_AGE_SECONDS,
+                        4.0 * max(0.0, state_interval if state_interval is not None else 1.0),
+                    )
+                    if scene_session_mismatch_fallback_is_fresh(
+                        fresh_scene,
+                        runtime=runtime,
+                        runtime_session_id=runtime_session_id,
+                        loop_started_at=loop_started_at,
+                        max_age_seconds=max_age,
+                    ):
+                        fresh_scene = dict(fresh_scene)
+                        fresh_scene["dashboard_live_session_fallback"] = True
+                        scene = fresh_scene
+                if isinstance(scene, dict) and scene.get("available"):
+                    key = scene_snapshot_key(scene)
+                    if key and key != last_key:
+                        last_key = key
+                        scene = self.compact_live_scene(self.annotate_live_scene(scene))
+                        self.live = self.merge_live_scene(self.live or {}, scene)
+                        await self.broadcast_live_json(
+                            {
+                                "type": "live_scene",
+                                "updated_at": datetime.now(timezone.utc).isoformat(),
+                                "sequence": live_scene_sequence(scene),
+                                "runtime": self.live.get("runtime"),
+                                "scene": scene,
+                            }
+                        )
+            except Exception as exc:
+                await self.record_live_loop_error("live_scene_error", exc)
+            elapsed = time.monotonic() - started
+            interval = max(0.05, float(getattr(self.config, "live_streamer_interval_seconds", 0.12)))
+            await asyncio.sleep(max(0.01, interval - elapsed))
+
+    async def record_live_loop_error(self, event_type: str, exc: Exception) -> None:
+        message = str(exc)
+        now = time.monotonic()
+        states = getattr(self, "_live_loop_error_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._live_loop_error_states = states
+        key = (event_type, message)
+        state = states.get(key) or {"count": 0, "last_emit": 0.0, "emitted": False}
+        state["count"] = int(state.get("count") or 0) + 1
+        elapsed = now - float(state.get("last_emit") or 0.0)
+        if not state.get("emitted") or elapsed >= 10.0:
+            suppressed = max(0, state["count"] - 1)
+            await self.record(
+                event_type,
+                level="warning",
+                message=message,
+                suppressed_repeats=suppressed,
+                error_traceback="".join(
+                    traceback_module.format_exception(type(exc), exc, exc.__traceback__, limit=8)
+                ),
+            )
+            state["count"] = 0
+            state["last_emit"] = now
+            state["emitted"] = True
+        states[key] = state
 
     async def collect_live_snapshot(
         self,
@@ -90,7 +185,13 @@ class LiveSnapshotMixin:
         visualizer_status = previous.get("visualizers")
         if include_state:
             runtime_result = await self.safe_tool("runtime_status", timeout_seconds=3.0)
+            runtime_captured_ts = time.time()
+            runtime_captured_at = datetime.now(timezone.utc).isoformat()
             runtime = compact_tool_payload(runtime_result)
+            if isinstance(runtime, dict):
+                runtime = dict(runtime)
+                runtime["dashboard_live_captured_at"] = runtime_captured_at
+                runtime["dashboard_live_captured_ts"] = runtime_captured_ts
             if not runtime_result.get("ok"):
                 return {
                     **previous,
@@ -108,6 +209,7 @@ class LiveSnapshotMixin:
             prefer_file=prefer_scene_file,
             runtime=runtime,
         )
+        scene = self.compact_live_scene(scene)
 
         streamer_options = getattr(self, "streamer_frame_options", {}) or {}
         streamer_full_resolution = bool(streamer_options.get("full_resolution"))
@@ -118,23 +220,26 @@ class LiveSnapshotMixin:
         streamer_frame = None
         if not direct_stream_available:
             if include_streamer_frame:
-                streamer_frame = await self.safe_frame(
+                streamer_frame = self.annotate_live_frame("streamer", await self.safe_frame(
                     "streamer",
                     "snapshot",
                     max_width=streamer_max_width,
                     max_height=streamer_max_height,
                     image_quality=72,
-                )
+                ))
             else:
                 streamer_frame = previous_frames.get("streamer")
         matrix_frame = previous_frames.get("matrix")
         if not (isinstance(scene, dict) and scene.get("available")):
-            matrix_frame = await self.safe_frame("matrix", "snapshot", max_width=520, max_height=360)
+            matrix_frame = self.annotate_live_frame(
+                "matrix",
+                await self.safe_frame("matrix", "snapshot", max_width=520, max_height=360),
+            )
         frames = {
             "matrix": matrix_frame,
             "streamer": streamer_frame,
         }
-        return {
+        snapshot = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "runtime": runtime,
             "state": state,
@@ -142,19 +247,20 @@ class LiveSnapshotMixin:
             "scene": scene,
             "frames": frames,
         }
+        return self.merge_newer_live_frames(snapshot, self.live or {})
 
     async def collect_streamer_frame(self) -> dict[str, Any]:
         streamer_options = getattr(self, "streamer_frame_options", {}) or {}
         streamer_full_resolution = bool(streamer_options.get("full_resolution"))
         streamer_max_width = None if streamer_full_resolution else int(streamer_options.get("max_width") or 720)
         streamer_max_height = None if streamer_full_resolution else int(streamer_options.get("max_height") or 460)
-        return await self.safe_frame(
+        return self.annotate_live_frame("streamer", await self.safe_frame(
             "streamer",
             "snapshot",
             max_width=streamer_max_width,
             max_height=streamer_max_height,
             image_quality=72,
-        )
+        ))
 
     @staticmethod
     def merge_live_frame(live: dict[str, Any], visualizer: str, frame: dict[str, Any]) -> dict[str, Any]:
@@ -164,6 +270,130 @@ class LiveSnapshotMixin:
         next_live["frames"] = frames
         next_live["updated_at"] = datetime.now(timezone.utc).isoformat()
         return next_live
+
+    def merge_live_scene(self, live: dict[str, Any], scene: dict[str, Any]) -> dict[str, Any]:
+        next_live = dict(live or {})
+        compact_scene = self.compact_live_scene(scene)
+        next_live["scene"] = compact_scene
+        runtime = runtime_with_scene_session(next_live.get("runtime"), compact_scene)
+        if runtime is not None:
+            next_live["runtime"] = runtime
+        next_live["updated_at"] = datetime.now(timezone.utc).isoformat()
+        return next_live
+
+    def next_live_sequence(self, channel: str) -> int:
+        sequences = getattr(self, "_live_frame_sequences", None)
+        if not isinstance(sequences, dict):
+            sequences = {}
+            self._live_frame_sequences = sequences
+        next_value = int(sequences.get(channel, 0)) + 1
+        sequences[channel] = next_value
+        return next_value
+
+    def annotate_live_frame(self, visualizer: str, frame: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(frame, dict):
+            return frame
+        sequence = self.next_live_sequence(f"frame:{visualizer}")
+        captured_at = datetime.now(timezone.utc).isoformat()
+        annotated = dict(frame)
+        metadata = {
+            "visualizer": visualizer,
+            "sequence": sequence,
+            "captured_at": captured_at,
+            "emitted_at": captured_at,
+        }
+        annotated["dashboard_live"] = metadata
+        annotated["dashboard_live_sequence"] = sequence
+        annotated["dashboard_live_captured_at"] = captured_at
+        annotated["dashboard_live_visualizer"] = visualizer
+        return annotated
+
+    def annotate_live_scene(self, scene: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(scene, dict):
+            return scene
+        sequence = self.next_live_sequence("scene:matrix")
+        captured_at = datetime.now(timezone.utc).isoformat()
+        annotated = dict(scene)
+        session_id = scene_session_id(annotated)
+        if session_id and not annotated.get("session_id"):
+            annotated["session_id"] = session_id
+        annotated["dashboard_live"] = {
+            "visualizer": "matrix",
+            "sequence": sequence,
+            "captured_at": captured_at,
+            "emitted_at": captured_at,
+        }
+        annotated["dashboard_live_sequence"] = sequence
+        annotated["dashboard_live_captured_at"] = captured_at
+        return annotated
+
+    def merge_newer_live_frames(self, incoming: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(incoming, dict):
+            return incoming
+        incoming_frames = incoming.get("frames") if isinstance(incoming.get("frames"), dict) else {}
+        current_frames = current.get("frames") if isinstance(current.get("frames"), dict) else {}
+        if not incoming_frames or not current_frames:
+            return incoming
+        merged = dict(incoming_frames)
+        for visualizer, current_frame in current_frames.items():
+            incoming_frame = merged.get(visualizer)
+            if incoming_frame is None:
+                merged[visualizer] = current_frame
+                continue
+            if live_frame_is_newer(current_frame, incoming_frame):
+                merged[visualizer] = current_frame
+        next_live = dict(incoming)
+        next_live["frames"] = merged
+        return next_live
+
+    def compact_live_scene(self, scene: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(scene, dict):
+            return scene
+        timeline = scene.get("timeline")
+        if not isinstance(timeline, dict):
+            return scene
+        frames = timeline.get("frames")
+        if not isinstance(frames, list) or not frames:
+            return scene
+        heavy = len(frames) > 80 or len(json.dumps(frames, ensure_ascii=True)) > 160_000
+        if not heavy:
+            return scene
+        indexed_frames = live_timeline_indexed_frames(frames)
+        focused_frame = live_timeline_focus_frame(scene)
+        frame_indices = live_timeline_sample_indices(
+            indexed_frames,
+            focused_frame=focused_frame,
+            limit=LIVE_TIMELINE_FRAME_SAMPLE_LIMIT,
+            focus_window=LIVE_TIMELINE_FRAME_FOCUS_WINDOW,
+        )
+        frame_lookup = {index: frame for index, frame in indexed_frames}
+        compact_frames = [
+            compact_live_timeline_frame(frame_lookup[index], fallback_index=index)
+            for index in frame_indices
+            if index in frame_lookup
+        ]
+        compact_timeline = dict(timeline)
+        compact_timeline["frames"] = compact_frames
+        compact_timeline["frames_compact"] = True
+        compact_timeline["live_frames_compacted"] = True
+        compact_timeline["live_frames_sampled"] = len(compact_frames) < len(indexed_frames)
+        compact_timeline["live_frame_count"] = len(indexed_frames)
+        compact_timeline["live_frames_sent"] = len(compact_frames)
+        compact_timeline["live_frames_omitted"] = max(0, len(indexed_frames) - len(compact_frames))
+        compact_timeline["live_frame_sample_limit"] = LIVE_TIMELINE_FRAME_SAMPLE_LIMIT
+        compact_timeline["live_frame_focus"] = focused_frame
+        compact_timeline["live_frame_lookup"] = "exact_index"
+        if focused_frame is not None:
+            compact_timeline["live_frame_focus_window"] = [
+                max(0, focused_frame - LIVE_TIMELINE_FRAME_FOCUS_WINDOW),
+                focused_frame + LIVE_TIMELINE_FRAME_FOCUS_WINDOW,
+            ]
+        compact_timeline["live_omitted_frame_details"] = True
+        compact_timeline["encoding"] = "sampled_compact_frame_index"
+        compact_timeline["detailed_frame_limit"] = min(int(timeline.get("detailed_frame_limit") or 0) or 80, 80)
+        compact_scene = dict(scene)
+        compact_scene["timeline"] = compact_timeline
+        return compact_scene
 
     async def record_live_temperature_sample(self, live: dict[str, Any]) -> None:
         state = unwrap_live_state(live.get("state"))
@@ -251,7 +481,7 @@ class LiveSnapshotMixin:
                 "session_id": runtime_session_id,
             }
         if prefer_file:
-            fallback = self.read_dashboard_scene_snapshot(runtime_session_id=runtime_session_id)
+            fallback = await self.read_dashboard_scene_snapshot_async(runtime_session_id=runtime_session_id)
             if fallback.get("available"):
                 return fallback
         result = await self.safe_tool(
@@ -278,11 +508,20 @@ class LiveSnapshotMixin:
                 scene = self.attach_cartridge_metadata(scene)
                 scene["transport"] = "dashboard_scene_tool"
                 return scene
-        fallback = self.read_dashboard_scene_snapshot(runtime_session_id=runtime_session_id)
+        fallback = await self.read_dashboard_scene_snapshot_async(runtime_session_id=runtime_session_id)
         if fallback is scene:
             fallback = dict(fallback)
         fallback["tool_error"] = scene if isinstance(scene, dict) else result
         return fallback
+
+    async def read_dashboard_scene_snapshot_async(
+        self,
+        runtime_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.read_dashboard_scene_snapshot,
+            runtime_session_id=runtime_session_id,
+        )
 
     def read_dashboard_scene_snapshot(
         self,
@@ -294,9 +533,25 @@ class LiveSnapshotMixin:
         scene_path = Path(path)
         if not scene_path.is_file():
             return {"available": False, "reason": "scene_snapshot_not_ready"}
+        last_error: Exception | None = None
+        scene: Any = None
+        snapshot_stat = None
+        for attempt in range(4):
+            try:
+                snapshot_stat = scene_path.stat()
+                with scene_path.open("r", encoding="utf-8") as handle:
+                    scene = json.load(handle)
+                last_error = None
+                break
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                time.sleep(0.03 * (attempt + 1))
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.03 * (attempt + 1))
+        if last_error is not None:
+            return {"available": False, "reason": "scene_snapshot_read_error", "error": str(last_error)}
         try:
-            with scene_path.open("r", encoding="utf-8") as handle:
-                scene = json.load(handle)
             if not isinstance(scene, dict):
                 return {"available": False, "reason": "scene_snapshot_invalid"}
             snapshot_session_id = scene_session_id(scene)
@@ -309,6 +564,9 @@ class LiveSnapshotMixin:
                 }
             if runtime_session_id and not scene.get("session_id"):
                 scene["session_id"] = runtime_session_id
+            if snapshot_stat is not None:
+                scene["dashboard_snapshot_mtime"] = snapshot_stat.st_mtime
+                scene["dashboard_snapshot_mtime_ns"] = snapshot_stat.st_mtime_ns
             if not scene.get("coordinate_mapping"):
                 mapping = self.dashboard_coordinate_mapping()
                 if mapping:
@@ -467,6 +725,149 @@ def unwrap_live_state(payload: Any) -> Any:
     return next((root for root in roots if isinstance(root, dict)), payload)
 
 
+def live_frame_sequence(frame: Any) -> int | None:
+    if not isinstance(frame, dict):
+        return None
+    roots = [
+        frame,
+        frame.get("dashboard_live"),
+        frame.get("result") if isinstance(frame.get("result"), dict) else None,
+    ]
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        value = root.get("dashboard_live_sequence") or root.get("sequence")
+        try:
+            sequence = int(value)
+        except (TypeError, ValueError):
+            continue
+        return sequence
+    return None
+
+
+def live_scene_sequence(scene: Any) -> int | None:
+    return live_frame_sequence(scene)
+
+
+def live_frame_captured_at(frame: Any) -> str:
+    if not isinstance(frame, dict):
+        return ""
+    roots = [
+        frame,
+        frame.get("dashboard_live"),
+        frame.get("result") if isinstance(frame.get("result"), dict) else None,
+    ]
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        value = root.get("dashboard_live_captured_at") or root.get("captured_at") or root.get("updated_at")
+        if value:
+            return str(value)
+    return ""
+
+
+def live_frame_is_newer(candidate: Any, baseline: Any) -> bool:
+    candidate_sequence = live_frame_sequence(candidate)
+    baseline_sequence = live_frame_sequence(baseline)
+    if candidate_sequence is not None and baseline_sequence is not None:
+        return candidate_sequence > baseline_sequence
+    if candidate_sequence is not None and baseline_sequence is None:
+        return True
+    if candidate_sequence is None and baseline_sequence is not None:
+        return False
+    candidate_time = live_frame_captured_at(candidate)
+    baseline_time = live_frame_captured_at(baseline)
+    return bool(candidate_time and baseline_time and candidate_time > baseline_time)
+
+
+def live_timeline_indexed_frames(frames: list[Any]) -> list[tuple[int, dict[str, Any]]]:
+    indexed: dict[int, dict[str, Any]] = {}
+    for position, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            continue
+        explicit_index = number_or_none(frame.get("index"))
+        index = int(explicit_index) if explicit_index is not None and explicit_index >= 0 else position
+        indexed[index] = frame
+    return sorted(indexed.items(), key=lambda item: item[0])
+
+
+def live_timeline_focus_frame(scene: Any) -> int | None:
+    if not isinstance(scene, dict):
+        return None
+    current_frame = number_or_none(get_path(scene, "executor.current_frame"))
+    focus = first_number(
+        get_path(scene, "frame.index"),
+        get_path(scene, "executor.last_applied_frame.index"),
+        get_path(scene, "executor.last_frame.index"),
+        current_frame - 1 if current_frame is not None else None,
+    )
+    if focus is None or focus < 0:
+        return None
+    return int(focus)
+
+
+def live_timeline_sample_indices(
+    indexed_frames: list[tuple[int, dict[str, Any]]],
+    focused_frame: int | None,
+    limit: int,
+    focus_window: int,
+) -> list[int]:
+    if limit <= 0:
+        return []
+    indices = [index for index, _frame in indexed_frames]
+    if len(indices) <= limit:
+        return indices
+    keep: set[int] = set(indices[:LIVE_TIMELINE_EDGE_FRAME_COUNT])
+    keep.update(indices[-LIVE_TIMELINE_EDGE_FRAME_COUNT:])
+    if focused_frame is not None:
+        start = max(0, focused_frame - max(0, focus_window))
+        end = focused_frame + max(0, focus_window)
+        keep.update(index for index in indices if start <= index <= end)
+    remaining = max(0, limit - len(keep))
+    if remaining > 0:
+        step = max(1, (len(indices) + remaining - 1) // remaining)
+        keep.update(indices[position] for position in range(0, len(indices), step))
+    if len(keep) <= limit:
+        return sorted(keep)
+    prioritized = []
+    if focused_frame is not None:
+        prioritized.extend(sorted(keep, key=lambda index: (abs(index - focused_frame), index))[:limit])
+    if len(prioritized) < limit:
+        for index in sorted(keep):
+            if index in prioritized:
+                continue
+            prioritized.append(index)
+            if len(prioritized) >= limit:
+                break
+    return sorted(prioritized[:limit])
+
+
+def compact_live_timeline_frame(frame: dict[str, Any], fallback_index: int) -> dict[str, Any]:
+    explicit_index = number_or_none(frame.get("index"))
+    active_droplet_ids = frame.get("active_droplet_ids") if isinstance(frame.get("active_droplet_ids"), list) else []
+    compact: dict[str, Any] = {
+        "index": int(explicit_index) if explicit_index is not None and explicit_index >= 0 else fallback_index,
+        "event_id": frame.get("event_id"),
+        "event_type": frame.get("event_type"),
+        "active_droplet_ids": active_droplet_ids,
+    }
+    summary = compact_live_timeline_summary(frame.get("summary"), active_droplet_ids)
+    if summary:
+        compact["summary"] = summary
+    return compact
+
+
+def compact_live_timeline_summary(summary: Any, active_droplet_ids: list[Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    if isinstance(summary, dict):
+        for key in ("active_count", "active_mask_sha256", "matrix_values_sha256"):
+            if key in summary:
+                compact[key] = summary.get(key)
+    if "active_count" not in compact and active_droplet_ids:
+        compact["active_count"] = len(active_droplet_ids)
+    return compact
+
+
 def attach_matrix_voltage_status(state_payload: Any, voltage_status: Any) -> Any:
     if not isinstance(state_payload, dict):
         return state_payload
@@ -561,6 +962,61 @@ def streamer_direct_stream_available(payload: Any) -> bool:
     return False
 
 
+def scene_snapshot_key(scene: Any) -> str:
+    if not isinstance(scene, dict):
+        return ""
+    frame = scene.get("frame") if isinstance(scene.get("frame"), dict) else {}
+    summary = frame.get("summary") if isinstance(frame.get("summary"), dict) else {}
+    executor = scene.get("executor") if isinstance(scene.get("executor"), dict) else {}
+    return ":".join(
+        str(item)
+        for item in (
+            scene.get("session_id"),
+            frame.get("source"),
+            frame.get("index"),
+            frame.get("count"),
+            summary.get("active_mask_sha256"),
+            summary.get("matrix_values_sha256"),
+            executor.get("current_frame"),
+            executor.get("frames_executed"),
+            scene.get("updated_at"),
+        )
+    )
+
+
+def scene_session_mismatch_fallback_is_fresh(
+    scene: Any,
+    *,
+    runtime: Any,
+    runtime_session_id: str,
+    loop_started_at: float | None,
+    max_age_seconds: float = LIVE_SCENE_SESSION_FALLBACK_MAX_AGE_SECONDS,
+    now: float | None = None,
+) -> bool:
+    if not isinstance(scene, dict) or not scene.get("available"):
+        return False
+    if live_runtime_system_loaded(runtime) is False:
+        return False
+    snapshot_session_id = scene_session_id(scene)
+    if not snapshot_session_id or snapshot_session_id == runtime_session_id:
+        return False
+    mtime = number_or_none(scene.get("dashboard_snapshot_mtime"))
+    if mtime is None:
+        return False
+    runtime_captured_at = live_runtime_captured_at(runtime)
+    if runtime_captured_at is not None and mtime < runtime_captured_at - 0.25:
+        return False
+    reference = time.time() if now is None else now
+    if mtime < reference - max(0.1, max_age_seconds):
+        return False
+    if mtime > reference + 1.0:
+        return False
+    started = number_or_none(loop_started_at)
+    if started is not None and mtime < started - 0.001:
+        return False
+    return True
+
+
 def extract_live_temperature(root: Any) -> float | None:
     for candidate_root in live_payload_roots(root):
         value = first_number(
@@ -643,6 +1099,60 @@ def live_runtime_session_id(root: Any) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def live_runtime_captured_at(root: Any) -> float | None:
+    for candidate_root in live_payload_roots(root):
+        value = first_defined(
+            candidate_root.get("dashboard_live_captured_ts"),
+            get_path(candidate_root, "runtime.dashboard_live_captured_ts"),
+            get_path(candidate_root, "result.dashboard_live_captured_ts"),
+            get_path(candidate_root, "structuredContent.result.dashboard_live_captured_ts"),
+        )
+        number = number_or_none(value)
+        if number is not None:
+            return number
+        text_value = first_defined(
+            candidate_root.get("dashboard_live_captured_at"),
+            get_path(candidate_root, "runtime.dashboard_live_captured_at"),
+            get_path(candidate_root, "result.dashboard_live_captured_at"),
+            get_path(candidate_root, "structuredContent.result.dashboard_live_captured_at"),
+        )
+        if text_value:
+            try:
+                parsed = datetime.fromisoformat(str(text_value).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return parsed.timestamp()
+    return None
+
+
+def runtime_with_scene_session(runtime: Any, scene: Any) -> Any:
+    session_id = scene_session_id(scene)
+    if not session_id:
+        return runtime
+    if not isinstance(runtime, dict):
+        return {"session_id": session_id}
+    if live_runtime_session_id(runtime) == session_id:
+        return runtime
+    updated = dict(runtime)
+    updated["session_id"] = session_id
+    for key in ("result", "value"):
+        nested = updated.get(key)
+        if isinstance(nested, dict):
+            nested_copy = dict(nested)
+            nested_copy["session_id"] = session_id
+            updated[key] = nested_copy
+    structured = updated.get("structuredContent")
+    if isinstance(structured, dict):
+        structured_copy = dict(structured)
+        structured_result = structured_copy.get("result")
+        if isinstance(structured_result, dict):
+            structured_result_copy = dict(structured_result)
+            structured_result_copy["session_id"] = session_id
+            structured_copy["result"] = structured_result_copy
+        updated["structuredContent"] = structured_copy
+    return updated
 
 
 def live_runtime_system_loaded(root: Any) -> bool | None:
