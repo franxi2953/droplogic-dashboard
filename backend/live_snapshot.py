@@ -15,6 +15,7 @@ from .tool_payloads import compact_tool_payload
 LIVE_TIMELINE_FRAME_SAMPLE_LIMIT = 160
 LIVE_TIMELINE_FRAME_FOCUS_WINDOW = 24
 LIVE_TIMELINE_EDGE_FRAME_COUNT = 4
+LIVE_SCENE_SESSION_FALLBACK_MAX_AGE_SECONDS = 5.0
 
 
 class LiveSnapshotMixin:
@@ -95,6 +96,8 @@ class LiveSnapshotMixin:
 
     async def scene_snapshot_loop(self) -> None:
         last_key = ""
+        loop_started_at = time.time()
+        self._scene_snapshot_loop_started_at = loop_started_at
         while self.mcp.running:
             started = time.monotonic()
             try:
@@ -106,11 +109,21 @@ class LiveSnapshotMixin:
                     and isinstance(scene, dict)
                     and scene.get("reason") == "scene_session_mismatch"
                 ):
-                    # Runtime polling can lag behind long MCP calls. The scene file is written
-                    # by the executor-side writer, so prefer the newest scene stream over a stale
-                    # runtime session id when keeping the matrix visualizer live.
                     fresh_scene = await self.read_dashboard_scene_snapshot_async(runtime_session_id=None)
-                    if isinstance(fresh_scene, dict) and fresh_scene.get("available"):
+                    state_interval = number_or_none(getattr(self.config, "live_state_interval_seconds", 1.0))
+                    max_age = max(
+                        LIVE_SCENE_SESSION_FALLBACK_MAX_AGE_SECONDS,
+                        4.0 * max(0.0, state_interval if state_interval is not None else 1.0),
+                    )
+                    if scene_session_mismatch_fallback_is_fresh(
+                        fresh_scene,
+                        runtime=runtime,
+                        runtime_session_id=runtime_session_id,
+                        loop_started_at=loop_started_at,
+                        max_age_seconds=max_age,
+                    ):
+                        fresh_scene = dict(fresh_scene)
+                        fresh_scene["dashboard_live_session_fallback"] = True
                         scene = fresh_scene
                 if isinstance(scene, dict) and scene.get("available"):
                     key = scene_snapshot_key(scene)
@@ -172,7 +185,13 @@ class LiveSnapshotMixin:
         visualizer_status = previous.get("visualizers")
         if include_state:
             runtime_result = await self.safe_tool("runtime_status", timeout_seconds=3.0)
+            runtime_captured_ts = time.time()
+            runtime_captured_at = datetime.now(timezone.utc).isoformat()
             runtime = compact_tool_payload(runtime_result)
+            if isinstance(runtime, dict):
+                runtime = dict(runtime)
+                runtime["dashboard_live_captured_at"] = runtime_captured_at
+                runtime["dashboard_live_captured_ts"] = runtime_captured_ts
             if not runtime_result.get("ok"):
                 return {
                     **previous,
@@ -363,6 +382,7 @@ class LiveSnapshotMixin:
         compact_timeline["live_frames_omitted"] = max(0, len(indexed_frames) - len(compact_frames))
         compact_timeline["live_frame_sample_limit"] = LIVE_TIMELINE_FRAME_SAMPLE_LIMIT
         compact_timeline["live_frame_focus"] = focused_frame
+        compact_timeline["live_frame_lookup"] = "exact_index"
         if focused_frame is not None:
             compact_timeline["live_frame_focus_window"] = [
                 max(0, focused_frame - LIVE_TIMELINE_FRAME_FOCUS_WINDOW),
@@ -515,8 +535,10 @@ class LiveSnapshotMixin:
             return {"available": False, "reason": "scene_snapshot_not_ready"}
         last_error: Exception | None = None
         scene: Any = None
+        snapshot_stat = None
         for attempt in range(4):
             try:
+                snapshot_stat = scene_path.stat()
                 with scene_path.open("r", encoding="utf-8") as handle:
                     scene = json.load(handle)
                 last_error = None
@@ -542,6 +564,9 @@ class LiveSnapshotMixin:
                 }
             if runtime_session_id and not scene.get("session_id"):
                 scene["session_id"] = runtime_session_id
+            if snapshot_stat is not None:
+                scene["dashboard_snapshot_mtime"] = snapshot_stat.st_mtime
+                scene["dashboard_snapshot_mtime_ns"] = snapshot_stat.st_mtime_ns
             if not scene.get("coordinate_mapping"):
                 mapping = self.dashboard_coordinate_mapping()
                 if mapping:
@@ -959,6 +984,39 @@ def scene_snapshot_key(scene: Any) -> str:
     )
 
 
+def scene_session_mismatch_fallback_is_fresh(
+    scene: Any,
+    *,
+    runtime: Any,
+    runtime_session_id: str,
+    loop_started_at: float | None,
+    max_age_seconds: float = LIVE_SCENE_SESSION_FALLBACK_MAX_AGE_SECONDS,
+    now: float | None = None,
+) -> bool:
+    if not isinstance(scene, dict) or not scene.get("available"):
+        return False
+    if live_runtime_system_loaded(runtime) is False:
+        return False
+    snapshot_session_id = scene_session_id(scene)
+    if not snapshot_session_id or snapshot_session_id == runtime_session_id:
+        return False
+    mtime = number_or_none(scene.get("dashboard_snapshot_mtime"))
+    if mtime is None:
+        return False
+    runtime_captured_at = live_runtime_captured_at(runtime)
+    if runtime_captured_at is not None and mtime < runtime_captured_at - 0.25:
+        return False
+    reference = time.time() if now is None else now
+    if mtime < reference - max(0.1, max_age_seconds):
+        return False
+    if mtime > reference + 1.0:
+        return False
+    started = number_or_none(loop_started_at)
+    if started is not None and mtime < started - 0.001:
+        return False
+    return True
+
+
 def extract_live_temperature(root: Any) -> float | None:
     for candidate_root in live_payload_roots(root):
         value = first_number(
@@ -1040,6 +1098,32 @@ def live_runtime_session_id(root: Any) -> str | None:
         )
         if value:
             return str(value)
+    return None
+
+
+def live_runtime_captured_at(root: Any) -> float | None:
+    for candidate_root in live_payload_roots(root):
+        value = first_defined(
+            candidate_root.get("dashboard_live_captured_ts"),
+            get_path(candidate_root, "runtime.dashboard_live_captured_ts"),
+            get_path(candidate_root, "result.dashboard_live_captured_ts"),
+            get_path(candidate_root, "structuredContent.result.dashboard_live_captured_ts"),
+        )
+        number = number_or_none(value)
+        if number is not None:
+            return number
+        text_value = first_defined(
+            candidate_root.get("dashboard_live_captured_at"),
+            get_path(candidate_root, "runtime.dashboard_live_captured_at"),
+            get_path(candidate_root, "result.dashboard_live_captured_at"),
+            get_path(candidate_root, "structuredContent.result.dashboard_live_captured_at"),
+        )
+        if text_value:
+            try:
+                parsed = datetime.fromisoformat(str(text_value).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            return parsed.timestamp()
     return None
 
 

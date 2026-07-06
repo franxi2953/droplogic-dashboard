@@ -6036,9 +6036,24 @@ function matrixSceneAtFrame(scene, frameIndex) {
 }
 
 function timelineFrame(scene, frameIndex) {
-  const frames = effectiveTimeline(scene)?.frames;
+  const timeline = effectiveTimeline(scene);
+  const frames = timeline?.frames;
   if (!Array.isArray(frames)) return null;
-  return frames.find((frame) => Number(frame?.index) === Number(frameIndex)) || frames[frameIndex] || null;
+  const exactFrame = frames.find((frame) => Number(frame?.index) === Number(frameIndex));
+  if (exactFrame) return exactFrame;
+  if (timelineFramesRequireExactIndex(timeline, frames)) return null;
+  return frames[frameIndex] || null;
+}
+
+function timelineFramesRequireExactIndex(timeline, frames = timeline?.frames) {
+  return Boolean(
+    timeline?.live_frame_lookup === "exact_index"
+    || timeline?.encoding === "sampled_compact_frame_index"
+    || timeline?.frames_compact
+    || timeline?.live_frames_compacted
+    || timeline?.live_frames_sampled
+    || Number(timeline?.live_frame_count || 0) > (Array.isArray(frames) ? frames.length : 0)
+  );
 }
 
 function timelineEventAtFrame(scene, frameIndex) {

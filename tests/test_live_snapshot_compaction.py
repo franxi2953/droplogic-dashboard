@@ -5,7 +5,11 @@ import types
 import unittest
 
 sys.modules.setdefault("httpx", types.ModuleType("httpx"))
-from backend.live_snapshot import LIVE_TIMELINE_FRAME_SAMPLE_LIMIT, LiveSnapshotMixin
+from backend.live_snapshot import (
+    LIVE_TIMELINE_FRAME_SAMPLE_LIMIT,
+    LiveSnapshotMixin,
+    scene_session_mismatch_fallback_is_fresh,
+)
 
 
 class FakeLiveSnapshot(LiveSnapshotMixin):
@@ -53,6 +57,7 @@ class LiveSceneCompactionTests(unittest.TestCase):
         self.assertEqual(timeline["live_frames_sent"], len(compact_frames))
         self.assertEqual(timeline["live_frames_omitted"], len(frames) - len(compact_frames))
         self.assertEqual(timeline["encoding"], "sampled_compact_frame_index")
+        self.assertEqual(timeline["live_frame_lookup"], "exact_index")
         self.assertIn(0, indices)
         self.assertIn(250, indices)
         self.assertIn(499, indices)
@@ -70,6 +75,88 @@ class LiveSceneCompactionTests(unittest.TestCase):
         }
 
         self.assertIs(FakeLiveSnapshot().compact_live_scene(scene), scene)
+
+
+class SceneSessionFallbackTests(unittest.TestCase):
+    def test_session_mismatch_fallback_requires_fresh_snapshot(self) -> None:
+        scene = {
+            "available": True,
+            "session_id": "next-session",
+            "dashboard_snapshot_mtime": 1000.0,
+        }
+
+        self.assertTrue(
+            scene_session_mismatch_fallback_is_fresh(
+                scene,
+                runtime={
+                    "session_id": "old-session",
+                    "system": {"loaded": True},
+                    "dashboard_live_captured_ts": 999.5,
+                },
+                runtime_session_id="old-session",
+                loop_started_at=999.0,
+                max_age_seconds=5.0,
+                now=1001.0,
+            )
+        )
+
+    def test_session_mismatch_fallback_rejects_stale_snapshot(self) -> None:
+        scene = {
+            "available": True,
+            "session_id": "previous-session",
+            "dashboard_snapshot_mtime": 990.0,
+        }
+
+        self.assertFalse(
+            scene_session_mismatch_fallback_is_fresh(
+                scene,
+                runtime={"session_id": "active-session", "system": {"loaded": True}},
+                runtime_session_id="active-session",
+                loop_started_at=995.0,
+                max_age_seconds=5.0,
+                now=1001.0,
+            )
+        )
+
+    def test_session_mismatch_fallback_rejects_snapshot_older_than_runtime_poll(self) -> None:
+        scene = {
+            "available": True,
+            "session_id": "previous-session",
+            "dashboard_snapshot_mtime": 1000.0,
+        }
+
+        self.assertFalse(
+            scene_session_mismatch_fallback_is_fresh(
+                scene,
+                runtime={
+                    "session_id": "active-session",
+                    "system": {"loaded": True},
+                    "dashboard_live_captured_ts": 1000.5,
+                },
+                runtime_session_id="active-session",
+                loop_started_at=999.0,
+                max_age_seconds=5.0,
+                now=1001.0,
+            )
+        )
+
+    def test_session_mismatch_fallback_rejects_no_system_runtime(self) -> None:
+        scene = {
+            "available": True,
+            "session_id": "next-session",
+            "dashboard_snapshot_mtime": 1000.0,
+        }
+
+        self.assertFalse(
+            scene_session_mismatch_fallback_is_fresh(
+                scene,
+                runtime={"session_id": "old-session", "system": {"loaded": False}},
+                runtime_session_id="old-session",
+                loop_started_at=999.0,
+                max_age_seconds=5.0,
+                now=1001.0,
+            )
+        )
 
 
 if __name__ == "__main__":
