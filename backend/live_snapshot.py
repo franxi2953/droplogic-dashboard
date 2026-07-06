@@ -95,7 +95,7 @@ class LiveSnapshotMixin:
             try:
                 runtime = self.live.get("runtime") if isinstance(self.live, dict) else None
                 runtime_session_id = live_runtime_session_id(runtime)
-                scene = self.read_dashboard_scene_snapshot(runtime_session_id=runtime_session_id)
+                scene = await self.read_dashboard_scene_snapshot_async(runtime_session_id=runtime_session_id)
                 if (
                     runtime_session_id
                     and isinstance(scene, dict)
@@ -104,7 +104,7 @@ class LiveSnapshotMixin:
                     # Runtime polling can lag behind long MCP calls. The scene file is written
                     # by the executor-side writer, so prefer the newest scene stream over a stale
                     # runtime session id when keeping the matrix visualizer live.
-                    fresh_scene = self.read_dashboard_scene_snapshot(runtime_session_id=None)
+                    fresh_scene = await self.read_dashboard_scene_snapshot_async(runtime_session_id=None)
                     if isinstance(fresh_scene, dict) and fresh_scene.get("available"):
                         scene = fresh_scene
                 if isinstance(scene, dict) and scene.get("available"):
@@ -441,7 +441,7 @@ class LiveSnapshotMixin:
                 "session_id": runtime_session_id,
             }
         if prefer_file:
-            fallback = self.read_dashboard_scene_snapshot(runtime_session_id=runtime_session_id)
+            fallback = await self.read_dashboard_scene_snapshot_async(runtime_session_id=runtime_session_id)
             if fallback.get("available"):
                 return fallback
         result = await self.safe_tool(
@@ -468,11 +468,20 @@ class LiveSnapshotMixin:
                 scene = self.attach_cartridge_metadata(scene)
                 scene["transport"] = "dashboard_scene_tool"
                 return scene
-        fallback = self.read_dashboard_scene_snapshot(runtime_session_id=runtime_session_id)
+        fallback = await self.read_dashboard_scene_snapshot_async(runtime_session_id=runtime_session_id)
         if fallback is scene:
             fallback = dict(fallback)
         fallback["tool_error"] = scene if isinstance(scene, dict) else result
         return fallback
+
+    async def read_dashboard_scene_snapshot_async(
+        self,
+        runtime_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self.read_dashboard_scene_snapshot,
+            runtime_session_id=runtime_session_id,
+        )
 
     def read_dashboard_scene_snapshot(
         self,
