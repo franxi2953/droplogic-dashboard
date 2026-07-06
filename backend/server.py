@@ -158,6 +158,10 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         self._live_frame_sequences: dict[str, int] = {}
         self._melting_curve_monitor_tasks: dict[str, asyncio.Task] = {}
         self._melting_curve_seen_captures: set[str] = set()
+        self._audio_transcriber: Any | None = None
+        self._audio_transcriber_lock = threading.Lock()
+        self._audio_preload_task: asyncio.Task | None = None
+        self._last_temperature_record: dict[str, Any] = {}
 
     @staticmethod
     def should_background_temperature_hold(arguments: dict[str, Any]) -> bool:
@@ -235,10 +239,6 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         }:
             return 30.0
         return DASHBOARD_USER_TOOL_DEFAULT_TIMEOUT_SECONDS
-        self._audio_transcriber: Any | None = None
-        self._audio_transcriber_lock = threading.Lock()
-        self._audio_preload_task: asyncio.Task | None = None
-        self._last_temperature_record: dict[str, Any] = {}
 
     def status(self) -> dict[str, Any]:
         return {
