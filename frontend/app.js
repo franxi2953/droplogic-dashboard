@@ -33,6 +33,7 @@ const state = {
   status: null,
   live: null,
   liveFrameFreshness: {},
+  liveSceneFreshnessReset: false,
   bottomTab: "state",
   agentBusy: false,
   runs: [],
@@ -545,19 +546,20 @@ function persistMatrixScene(scene, live = {}) {
   }
 }
 
-function mergeLiveWithMatrixCache(live) {
+function mergeLiveWithMatrixCache(live, options = {}) {
   const nextLive = mergeLiveWithFreshFrames(live || {});
   const scene = nextLive?.scene?.result || nextLive?.scene;
   if (scene?.available) {
     if (matrixSceneMatchesRuntimeSession(scene, nextLive)) {
       const currentScene = state.live?.scene?.result || state.live?.scene;
-      if (matrixSceneIsStaleComparedTo(scene, currentScene)) {
+      if (!options.resetSceneFreshness && matrixSceneIsStaleComparedTo(scene, currentScene)) {
         return {
           ...nextLive,
           scene: state.live.scene,
           matrix_scene_stale_ignored: matrixSceneFreshnessSummary(scene, currentScene),
         };
       }
+      if (options.resetSceneFreshness) state.liveSceneFreshnessReset = false;
       persistMatrixScene(scene, nextLive);
       return nextLive;
     }
@@ -641,6 +643,11 @@ function frameIsFreshForVisualizer(visualizer, frame, updatedAt = "") {
 
 function rememberFrameFreshness(visualizer, frame, updatedAt = "") {
   state.liveFrameFreshness[visualizer] = frameFreshness(frame, updatedAt);
+}
+
+function resetLiveFreshnessForReconnect() {
+  state.liveFrameFreshness = {};
+  state.liveSceneFreshnessReset = true;
 }
 
 function matrixSceneIsStaleComparedTo(incoming, current) {
@@ -3077,7 +3084,9 @@ function send(message) {
 
 function handleRealtimeMessage(data) {
   if (data.type === "live") {
-    state.live = mergeLiveWithMatrixCache(data.live);
+    state.live = mergeLiveWithMatrixCache(data.live, {
+      resetSceneFreshness: state.liveSceneFreshnessReset === true,
+    });
     bootstrapTimelineLiveFromScene(state.live?.scene?.result || state.live?.scene);
     syncStageMotionWithLive();
     scheduleLiveOnlyRender();
@@ -3110,6 +3119,7 @@ function connectLive() {
       window.clearTimeout(state.liveWsReconnectTimer);
       state.liveWsReconnectTimer = null;
     }
+    resetLiveFreshnessForReconnect();
     state.liveWsConnected = true;
     ws.send(JSON.stringify({ type: "get_live" }));
   };
@@ -3265,9 +3275,10 @@ function connect() {
     } else if (data.type === "calibration_move_result") {
       state.calibration.movePending = false;
       const result = data.result?.result || data.result;
-      const actual = result?.actual_position || result?.target_position || data.position;
+      const failed = result?.ok === false || result?.error;
+      const actual = result?.actual_position || result?.position || (!failed ? (result?.target_position || data.position) : null);
       if (actual) state.calibration.localPosition = actual;
-      if (result?.ok === false || result?.error) {
+      if (failed) {
         appendEvent({
           ts: new Date().toISOString(),
           type: "ui_error",
@@ -5193,7 +5204,9 @@ function applyLiveScene(data) {
   if (data?.runtime && typeof data.runtime === "object") live.runtime = data.runtime;
   live.scene = scene;
   live.updated_at = data.updated_at || live.updated_at || new Date().toISOString();
-  state.live = mergeLiveWithMatrixCache(live);
+  state.live = mergeLiveWithMatrixCache(live, {
+    resetSceneFreshness: state.liveSceneFreshnessReset === true,
+  });
   bootstrapTimelineLiveFromScene(state.live?.scene?.result || state.live?.scene);
   setText("liveState", state.live.updated_at || state.status?.live?.updated_at || "-");
   setText("liveStateAdvanced", state.live.updated_at || state.status?.live?.updated_at || "-");

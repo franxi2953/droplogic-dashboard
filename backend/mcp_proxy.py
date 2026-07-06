@@ -125,7 +125,11 @@ async def run_proxy(config_path: str | None = None) -> None:
             if mcp_auto_started and actual_name in MCP_STATEFUL_EXECUTION_TOOLS:
                 result = app.mcp_runtime_restarted_result(actual_name, via="cockpit_proxy")
             else:
-                guard_result = await app.mcp_health_guard_result(actual_name, via="cockpit_proxy")
+                guard_result = await app.mcp_health_guard_result(
+                    actual_name,
+                    via="cockpit_proxy",
+                    arguments=actual_arguments,
+                )
                 if guard_result is not None:
                     result = guard_result
                 elif actual_name == "verify_droplets":

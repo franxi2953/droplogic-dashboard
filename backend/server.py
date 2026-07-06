@@ -89,6 +89,9 @@ MCP_STATEFUL_EXECUTION_TOOLS = {
     "execution_wait_status",
 }
 MCP_HEALTH_GUARDED_TOOLS = {
+    "calibration_stage_jog",
+    "calibration_stage_move_to_target",
+    "calibration_stage_set_speed",
     "capture_camera_image",
     "capture_microscope_image",
     "configure_camera_imaging",
@@ -101,6 +104,8 @@ MCP_HEALTH_GUARDED_TOOLS = {
     "set_light_state",
     "set_matrix_cells",
     "set_matrix_voltage",
+    "set_stage_motion_params",
+    "set_stage_motion_speed",
     "set_streamer_source",
     "set_temperature_target",
     "start_execute_until_breakpoint",
@@ -347,8 +352,19 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             ),
         }
 
-    async def mcp_health_guard_result(self, tool: str, via: str) -> dict[str, Any] | None:
-        if tool not in MCP_HEALTH_GUARDED_TOOLS or not self.mcp.running:
+    @staticmethod
+    def mcp_tool_requires_health(tool: str, arguments: dict[str, Any] | None = None) -> bool:
+        if tool == "calibration_stage_jog" and isinstance(arguments, dict) and arguments.get("stop_all"):
+            return False
+        return tool in MCP_HEALTH_GUARDED_TOOLS
+
+    async def mcp_health_guard_result(
+        self,
+        tool: str,
+        via: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.mcp_tool_requires_health(tool, arguments) or not self.mcp.running:
             return None
         health_result = await self.safe_tool("health_check", timeout_seconds=3.0)
         health = self.normalized_health_payload(health_result)
@@ -664,7 +680,20 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     result={"capture": capture_event},
                     parent_call_event_id=call_event_id,
                     via=via,
-                )
+        )
+
+    async def guarded_safe_tool(
+        self,
+        tool: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        via: str,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        guard_result = await self.mcp_health_guard_result(tool, via=via, arguments=arguments)
+        if guard_result is not None:
+            return guard_result
+        return await self.safe_tool(tool, arguments, timeout_seconds=timeout_seconds)
 
     async def call_stage_motion_tool(
         self,
@@ -673,6 +702,9 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         call_event_id: Any = None,
         preset_category: str = "stage",
     ) -> dict[str, Any]:
+        guard_result = await self.mcp_health_guard_result("move_stage", via=source, arguments=arguments)
+        if guard_result is not None:
+            return guard_result
         await self.broadcast_stage_motion_start(
             arguments,
             source=source,
@@ -1425,7 +1457,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     result = self.mcp_runtime_restarted_result(actual_tool, via="dashboard_user")
                     mcp_timing = {}
                 else:
-                    guard_result = await self.mcp_health_guard_result(actual_tool, via="dashboard_user")
+                    guard_result = await self.mcp_health_guard_result(
+                        actual_tool,
+                        via="dashboard_user",
+                        arguments=actual_arguments,
+                    )
                     if guard_result is not None:
                         result = guard_result
                         mcp_timing = {}
@@ -1594,14 +1630,22 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             restore_result = None
             if self.calibration is not None and self.mcp.running:
                 previous_motion_params = self.calibration.previous_motion_params
-                await self.safe_tool("calibration_stage_jog", {"stop_all": True})
+                await self.guarded_safe_tool("calibration_stage_jog", {"stop_all": True}, via="calibration")
                 if previous_motion_params:
                     restore_result = compact_tool_payload(
-                        await self.safe_tool("set_stage_motion_params", previous_motion_params)
+                        await self.guarded_safe_tool(
+                            "set_stage_motion_params",
+                            previous_motion_params,
+                            via="calibration",
+                        )
                     )
                     if isinstance(restore_result, dict) and restore_result.get("ok") is False:
                         fallback_result = compact_tool_payload(
-                            await self.safe_tool("set_stage_motion_speed", {"speed_key": "standard"})
+                            await self.guarded_safe_tool(
+                                "set_stage_motion_speed",
+                                {"speed_key": "standard"},
+                                via="calibration",
+                            )
                         )
                         restore_result = {
                             "motion_params_restore": restore_result,
@@ -1609,7 +1653,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                         }
                 else:
                     restore_result = compact_tool_payload(
-                        await self.safe_tool("set_stage_motion_speed", {"speed_key": "standard"})
+                        await self.guarded_safe_tool(
+                            "set_stage_motion_speed",
+                            {"speed_key": "standard"},
+                            via="calibration",
+                        )
                     )
             self.calibration = None
             self.streamer_frame_options = {"max_width": 720, "max_height": 460}
@@ -1636,7 +1684,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             speed_key = str(message.get("speed_key") or "2")
             self.calibration.set_speed(speed_key)
             result = compact_tool_payload(
-                await self.safe_tool("calibration_stage_set_speed", {"speed_key": self.calibration.speed_key})
+                await self.guarded_safe_tool(
+                    "calibration_stage_set_speed",
+                    {"speed_key": self.calibration.speed_key},
+                    via="calibration",
+                )
             )
             await websocket.send(
                 json.dumps(
@@ -1658,7 +1710,9 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 "direction": int(message.get("direction") or 0),
                 "stop_all": bool(message.get("stop_all", False)),
             }
-            result = compact_tool_payload(await self.safe_tool("calibration_stage_jog", arguments))
+            result = compact_tool_payload(
+                await self.guarded_safe_tool("calibration_stage_jog", arguments, via="calibration")
+            )
             position = result.get("position") if isinstance(result, dict) else None
             if position:
                 self.calibration.status_message = f"Adjusting {self.calibration.current_step['label']}" if self.calibration.current_step else "Adjusting"
@@ -1690,12 +1744,20 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     source="calibration",
                 )
             )
+            move_failed = isinstance(result, dict) and (result.get("ok") is False or result.get("error"))
+            response_position = None
+            if isinstance(result, dict):
+                response_position = result.get("actual_position") or result.get("position")
+                if not move_failed:
+                    response_position = response_position or result.get("target_position") or position
+            elif not move_failed:
+                response_position = position
             await websocket.send(
                 json.dumps(
                     {
                         "type": "calibration_move_result",
                         "result": result,
-                        "position": position,
+                        "position": response_position,
                     },
                     ensure_ascii=True,
                 )
@@ -1730,7 +1792,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if msg_type == "calibration_record":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
-            await self.safe_tool("calibration_stage_jog", {"stop_all": True})
+            await self.guarded_safe_tool("calibration_stage_jog", {"stop_all": True}, via="calibration")
             fresh_position = compact_tool_payload(await self.safe_tool("calibration_stage_position"))
             position = (
                 fresh_position.get("position")
@@ -1793,7 +1855,9 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 "col_max": int(message.get("col_max", 0)),
                 "wait_for_queue": False,
             }
-            raw_result = mark_failed_mcp_payload(await self.safe_tool("set_matrix_cells", arguments))
+            raw_result = mark_failed_mcp_payload(
+                await self.guarded_safe_tool("set_matrix_cells", arguments, via="dashboard_matrix")
+            )
             result = compact_tool_payload(raw_result)
             droplet_update_results: list[dict[str, Any]] = []
             if arguments["value"] == 0 and mcp_tool_call_succeeded(raw_result):
@@ -2167,7 +2231,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if self.calibration is not None:
             self.calibration.set_previous_motion_params(await self.read_stage_motion_params())
 
-        prepare_result = await self.safe_tool(
+        prepare_result = await self.guarded_safe_tool(
             "configure_microscope_imaging",
             {
                 "channel": "Brightfield",
@@ -2181,9 +2245,10 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 "stabilization_wait": 0.2,
                 "queue_timeout_seconds": 10,
             },
+            via="calibration",
         )
         streamer_result = compact_tool_payload(
-            await self.safe_tool(
+            await self.guarded_safe_tool(
                 "set_streamer_source",
                 {
                     "source": "microscope",
@@ -2191,12 +2256,14 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     "coordinates": True,
                     "bring_to_front": False,
                 },
+                via="calibration",
             )
         )
         speed_result = compact_tool_payload(
-            await self.safe_tool(
+            await self.guarded_safe_tool(
                 "calibration_stage_set_speed",
                 {"speed_key": self.calibration.speed_key},
+                via="calibration",
             )
         )
         if isinstance(prepare_result, dict) and prepare_result.get("ok") is False:
@@ -2287,6 +2354,14 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             "wait_timeout_seconds": wait_timeout_seconds,
             "poll_interval": 0.05,
         }
+        guard_result = await self.mcp_health_guard_result(
+            "calibration_stage_move_to_target",
+            via="calibration_target",
+            arguments=arguments,
+        )
+        if guard_result is not None:
+            self.calibration.status_message = "Target move blocked"
+            return {"result": compact_tool_payload(guard_result), "position": None}
         await self.broadcast_stage_motion_start(
             arguments,
             source="calibration_target",
@@ -2509,7 +2584,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     "electrode_overlay": False,
                     "bring_to_front": False,
                 }
-                result = await self.safe_tool("set_streamer_source", streamer_args)
+                result = await self.guarded_safe_tool(
+                    "set_streamer_source",
+                    streamer_args,
+                    via="preset.imaging",
+                )
                 actions.append({"tool": "set_streamer_source", "arguments": streamer_args, "result": compact_tool_payload(result)})
                 args = {
                     "exposure_time": int(camera_settings.get("exposure_time", 72000)),
@@ -2517,13 +2596,25 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     "auto_exposure": bool(camera_settings.get("auto_exposure", False)),
                     "queue_timeout_seconds": 10.0,
                 }
-                result = await self.safe_tool("configure_camera_imaging", args)
+                result = await self.guarded_safe_tool(
+                    "configure_camera_imaging",
+                    args,
+                    via="preset.imaging",
+                )
                 actions.append({"tool": "configure_camera_imaging", "arguments": args, "result": compact_tool_payload(result)})
                 if light_settings:
                     light_args = self.light_args_from_preset(light_settings)
-                    result = await self.safe_tool("set_light_state", light_args)
+                    result = await self.guarded_safe_tool(
+                        "set_light_state",
+                        light_args,
+                        via="preset.imaging",
+                    )
                     actions.append({"tool": "set_light_state", "arguments": light_args, "result": compact_tool_payload(result)})
-                result = await self.safe_tool("start_visualizer", {"visualizer": "streamer"})
+                result = await self.guarded_safe_tool(
+                    "start_visualizer",
+                    {"visualizer": "streamer"},
+                    via="preset.imaging",
+                )
                 actions.append({"tool": "start_visualizer", "arguments": {"visualizer": "streamer"}, "result": compact_tool_payload(result)})
             else:
                 microscope_settings = microscope_settings if isinstance(microscope_settings, dict) else {}
@@ -2539,7 +2630,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     "stabilization_wait": 0.2,
                     "queue_timeout_seconds": 10.0,
                 }
-                result = await self.safe_tool("configure_microscope_imaging", args)
+                result = await self.guarded_safe_tool(
+                    "configure_microscope_imaging",
+                    args,
+                    via="preset.imaging",
+                )
                 actions.append({"tool": "configure_microscope_imaging", "arguments": args, "result": compact_tool_payload(result)})
         else:
             return {
@@ -2852,7 +2947,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     if mcp_auto_started and tool in MCP_STATEFUL_EXECUTION_TOOLS:
                         result = self.mcp_runtime_restarted_result(tool, via="agent")
                     else:
-                        guard_result = await self.mcp_health_guard_result(tool, via="agent")
+                        guard_result = await self.mcp_health_guard_result(
+                            tool,
+                            via="agent",
+                            arguments=call_arguments,
+                        )
                         if guard_result is not None:
                             result = guard_result
                         else:
