@@ -109,6 +109,7 @@ MCP_HEALTH_GUARDED_TOOLS = {
     "set_streamer_source",
     "set_temperature_target",
     "start_execute_until_breakpoint",
+    "start_melting_curve_capture",
     "start_plan",
     "start_temperature_routine",
     "start_visualizer",
@@ -3652,32 +3653,35 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         await self.record("cockpit_started", host=self.config.host, port=self.config.port)
         if self.config.speech.enabled and self.config.speech.preload:
             self._audio_preload_task = asyncio.create_task(self.preload_audio_transcriber_background())
-        httpd = start_http_server(self.config.host, self.config.port, self.recorder.runs_dir)
-        ws_port = self.config.port + 1
-        live_ws_port = self.config.port + 2
-        async with (
-            websockets.serve(
-                self.handle_ws,
-                self.config.host,
-                ws_port,
-                max_size=None,
-            ),
-            websockets.serve(
-                self.handle_live_ws,
-                self.config.host,
-                live_ws_port,
-                max_size=None,
-            ),
-        ):
-            print(f"DropLogic Dashboard: http://{self.config.host}:{self.config.port}")
-            print(f"DropLogic Dashboard WS: ws://{self.config.host}:{ws_port}")
-            print(f"DropLogic Dashboard Live WS: ws://{self.config.host}:{live_ws_port}")
-            try:
+        httpd = None
+        try:
+            httpd = start_http_server(self.config.host, self.config.port, self.recorder.runs_dir)
+            ws_port = self.config.port + 1
+            live_ws_port = self.config.port + 2
+            async with (
+                websockets.serve(
+                    self.handle_ws,
+                    self.config.host,
+                    ws_port,
+                    max_size=None,
+                ),
+                websockets.serve(
+                    self.handle_live_ws,
+                    self.config.host,
+                    live_ws_port,
+                    max_size=None,
+                ),
+            ):
+                print(f"DropLogic Dashboard: http://{self.config.host}:{self.config.port}")
+                print(f"DropLogic Dashboard WS: ws://{self.config.host}:{ws_port}")
+                print(f"DropLogic Dashboard Live WS: ws://{self.config.host}:{live_ws_port}")
                 await asyncio.Future()
-            finally:
-                if self._audio_preload_task is not None:
-                    self._audio_preload_task.cancel()
+        finally:
+            if self._audio_preload_task is not None:
+                self._audio_preload_task.cancel()
+            if httpd is not None:
                 httpd.shutdown()
+                httpd.server_close()
 
 
 def path_is_relative_to(path: Path, root: Path) -> bool:

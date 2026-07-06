@@ -68,22 +68,6 @@ async def run_proxy(config_path: str | None = None) -> None:
     app = CockpitApp(config)
     await app.record("cockpit_proxy_started", host=config.host, port=config.port)
 
-    httpd = start_http_server(config.host, config.port, app.recorder.runs_dir)
-    ws_port = config.port + 1
-    live_ws_port = config.port + 2
-    ws_server = await websockets.serve(
-        app.handle_ws,
-        config.host,
-        ws_port,
-        max_size=None,
-    )
-    live_ws_server = await websockets.serve(
-        app.handle_live_ws,
-        config.host,
-        live_ws_port,
-        max_size=None,
-    )
-
     server = Server(
         "DropLogic Dashboard",
         version="0.1.0",
@@ -193,7 +177,25 @@ async def run_proxy(config_path: str | None = None) -> None:
             )
             return error_result(str(exc))
 
+    httpd = None
+    ws_server = None
+    live_ws_server = None
     try:
+        httpd = start_http_server(config.host, config.port, app.recorder.runs_dir)
+        ws_port = config.port + 1
+        live_ws_port = config.port + 2
+        ws_server = await websockets.serve(
+            app.handle_ws,
+            config.host,
+            ws_port,
+            max_size=None,
+        )
+        live_ws_server = await websockets.serve(
+            app.handle_live_ws,
+            config.host,
+            live_ws_port,
+            max_size=None,
+        )
         await ensure_mcp_started(app)
         async with stdio_server() as (read_stream, write_stream):
             await server.run(
@@ -204,11 +206,15 @@ async def run_proxy(config_path: str | None = None) -> None:
     finally:
         await app.stop_live_polling()
         await app.mcp.stop()
-        ws_server.close()
-        live_ws_server.close()
-        await ws_server.wait_closed()
-        await live_ws_server.wait_closed()
-        httpd.shutdown()
+        for active_server in (ws_server, live_ws_server):
+            if active_server is not None:
+                active_server.close()
+        for active_server in (ws_server, live_ws_server):
+            if active_server is not None:
+                await active_server.wait_closed()
+        if httpd is not None:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 def parse_args() -> argparse.Namespace:
