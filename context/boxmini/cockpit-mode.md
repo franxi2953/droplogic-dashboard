@@ -12,4 +12,6 @@ This MCP server was launched by DropLogic Dashboard.
 - The agent should keep using the normal DropLogic MCP tools. The dashboard observes those calls, displays live matrix/streamer frames, and records the run history.
 - Tool events with `called_by_user: true` / `tool_invocation_origin: "dashboard_user"` were launched manually by the user from the dashboard UI, not by the AI agent. Treat them as user actions or user-provided context when deciding what has already happened.
 - Avoid frequent `bring_visualizer_to_front` calls in dashboard mode; they are unnecessary and may be a no-op.
-- For live observation, prefer compact state/status tools (`runtime_status`, `state_summary`, `visualizer_status`) and let the dashboard poll frames in the background.
+- For live observation, prefer compact targeted status tools (`runtime_status`, `state_summary`, `visualizer_status`) and let the dashboard poll frames and matrix scenes in the background.
+- Avoid repeated broad `execution_status_summary` calls. Request visualizer, planning-job, or execution-wait details only when that specific detail is needed; Dashboard may strip those optional sections from agent calls to keep context compact.
+- If a tool result has `reason: "mcp_runtime_health_failed"` or `tool_not_run`, stop hardware execution and inspect the reported health payload before continuing. Restart/reload from the current physical state only after the runtime is healthy.

@@ -3,7 +3,7 @@
 Use two layers:
 
 - Library tests live in the repo that owns the Python code. `DropLogic/tests/` is the right place for deterministic `AdvancedDrop`, SIPP, merge, extraction, and executor unit/regression tests.
-- Dashboard/system benchmarks live here because they orchestrate browser UI, dashboard backend, MCP, and sometimes hardware. They write results under `benchmarks/results/`, which is intentionally ignored by git.
+- Dashboard/system benchmarks live here because they orchestrate browser UI, dashboard backend, MCP, and sometimes hardware. Long-running result sets should go under `benchmarks/results/`, and local smoke outputs may use `runtime/`; both paths are intentionally ignored by git.
 
 ## 1. UI stress benchmark
 
@@ -22,7 +22,64 @@ py -3 scripts\generate_ui_stress_run.py --frames 1600 --events 2500 --temperatur
 
 The Playwright benchmark reports load time, timeline/matrix pointer latency, render call timings, long tasks, DOM size, event counts, and saves a screenshot plus JSON metrics.
 
-## 2. Five-droplet move benchmark
+## 2. Live WebSocket feed benchmark
+
+This samples the dashboard live channel. It is useful for checking that streamer frames and matrix scenes keep arriving independently from the main control WebSocket.
+
+Start the dashboard, then run:
+
+```powershell
+npm run bench:live
+```
+
+The default target is `ws://127.0.0.1:8789/live`. The output reports message counts, live channel counts, last sequences, sequence regressions/repeats, inter-message gaps, frame ages, streamer FPS, and average message sizes.
+
+Optional passive run-log analysis:
+
+```powershell
+py -3 backend\bench_live_feed.py --run-dir runs\<run-id> --skip-live
+```
+
+## 3. Synthetic live matrix motion benchmark
+
+This benchmark does not touch hardware. It serves the frontend with a fake live WebSocket stream containing a reservoir extraction and 15-droplet motion sequence, then measures matrix render calls, unique rendered frames, dropped frames, render duration, long tasks, and final live state.
+
+```powershell
+npm run bench:matrix:motion
+```
+
+Useful knobs:
+
+```powershell
+npm run bench:matrix:motion -- --fps 20 --headed --output benchmarks/results/matrix-motion/dev
+npm run bench:matrix:motion -- --video false
+```
+
+The default output folder is `runtime/perf-bench-motion`; it contains JSON metrics, a final screenshot, and a `.webm` video unless video capture is disabled.
+
+## 4. Agent matrix motion benchmark
+
+This asks the dashboard agent to run the reservoir extraction and matrix motion workflow through MCP tools while Playwright records matrix renders, main/live WebSocket traffic, long tasks, run events, a screenshot, and a video.
+
+The script may change MCP state, so it requires an explicit acknowledgement. It defaults to the simulator:
+
+```powershell
+npm run bench:agent:matrix -- --i-understand-this-may-change-mcp-state
+```
+
+Common variants:
+
+```powershell
+npm run bench:agent:matrix -- --i-understand-this-may-change-mcp-state --frame-delay 0.05 --headed
+npm run bench:agent:matrix -- --i-understand-this-may-change-mcp-state --system boxmini --headed
+npm run bench:agent:matrix -- --i-understand-this-may-change-mcp-state --allow-loaded-system-restart
+```
+
+Other knobs include `--url`, `--output`, `--timeout`, `--prompt`, and `--video false`.
+
+Use `--system boxmini` only when controlling real BoxMini hardware is intentional. If another system is already loaded, the script refuses to restart it unless `--allow-loaded-system-restart` is supplied.
+
+## 5. Five-droplet move benchmark
 
 This measures the path from high-level `AdvancedDrop` operations to `PlanExecutor` timing. By default it uses the DropLogic simulator, so it is safe for development and CI.
 
@@ -50,7 +107,7 @@ The output JSON includes:
 
 Real hardware should be added behind an explicit flag only. Do not make `npm test` or `pytest` move electrodes by default.
 
-## 3. Real dashboard-to-hardware move benchmark
+## 6. Real dashboard-to-hardware move benchmark
 
 This opens the dashboard with Playwright, creates a new run, optionally restarts BoxMini with a clean matrix/plan, sends MCP tool calls through the dashboard WebSocket as `dashboard_user`, records a browser video, executes the matrix plan at `frame_delay=1`, and then reads compact per-frame executor timing from MCP.
 
