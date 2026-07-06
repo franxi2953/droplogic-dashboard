@@ -9425,20 +9425,34 @@ function eventTimeLabel(event) {
 
 function drawTimelineActiveTicks(ctx, layout, frames, count) {
   if (!Array.isArray(frames) || !frames.length) return;
+  const indexedFrames = frames
+    .map((frame, position) => ({
+      frame,
+      index: Number.isFinite(Number(frame?.index)) ? Number(frame.index) : position,
+    }))
+    .filter((item) => Number.isFinite(item.index))
+    .sort((a, b) => a.index - b.index);
+  if (!indexedFrames.length) return;
+  const frameActiveCount = (frame) => {
+    const active = Number(frame?.summary?.active_count);
+    if (Number.isFinite(active)) return active;
+    return Array.isArray(frame?.active_droplet_ids) ? frame.active_droplet_ids.length : 0;
+  };
   ctx.save();
-  const maxActive = Math.max(1, ...frames.map((frame) => Number(frame?.summary?.active_count || 0)));
+  const maxActive = Math.max(1, ...indexedFrames.map((item) => frameActiveCount(item.frame)));
   const tickHeight = Math.max(8, Math.min(18, layout.height - layout.axisY - 54));
   const tickBaseY = Math.min(layout.height - 10, layout.axisY + 47);
   const barWidth = Math.max(1.5, Math.min(5, layout.trackWidth / Math.max(1, layout.visibleFrames)));
   ctx.fillStyle = "rgba(100, 210, 255, 0.56)";
-  const step = Math.max(1, Math.ceil(count / Math.max(1, layout.trackWidth)));
   const firstIndex = Math.max(0, Math.floor(layout.startFrame));
-  const lastIndex = Math.min(frames.length - 1, Math.ceil(layout.endFrame));
-  for (let index = firstIndex; index <= lastIndex; index += step) {
-    const frame = frames[index];
-    const frameIndex = Number(frame?.index);
-    if (!Number.isFinite(frameIndex)) continue;
-    const active = Number(frame?.summary?.active_count || 0);
+  const frameCount = Number.isFinite(Number(count)) && Number(count) > 0
+    ? Number(count)
+    : Math.max(...indexedFrames.map((item) => item.index)) + 1;
+  const lastIndex = Math.min(Math.max(0, frameCount - 1), Math.ceil(layout.endFrame));
+  for (const item of indexedFrames) {
+    const { frame, index: frameIndex } = item;
+    if (frameIndex < firstIndex || frameIndex > lastIndex) continue;
+    const active = frameActiveCount(frame);
     if (active <= 0) continue;
     const x = clamp(timelineXForFrame(layout, frameIndex), layout.left + barWidth / 2, layout.left + layout.trackWidth - barWidth / 2);
     const h = Math.max(2, tickHeight * Math.sqrt(active / maxActive));

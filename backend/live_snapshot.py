@@ -12,6 +12,11 @@ from .config import DROPLOGIC_ROOT
 from .tool_payloads import compact_tool_payload
 
 
+LIVE_TIMELINE_FRAME_SAMPLE_LIMIT = 160
+LIVE_TIMELINE_FRAME_FOCUS_WINDOW = 24
+LIVE_TIMELINE_EDGE_FRAME_COUNT = 4
+
+
 class LiveSnapshotMixin:
     def ensure_live_polling(self) -> None:
         if self._poll_task is None or self._poll_task.done():
@@ -334,22 +339,37 @@ class LiveSnapshotMixin:
         heavy = len(frames) > 80 or len(json.dumps(frames, ensure_ascii=True)) > 160_000
         if not heavy:
             return scene
-        compact_frames = []
-        for frame in frames:
-            if not isinstance(frame, dict):
-                continue
-            compact_frames.append({
-                "index": frame.get("index"),
-                "event_id": frame.get("event_id"),
-                "event_type": frame.get("event_type"),
-                "active_droplet_ids": frame.get("active_droplet_ids") if isinstance(frame.get("active_droplet_ids"), list) else [],
-            })
+        indexed_frames = live_timeline_indexed_frames(frames)
+        focused_frame = live_timeline_focus_frame(scene)
+        frame_indices = live_timeline_sample_indices(
+            indexed_frames,
+            focused_frame=focused_frame,
+            limit=LIVE_TIMELINE_FRAME_SAMPLE_LIMIT,
+            focus_window=LIVE_TIMELINE_FRAME_FOCUS_WINDOW,
+        )
+        frame_lookup = {index: frame for index, frame in indexed_frames}
+        compact_frames = [
+            compact_live_timeline_frame(frame_lookup[index], fallback_index=index)
+            for index in frame_indices
+            if index in frame_lookup
+        ]
         compact_timeline = dict(timeline)
         compact_timeline["frames"] = compact_frames
         compact_timeline["frames_compact"] = True
         compact_timeline["live_frames_compacted"] = True
+        compact_timeline["live_frames_sampled"] = len(compact_frames) < len(indexed_frames)
+        compact_timeline["live_frame_count"] = len(indexed_frames)
+        compact_timeline["live_frames_sent"] = len(compact_frames)
+        compact_timeline["live_frames_omitted"] = max(0, len(indexed_frames) - len(compact_frames))
+        compact_timeline["live_frame_sample_limit"] = LIVE_TIMELINE_FRAME_SAMPLE_LIMIT
+        compact_timeline["live_frame_focus"] = focused_frame
+        if focused_frame is not None:
+            compact_timeline["live_frame_focus_window"] = [
+                max(0, focused_frame - LIVE_TIMELINE_FRAME_FOCUS_WINDOW),
+                focused_frame + LIVE_TIMELINE_FRAME_FOCUS_WINDOW,
+            ]
         compact_timeline["live_omitted_frame_details"] = True
-        compact_timeline["encoding"] = "compact_frame_index"
+        compact_timeline["encoding"] = "sampled_compact_frame_index"
         compact_timeline["detailed_frame_limit"] = min(int(timeline.get("detailed_frame_limit") or 0) or 80, 80)
         compact_scene = dict(scene)
         compact_scene["timeline"] = compact_timeline
@@ -733,6 +753,94 @@ def live_frame_is_newer(candidate: Any, baseline: Any) -> bool:
     candidate_time = live_frame_captured_at(candidate)
     baseline_time = live_frame_captured_at(baseline)
     return bool(candidate_time and baseline_time and candidate_time > baseline_time)
+
+
+def live_timeline_indexed_frames(frames: list[Any]) -> list[tuple[int, dict[str, Any]]]:
+    indexed: dict[int, dict[str, Any]] = {}
+    for position, frame in enumerate(frames):
+        if not isinstance(frame, dict):
+            continue
+        explicit_index = number_or_none(frame.get("index"))
+        index = int(explicit_index) if explicit_index is not None and explicit_index >= 0 else position
+        indexed[index] = frame
+    return sorted(indexed.items(), key=lambda item: item[0])
+
+
+def live_timeline_focus_frame(scene: Any) -> int | None:
+    if not isinstance(scene, dict):
+        return None
+    current_frame = number_or_none(get_path(scene, "executor.current_frame"))
+    focus = first_number(
+        get_path(scene, "frame.index"),
+        get_path(scene, "executor.last_applied_frame.index"),
+        get_path(scene, "executor.last_frame.index"),
+        current_frame - 1 if current_frame is not None else None,
+    )
+    if focus is None or focus < 0:
+        return None
+    return int(focus)
+
+
+def live_timeline_sample_indices(
+    indexed_frames: list[tuple[int, dict[str, Any]]],
+    focused_frame: int | None,
+    limit: int,
+    focus_window: int,
+) -> list[int]:
+    if limit <= 0:
+        return []
+    indices = [index for index, _frame in indexed_frames]
+    if len(indices) <= limit:
+        return indices
+    keep: set[int] = set(indices[:LIVE_TIMELINE_EDGE_FRAME_COUNT])
+    keep.update(indices[-LIVE_TIMELINE_EDGE_FRAME_COUNT:])
+    if focused_frame is not None:
+        start = max(0, focused_frame - max(0, focus_window))
+        end = focused_frame + max(0, focus_window)
+        keep.update(index for index in indices if start <= index <= end)
+    remaining = max(0, limit - len(keep))
+    if remaining > 0:
+        step = max(1, (len(indices) + remaining - 1) // remaining)
+        keep.update(indices[position] for position in range(0, len(indices), step))
+    if len(keep) <= limit:
+        return sorted(keep)
+    prioritized = []
+    if focused_frame is not None:
+        prioritized.extend(sorted(keep, key=lambda index: (abs(index - focused_frame), index))[:limit])
+    if len(prioritized) < limit:
+        for index in sorted(keep):
+            if index in prioritized:
+                continue
+            prioritized.append(index)
+            if len(prioritized) >= limit:
+                break
+    return sorted(prioritized[:limit])
+
+
+def compact_live_timeline_frame(frame: dict[str, Any], fallback_index: int) -> dict[str, Any]:
+    explicit_index = number_or_none(frame.get("index"))
+    active_droplet_ids = frame.get("active_droplet_ids") if isinstance(frame.get("active_droplet_ids"), list) else []
+    compact: dict[str, Any] = {
+        "index": int(explicit_index) if explicit_index is not None and explicit_index >= 0 else fallback_index,
+        "event_id": frame.get("event_id"),
+        "event_type": frame.get("event_type"),
+        "active_droplet_ids": active_droplet_ids,
+    }
+    summary = compact_live_timeline_summary(frame.get("summary"), active_droplet_ids)
+    if summary:
+        compact["summary"] = summary
+    return compact
+
+
+def compact_live_timeline_summary(summary: Any, active_droplet_ids: list[Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    if isinstance(summary, dict):
+        for key in ("active_count", "active_mask_sha256", "matrix_values_sha256"):
+            if key in summary:
+                compact[key] = summary.get(key)
+    if "active_count" not in compact and active_droplet_ids:
+        compact["active_count"] = len(active_droplet_ids)
+    return compact
 
 
 def attach_matrix_voltage_status(state_payload: Any, voltage_status: Any) -> Any:
