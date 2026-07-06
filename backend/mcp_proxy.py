@@ -52,7 +52,7 @@ def as_call_tool_result(result: Any) -> types.CallToolResult:
     return types.CallToolResult(
         content=[types.TextContent(type="text", text=json.dumps(result, ensure_ascii=True, indent=2))],
         structuredContent=result if isinstance(result, dict) else None,
-        isError=False,
+        isError=bool(result.get("isError")) if isinstance(result, dict) else False,
     )
 
 
@@ -124,21 +124,25 @@ async def run_proxy(config_path: str | None = None) -> None:
         try:
             if mcp_auto_started and actual_name in MCP_STATEFUL_EXECUTION_TOOLS:
                 result = app.mcp_runtime_restarted_result(actual_name, via="cockpit_proxy")
-            elif actual_name == "verify_droplets":
-                result = await app.call_verify_droplets_observed(
-                    actual_arguments,
-                    source="cockpit_proxy",
-                    call_event_id=call_event.get("t"),
-                )
             else:
-                result = await app.mcp.call_tool(
-                    actual_name,
-                    actual_arguments,
-                    read_timeout_seconds=app.dashboard_user_tool_timeout_seconds(
+                guard_result = await app.mcp_health_guard_result(actual_name, via="cockpit_proxy")
+                if guard_result is not None:
+                    result = guard_result
+                elif actual_name == "verify_droplets":
+                    result = await app.call_verify_droplets_observed(
+                        actual_arguments,
+                        source="cockpit_proxy",
+                        call_event_id=call_event.get("t"),
+                    )
+                else:
+                    result = await app.mcp.call_tool(
                         actual_name,
                         actual_arguments,
-                    ),
-                )
+                        read_timeout_seconds=app.dashboard_user_tool_timeout_seconds(
+                            actual_name,
+                            actual_arguments,
+                        ),
+                    )
             if routed_tool:
                 result = app.annotate_routed_tool_result(result, name, actual_name)
             ok = mcp_tool_call_succeeded(result)
@@ -157,6 +161,12 @@ async def run_proxy(config_path: str | None = None) -> None:
                     if routed_tool
                     else {}
                 ),
+            )
+            app.maybe_start_melting_curve_monitor(
+                actual_name,
+                result,
+                call_event_id=call_event.get("t"),
+                via="cockpit_proxy",
             )
             return as_call_tool_result(result)
         except Exception as exc:

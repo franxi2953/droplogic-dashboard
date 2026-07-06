@@ -290,6 +290,9 @@ class LiveSnapshotMixin:
         sequence = self.next_live_sequence("scene:matrix")
         captured_at = datetime.now(timezone.utc).isoformat()
         annotated = dict(scene)
+        session_id = scene_session_id(annotated)
+        if session_id and not annotated.get("session_id"):
+            annotated["session_id"] = session_id
         annotated["dashboard_live"] = {
             "visualizer": "matrix",
             "sequence": sequence,

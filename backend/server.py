@@ -1415,6 +1415,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     else {}
                 ),
             )
+            stage_motion_invoked = False
             try:
                 mcp_auto_started = await self.ensure_mcp_started_for_tool(
                     via="dashboard_user",
@@ -1435,6 +1436,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                                 source="dashboard_user",
                                 call_event_id=event.get("t"),
                             )
+                            stage_motion_invoked = True
                         if actual_tool == "verify_droplets":
                             result, mcp_timing = await self.call_verify_droplets_observed_timed(
                                 actual_arguments,
@@ -1453,7 +1455,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     if routed_tool:
                         result = self.annotate_routed_tool_result(result, tool, actual_tool)
                 result = mark_failed_mcp_payload(result)
-                if actual_tool == "move_stage":
+                if actual_tool == "move_stage" and stage_motion_invoked:
                     await self.broadcast_stage_motion_end(
                         actual_arguments,
                         result=result,
@@ -1507,7 +1509,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     json.dumps({"type": "tool_result", "event": result_event, "result": event_result})
                 )
             except Exception as exc:
-                if actual_tool == "move_stage":
+                if actual_tool == "move_stage" and stage_motion_invoked:
                     await self.broadcast_stage_motion_end(
                         actual_arguments,
                         source="dashboard_user",
@@ -2840,6 +2842,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 if argument_overrides:
                     call_fields["argument_overrides"] = argument_overrides
                 call_event = await self.record("mcp_tool_call", **call_fields)
+                stage_motion_invoked = False
                 try:
                     tool_started = time.monotonic()
                     mcp_auto_started = await self.ensure_mcp_started_for_tool(
@@ -2859,6 +2862,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                                     source="agent",
                                     call_event_id=call_event.get("t"),
                                 )
+                                stage_motion_invoked = True
                             if tool == "verify_droplets":
                                 result = await self.call_verify_droplets_observed(
                                     call_arguments,
@@ -2869,7 +2873,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                                 result = await self.call_agent_mcp_tool(tool, call_arguments)
                     tool_total_seconds = time.monotonic() - tool_started
                     result = mark_failed_mcp_payload(result)
-                    if tool == "move_stage":
+                    if tool == "move_stage" and stage_motion_invoked:
                         await self.broadcast_stage_motion_end(
                             call_arguments,
                             result=result,
@@ -2915,7 +2919,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    if tool == "move_stage":
+                    if tool == "move_stage" and stage_motion_invoked:
                         await self.broadcast_stage_motion_end(
                             call_arguments,
                             source="agent",

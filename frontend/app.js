@@ -666,6 +666,14 @@ function matrixSceneIsStaleComparedTo(incoming, current) {
   return true;
 }
 
+function firstTimelineSeconds(...values) {
+  for (const value of values) {
+    const seconds = timelineSecondsFromValue(value);
+    if (Number.isFinite(seconds)) return seconds;
+  }
+  return NaN;
+}
+
 function matrixSceneFreshness(scene) {
   const executor = scene?.executor || scene?.executor_status || {};
   const applied = executor.last_applied_frame || scene?.last_applied_frame || {};
@@ -695,8 +703,8 @@ function matrixSceneFreshness(scene) {
     frameIndex: Number.isFinite(frameIndex) ? Math.trunc(Number(frameIndex)) : NaN,
     frameCount: Number.isFinite(frameCount) ? Math.trunc(Number(frameCount)) : NaN,
     sequence: firstFiniteNumber(scene?.dashboard_live_sequence, scene?.dashboard_live?.sequence),
-    appliedAt: firstFiniteNumber(applied.applied_at, executor.last_update, executor.last_frame?.finished_at),
-    updatedAt: firstFiniteNumber(scene?.updated_at, frame.updated_at, plan.updated_at),
+    appliedAt: firstTimelineSeconds(applied.applied_at, executor.last_update, executor.last_frame?.finished_at),
+    updatedAt: firstTimelineSeconds(scene?.updated_at, frame.updated_at, plan.updated_at),
   };
 }
 
