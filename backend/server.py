@@ -93,6 +93,7 @@ MCP_HEALTH_GUARDED_TOOLS = {
     "calibration_stage_move_to_target",
     "calibration_stage_set_speed",
     "capture_camera_image",
+    "capture_droplet_images",
     "capture_microscope_image",
     "configure_camera_imaging",
     "configure_microscope_imaging",

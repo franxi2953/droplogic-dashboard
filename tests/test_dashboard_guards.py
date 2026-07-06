@@ -12,6 +12,9 @@ class HealthGuardTests(unittest.TestCase):
     def test_melting_curve_capture_requires_health(self) -> None:
         self.assertTrue(CockpitApp.mcp_tool_requires_health("start_melting_curve_capture", {}))
 
+    def test_droplet_image_capture_requires_health(self) -> None:
+        self.assertTrue(CockpitApp.mcp_tool_requires_health("capture_droplet_images", {}))
+
 
 class ProxyStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_websocket_startup_failure_closes_started_servers(self) -> None:
