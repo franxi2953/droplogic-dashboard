@@ -5182,6 +5182,7 @@ function applyLiveScene(data) {
   const scene = data?.scene?.result || data?.scene;
   if (!scene?.available) return;
   const live = state.live && typeof state.live === "object" ? { ...state.live } : {};
+  if (data?.runtime && typeof data.runtime === "object") live.runtime = data.runtime;
   live.scene = scene;
   live.updated_at = data.updated_at || live.updated_at || new Date().toISOString();
   state.live = mergeLiveWithMatrixCache(live);

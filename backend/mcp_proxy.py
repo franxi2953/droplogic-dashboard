@@ -70,10 +70,17 @@ async def run_proxy(config_path: str | None = None) -> None:
 
     httpd = start_http_server(config.host, config.port, app.recorder.runs_dir)
     ws_port = config.port + 1
+    live_ws_port = config.port + 2
     ws_server = await websockets.serve(
         app.handle_ws,
         config.host,
         ws_port,
+        max_size=None,
+    )
+    live_ws_server = await websockets.serve(
+        app.handle_live_ws,
+        config.host,
+        live_ws_port,
         max_size=None,
     )
 
@@ -184,7 +191,9 @@ async def run_proxy(config_path: str | None = None) -> None:
         await app.stop_live_polling()
         await app.mcp.stop()
         ws_server.close()
+        live_ws_server.close()
         await ws_server.wait_closed()
+        await live_ws_server.wait_closed()
         httpd.shutdown()
 
 

@@ -209,6 +209,7 @@ async function installInstrumentation(page) {
       matrixRecords: [],
       wsMessages: [],
       longTasks: [],
+      wsAttachTimer: null,
     };
     try {
       const observer = new PerformanceObserver((list) => {
@@ -244,25 +245,39 @@ async function installInstrumentation(page) {
       wrapped.__agentMatrixBenchWrapped = true;
       window.renderMatrixScene = wrapped;
     }
-    const ws = window.__droplogicDebug?.state?.ws;
-    if (ws && !ws.__agentMatrixBenchListener) {
-      ws.__agentMatrixBenchListener = true;
-      ws.addEventListener("message", (event) => {
-        let data = null;
-        try {
-          data = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        const record = {
-          at: performance.now(),
-          type: data?.type || "",
-          event_type: data?.event?.type || "",
-          tool: data?.event?.tool || "",
-          live_frame: data?.scene?.frame?.index ?? data?.live?.scene?.frame?.index ?? null,
-        };
-        window.__DROPOLOGIC_AGENT_MATRIX_BENCH.wsMessages.push(record);
-      });
+    const recordWsMessage = (socket, event) => {
+      let data = null;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      const record = {
+        at: performance.now(),
+        socket,
+        type: data?.type || "",
+        event_type: data?.event?.type || "",
+        tool: data?.event?.tool || "",
+        live_frame: data?.scene?.frame?.index ?? data?.live?.scene?.frame?.index ?? null,
+      };
+      window.__DROPOLOGIC_AGENT_MATRIX_BENCH.wsMessages.push(record);
+    };
+    const attachWebSocket = (socket, ws) => {
+      if (!ws) return;
+      const key = socket === "live" ? "__agentMatrixBenchLiveListener" : "__agentMatrixBenchMainListener";
+      if (ws[key]) return;
+      ws[key] = true;
+      ws.addEventListener("message", (event) => recordWsMessage(socket, event));
+    };
+    const attachCurrentSockets = () => {
+      const debugState = window.__droplogicDebug?.state || {};
+      attachWebSocket("main", debugState.ws);
+      attachWebSocket("live", debugState.liveWs);
+    };
+    window.__DROPOLOGIC_AGENT_MATRIX_BENCH.attachCurrentSockets = attachCurrentSockets;
+    attachCurrentSockets();
+    if (!window.__DROPOLOGIC_AGENT_MATRIX_BENCH.wsAttachTimer) {
+      window.__DROPOLOGIC_AGENT_MATRIX_BENCH.wsAttachTimer = window.setInterval(attachCurrentSockets, 250);
     }
   });
 }

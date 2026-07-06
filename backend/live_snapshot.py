@@ -118,6 +118,7 @@ class LiveSnapshotMixin:
                                 "type": "live_scene",
                                 "updated_at": datetime.now(timezone.utc).isoformat(),
                                 "sequence": live_scene_sequence(scene),
+                                "runtime": self.live.get("runtime"),
                                 "scene": scene,
                             }
                         )
@@ -135,10 +136,10 @@ class LiveSnapshotMixin:
             states = {}
             self._live_loop_error_states = states
         key = (event_type, message)
-        state = states.get(key) or {"count": 0, "last_emit": 0.0}
+        state = states.get(key) or {"count": 0, "last_emit": 0.0, "emitted": False}
         state["count"] = int(state.get("count") or 0) + 1
         elapsed = now - float(state.get("last_emit") or 0.0)
-        if state["count"] == 1 or elapsed >= 10.0:
+        if not state.get("emitted") or elapsed >= 10.0:
             suppressed = max(0, state["count"] - 1)
             await self.record(
                 event_type,
@@ -151,6 +152,7 @@ class LiveSnapshotMixin:
             )
             state["count"] = 0
             state["last_emit"] = now
+            state["emitted"] = True
         states[key] = state
 
     async def collect_live_snapshot(
@@ -247,7 +249,11 @@ class LiveSnapshotMixin:
 
     def merge_live_scene(self, live: dict[str, Any], scene: dict[str, Any]) -> dict[str, Any]:
         next_live = dict(live or {})
-        next_live["scene"] = self.compact_live_scene(scene)
+        compact_scene = self.compact_live_scene(scene)
+        next_live["scene"] = compact_scene
+        runtime = runtime_with_scene_session(next_live.get("runtime"), compact_scene)
+        if runtime is not None:
+            next_live["runtime"] = runtime
         next_live["updated_at"] = datetime.now(timezone.utc).isoformat()
         return next_live
 
@@ -915,6 +921,34 @@ def live_runtime_session_id(root: Any) -> str | None:
         if value:
             return str(value)
     return None
+
+
+def runtime_with_scene_session(runtime: Any, scene: Any) -> Any:
+    session_id = scene_session_id(scene)
+    if not session_id:
+        return runtime
+    if not isinstance(runtime, dict):
+        return {"session_id": session_id}
+    if live_runtime_session_id(runtime) == session_id:
+        return runtime
+    updated = dict(runtime)
+    updated["session_id"] = session_id
+    for key in ("result", "value"):
+        nested = updated.get(key)
+        if isinstance(nested, dict):
+            nested_copy = dict(nested)
+            nested_copy["session_id"] = session_id
+            updated[key] = nested_copy
+    structured = updated.get("structuredContent")
+    if isinstance(structured, dict):
+        structured_copy = dict(structured)
+        structured_result = structured_copy.get("result")
+        if isinstance(structured_result, dict):
+            structured_result_copy = dict(structured_result)
+            structured_result_copy["session_id"] = session_id
+            structured_copy["result"] = structured_result_copy
+        updated["structuredContent"] = structured_copy
+    return updated
 
 
 def live_runtime_system_loaded(root: Any) -> bool | None:

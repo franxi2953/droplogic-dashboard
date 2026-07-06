@@ -351,7 +351,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if tool not in MCP_HEALTH_GUARDED_TOOLS or not self.mcp.running:
             return None
         health_result = await self.safe_tool("health_check", timeout_seconds=3.0)
-        health = compact_tool_payload(health_result)
+        health = self.normalized_health_payload(health_result)
         if isinstance(health, dict) and health.get("ok") is True:
             return None
         if not isinstance(health, dict):
@@ -378,6 +378,28 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 "After restart, re-load or rebuild the intended plan from the current physical state.",
             ],
         }
+
+    def normalized_health_payload(self, health_result: Any) -> Any:
+        raw_result = health_result.get("result") if isinstance(health_result, dict) and "result" in health_result else health_result
+        roots: list[Any] = []
+
+        def add(value: Any) -> None:
+            if value is not None and not any(value is root for root in roots):
+                roots.append(value)
+
+        add(compact_tool_payload(health_result))
+        for root in self.iter_payload_roots(raw_result):
+            add(root)
+        for root in roots:
+            if isinstance(root, dict) and root.get("ok") is True:
+                return root
+        for root in roots:
+            if isinstance(root, dict) and "ok" in root:
+                return root
+        for root in roots:
+            if isinstance(root, dict):
+                return root
+        return None
 
     def pinned_context_roots(self) -> list[tuple[str, Path]]:
         roots: list[tuple[str, Path]] = []
