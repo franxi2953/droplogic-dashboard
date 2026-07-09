@@ -16,6 +16,9 @@ LIVE_TIMELINE_FRAME_SAMPLE_LIMIT = 160
 LIVE_TIMELINE_FRAME_FOCUS_WINDOW = 24
 LIVE_TIMELINE_EDGE_FRAME_COUNT = 4
 LIVE_SCENE_SESSION_FALLBACK_MAX_AGE_SECONDS = 5.0
+LIVE_SCENE_SNAPSHOT_MAX_AGE_SECONDS = 10.0
+LIVE_VISUALIZER_FRAME_TIMEOUT_SECONDS = 2.0
+LIVE_DASHBOARD_SCENE_TIMEOUT_SECONDS = 2.0
 
 
 class LiveSnapshotMixin:
@@ -191,6 +194,7 @@ class LiveSnapshotMixin:
                 runtime_session_id=live_runtime_session_id(runtime),
             )
         if include_state:
+            runtime_result = None
             runtime_captured_ts = time.time()
             runtime_captured_at = datetime.now(timezone.utc).isoformat()
             if isinstance(scene, dict) and scene.get("available"):
@@ -216,6 +220,8 @@ class LiveSnapshotMixin:
                 runtime = dict(runtime)
                 runtime["dashboard_live_captured_at"] = runtime_captured_at
                 runtime["dashboard_live_captured_ts"] = runtime_captured_ts
+                if isinstance(runtime_result, dict) and runtime_result.get("dashboard_timing"):
+                    runtime["dashboard_live_tool_timing"] = runtime_result["dashboard_timing"]
             self._direct_stream_available = streamer_direct_stream_available(visualizer_status)
         if not (isinstance(scene, dict) and scene.get("available")):
             scene = await self.safe_dashboard_scene(
@@ -474,13 +480,15 @@ class LiveSnapshotMixin:
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         try:
+            result, timing = await self.mcp.call_tool_timed(
+                tool,
+                arguments or {},
+                read_timeout_seconds=timeout_seconds,
+            )
             return {
                 "ok": True,
-                "result": await self.mcp.call_tool(
-                    tool,
-                    arguments or {},
-                    read_timeout_seconds=timeout_seconds,
-                ),
+                "result": result,
+                "dashboard_timing": timing,
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -505,6 +513,7 @@ class LiveSnapshotMixin:
         result = await self.safe_tool(
             "dashboard_scene",
             {"max_path_points": 256, "max_droplet_cells": 1024},
+            timeout_seconds=LIVE_DASHBOARD_SCENE_TIMEOUT_SECONDS,
         )
         scene = compact_tool_payload(result)
         if isinstance(scene, dict) and "available" in scene:
@@ -525,6 +534,8 @@ class LiveSnapshotMixin:
                         scene["coordinate_mapping"] = mapping
                 scene = self.attach_cartridge_metadata(scene)
                 scene["transport"] = "dashboard_scene_tool"
+                if result.get("dashboard_timing"):
+                    scene["dashboard_live_tool_timing"] = result["dashboard_timing"]
                 return scene
         fallback = await self.read_dashboard_scene_snapshot_async(runtime_session_id=runtime_session_id)
         if fallback is scene:
@@ -585,6 +596,20 @@ class LiveSnapshotMixin:
             if snapshot_stat is not None:
                 scene["dashboard_snapshot_mtime"] = snapshot_stat.st_mtime
                 scene["dashboard_snapshot_mtime_ns"] = snapshot_stat.st_mtime_ns
+                snapshot_age = max(0.0, time.time() - snapshot_stat.st_mtime)
+                scene["dashboard_snapshot_age_seconds"] = round(snapshot_age, 3)
+                max_age = self.live_scene_snapshot_max_age_seconds()
+                if snapshot_age > max_age:
+                    return {
+                        "available": False,
+                        "reason": "scene_snapshot_stale",
+                        "session_id": snapshot_session_id,
+                        "runtime_session_id": runtime_session_id,
+                        "dashboard_snapshot_mtime": snapshot_stat.st_mtime,
+                        "dashboard_snapshot_mtime_ns": snapshot_stat.st_mtime_ns,
+                        "dashboard_snapshot_age_seconds": round(snapshot_age, 3),
+                        "dashboard_snapshot_max_age_seconds": max_age,
+                    }
             if not scene.get("coordinate_mapping"):
                 mapping = self.dashboard_coordinate_mapping()
                 if mapping:
@@ -629,6 +654,16 @@ class LiveSnapshotMixin:
             except Exception:
                 continue
         return None
+
+    def live_scene_snapshot_max_age_seconds(self) -> float:
+        state_interval = number_or_none(getattr(self.config, "live_state_interval_seconds", 1.0))
+        scene_interval = number_or_none(getattr(self.config, "live_scene_interval_seconds", 0.1))
+        interval = max(
+            0.0,
+            state_interval if state_interval is not None else 1.0,
+            scene_interval if scene_interval is not None else 0.1,
+        )
+        return max(LIVE_SCENE_SNAPSHOT_MAX_AGE_SECONDS, 6.0 * interval)
 
     def dashboard_coordinate_mapping(self) -> dict[str, Any] | None:
         config_path = DROPLOGIC_ROOT / "config.json"
@@ -724,10 +759,14 @@ class LiveSnapshotMixin:
         result = await self.safe_tool(
             "visualizer_frame",
             arguments,
+            timeout_seconds=LIVE_VISUALIZER_FRAME_TIMEOUT_SECONDS,
         )
         if not result.get("ok"):
             return result
         payload = compact_tool_payload(result)
+        if isinstance(payload, dict) and result.get("dashboard_timing"):
+            payload = dict(payload)
+            payload["dashboard_live_tool_timing"] = result["dashboard_timing"]
         return payload if isinstance(payload, dict) else {"ok": True, "result": payload}
 
 

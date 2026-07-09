@@ -17,6 +17,7 @@ from .context_builder import (
     encoded_json_length,
     stale_state_snapshot_indices,
 )
+from .pinned_context import parse_guide_shard_selection
 
 
 RETRY_PAYLOAD_COMPACT_EVERY = 5
@@ -286,6 +287,79 @@ class AiProvider:
             text = f"{text[: max_chars - 200].rstrip()}\n\n[AI memory truncated to configured limit.]"
         return text
 
+    async def select_guide_shards(
+        self,
+        prompt: str,
+        events: list[dict[str, Any]],
+        shard_catalog: list[dict[str, Any]],
+        max_files: int = 5,
+        on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        if not self.configured or not shard_catalog:
+            return {"paths": [], "reason": "guide shard selection unavailable"}
+
+        allowed_paths = [str(item.get("path") or "") for item in shard_catalog if item.get("path")]
+        selection_context = [
+            build_run_memory(events),
+            *events[-20:],
+        ]
+        instructions = (
+            "Select DropLogic BoxMini guide shards to refresh before the next agent turn. "
+            "You are not executing the task. Choose only files whose detailed rules are likely "
+            "needed for this exact user request, active goal, recent tool failures, or safety risk. "
+            f"Return only JSON with keys `paths` and `reason`. `paths` must contain 0 to {max_files} "
+            "items from the provided catalog, with no invented paths."
+        )
+        content = (
+            f"User request:\n{prompt}\n\n"
+            f"Available guide shards:\n{json.dumps(shard_catalog, ensure_ascii=True, default=str)}\n\n"
+            "Compact recent run context:\n"
+            f"{json.dumps(selection_context, ensure_ascii=True, default=str)}"
+        )
+
+        if uses_anthropic_messages(self.config):
+            payload = {
+                "model": self.config.model,
+                "system": instructions,
+                "max_tokens": 1200,
+                "messages": [{"role": "user", "content": content}],
+            }
+            data = await self._post_anthropic_message(
+                payload,
+                on_retry=on_retry,
+                on_retry_compact=retry_payload_compactor(payload, on_context_compacted=on_context_compacted),
+            )
+            text = extract_anthropic_text(data)
+        elif uses_chat_completions(self.config):
+            payload = {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": content},
+                ],
+            }
+            data = await self._post_chat_completion(
+                payload,
+                on_retry=on_retry,
+                on_retry_compact=retry_payload_compactor(payload, on_context_compacted=on_context_compacted),
+            )
+            text = extract_chat_response_text(data)
+        else:
+            payload = {
+                "model": self.config.model,
+                "instructions": instructions,
+                "input": [{"role": "user", "content": content}],
+            }
+            data = await self._post_response(
+                payload,
+                on_retry=on_retry,
+                on_retry_compact=retry_payload_compactor(payload, on_context_compacted=on_context_compacted),
+            )
+            text = extract_response_text(data)
+
+        return parse_guide_shard_selection(text, allowed_paths=allowed_paths, max_files=max_files)
+
     async def ask_with_tools(
         self,
         prompt: str,
@@ -349,14 +423,15 @@ class AiProvider:
             "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
             "If execute_segment_to_breakpoint starts a background wait, call "
             "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
-            "repeated immediate status calls."
+            "repeated immediate status calls. If background planning is running, call "
+            "planning_job_status once and wait for its returned result instead of polling in a tight loop."
         )
+        effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
         response_tools = mcp_tools_to_response_tools(tools)
         input_list: list[dict[str, Any]] = [
             {
                 "role": "user",
                 "content": (
-                    f"{format_pinned_context(pinned_context)}"
                     f"Curated dashboard event log JSON for model context:\n{context}\n\n"
                     f"User request:\n{prompt}"
                 ),
@@ -364,7 +439,7 @@ class AiProvider:
         ]
         payload = {
             "model": self.config.model,
-            "instructions": instructions,
+            "instructions": effective_instructions,
             "input": input_list,
             "tools": response_tools,
             "tool_choice": "auto",
@@ -443,7 +518,7 @@ class AiProvider:
             )
             followup = {
                 "model": self.config.model,
-                "instructions": instructions,
+                "instructions": effective_instructions,
                 "input": input_list,
                 "tools": response_tools,
             }
@@ -529,14 +604,15 @@ class AiProvider:
             "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
             "If execute_segment_to_breakpoint starts a background wait, call "
             "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
-            "repeated immediate status calls."
+            "repeated immediate status calls. If background planning is running, call "
+            "planning_job_status once and wait for its returned result instead of polling in a tight loop."
         )
+        effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": instructions},
+            {"role": "system", "content": effective_instructions},
             {
                 "role": "user",
                 "content": (
-                    f"{format_pinned_context(pinned_context)}"
                     f"Curated dashboard event log JSON for model context:\n{context}\n\n"
                     f"User request:\n{prompt}"
                 ),
@@ -684,13 +760,14 @@ class AiProvider:
             "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
             "If execute_segment_to_breakpoint starts a background wait, call "
             "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
-            "repeated immediate status calls."
+            "repeated immediate status calls. If background planning is running, call "
+            "planning_job_status once and wait for its returned result instead of polling in a tight loop."
         )
+        effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
         messages: list[dict[str, Any]] = [
             {
                 "role": "user",
                 "content": (
-                    f"{format_pinned_context(pinned_context)}"
                     f"Curated dashboard event log JSON for model context:\n{context}\n\n"
                     f"User request:\n{prompt}"
                 ),
@@ -699,7 +776,7 @@ class AiProvider:
         anthropic_tools = mcp_tools_to_anthropic_tools(tools)
         payload = {
             "model": self.config.model,
-            "system": instructions,
+            "system": effective_instructions,
             "messages": messages,
             "tools": anthropic_tools,
             "max_tokens": 8192,
@@ -767,7 +844,7 @@ class AiProvider:
             )
             followup = {
                 "model": self.config.model,
-                "system": instructions,
+                "system": effective_instructions,
                 "messages": messages,
                 "tools": anthropic_tools,
                 "max_tokens": 8192,
@@ -1467,9 +1544,18 @@ def format_pinned_context(pinned_context: str | None) -> str:
         return ""
     return (
         "Pinned BoxMini operating context. This is authoritative and is resent on every "
-        "agent turn; do not treat the compacted event log as replacing it.\n"
+        "agent turn; do not treat the compacted event log as replacing it. Any "
+        "`Turn-Scoped Detailed Guide Expansions` section applies only to this model "
+        "turn and must be re-selected on future turns.\n"
         f"{text}\n\n"
     )
+
+
+def instructions_with_pinned_context(instructions: str, pinned_context: str | None) -> str:
+    pinned = format_pinned_context(pinned_context).strip()
+    if not pinned:
+        return instructions
+    return f"{instructions}\n\n{pinned}"
 
 
 def model_response_metrics(

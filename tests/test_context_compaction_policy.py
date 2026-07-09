@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 
 from backend.context_builder import build_model_context, latest_tool_results_by_tool, old_tool_event_indices
-from backend.pinned_context import compact_pinned_context_file
+from backend.config import DROPLOGIC_ROOT
+from backend.pinned_context import (
+    build_guide_expansion_context,
+    compact_pinned_context_file,
+    guide_shard_catalog,
+    parse_guide_shard_selection,
+)
 
 
 class ContextCompactionPolicyTests(unittest.TestCase):
@@ -34,6 +41,34 @@ class ContextCompactionPolicyTests(unittest.TestCase):
 
         self.assertEqual([event["tool"] for event in raw_results], ["runtime_status", "plan_summary"])
         self.assertEqual([event["result"]["i"] for event in raw_results], [9, 9])
+
+    def test_old_failed_tool_results_are_compacted_by_tool(self) -> None:
+        events = []
+        for index in range(6):
+            call_t = float(len(events) + 1)
+            events.append({"type": "mcp_tool_call", "t": call_t, "tool": "executor_status", "arguments": {"i": index}})
+            events.append(
+                {
+                    "type": "mcp_tool_result",
+                    "t": float(len(events) + 1),
+                    "tool": "executor_status",
+                    "ok": False,
+                    "call_event_id": call_t,
+                    "error": f"executor failed {index}",
+                    "result": {"details": "x" * 200},
+                }
+            )
+
+        compact_indices = old_tool_event_indices(events)
+        raw_results = [
+            event
+            for index, event in enumerate(events)
+            if event.get("type") == "mcp_tool_result" and index not in compact_indices
+        ]
+
+        self.assertEqual(len(raw_results), 1)
+        self.assertEqual(raw_results[0]["tool"], "executor_status")
+        self.assertEqual(raw_results[0]["error"], "executor failed 5")
 
     def test_latest_tool_results_are_ordered_by_latest_event_index(self) -> None:
         events = [
@@ -125,18 +160,103 @@ class ContextCompactionPolicyTests(unittest.TestCase):
         self.assertEqual(latest_result["result"], {"i": 4})
         self.assertTrue(latest_result["_protected_latest_tool_output"])
 
-    def test_agent_guide_is_sent_as_turn_manual(self) -> None:
-        large_guide = "# BoxMini Agent Quick Guide\n\n" + "\n".join(
+    def test_large_agent_guide_uses_generic_heading_index(self) -> None:
+        large_guide = "# BoxMini Agent Guide\n\n" + "\n".join(
             f"## Section {index}\nImportant detail {index}."
-            for index in range(200)
+            for index in range(500)
         )
 
         compacted, metadata = compact_pinned_context_file("agent-guide.md", large_guide)
 
         self.assertTrue(metadata["compacted"])
         self.assertLess(metadata["sent_chars"], metadata["original_chars"])
-        self.assertIn("BoxMini Turn Manual", compacted)
-        self.assertIn("Use read_context_file", compacted)
+        self.assertIn("Compacted Pinned Context", compacted)
+        self.assertIn("read_context_file", compacted)
+        self.assertIn("-   Section 0", compacted)
+
+    def test_agent_guide_entrypoint_is_sent_inline_when_under_limit(self) -> None:
+        guide = "\n".join(
+            [
+                "# BoxMini Agent Guide",
+                "This is the pinned entrypoint.",
+                "## Guide Expansion Protocol",
+                "- Detailed rules live in `agent-guide/*.md`.",
+                "## Detailed Guide Files",
+                "- `agent-guide/06-planning-execution-rhythm.md`: planning details.",
+            ]
+        )
+
+        compacted, metadata = compact_pinned_context_file("agent-guide.md", guide)
+
+        self.assertFalse(metadata["compacted"])
+        self.assertEqual(compacted, guide)
+        self.assertIn("# BoxMini Agent Guide", compacted)
+        self.assertIn("agent-guide/06-planning-execution-rhythm.md", compacted)
+        self.assertNotIn("Relevant Full Guide Sections", compacted)
+
+    def test_real_agent_guide_shards_catalog_and_expand_routing_docs(self) -> None:
+        guide_root = DROPLOGIC_ROOT / "droplogic" / "mcp" / "context" / "boxmini"
+        if not Path(guide_root / "agent-guide").exists():
+            self.skipTest(f"BoxMini guide shards not found at {guide_root / 'agent-guide'}")
+
+        catalog = guide_shard_catalog(guide_root)
+        paths = {item["path"] for item in catalog}
+
+        self.assertIn("agent-guide/05-visualizers-cockpit-stage.md", paths)
+        self.assertIn("agent-guide/06-planning-execution-rhythm.md", paths)
+        self.assertIn("agent-guide/07-droplets-reservoirs-injection.md", paths)
+        self.assertIn("agent-guide/08-reservoir-extraction.md", paths)
+        self.assertIn("agent-guide/09-execution-view-modes-diagnostics.md", paths)
+
+        expanded, metadata = build_guide_expansion_context(
+            guide_root,
+            [
+                "agent-guide/05-visualizers-cockpit-stage.md",
+                "agent-guide/06-planning-execution-rhythm.md",
+                "agent-guide/07-droplets-reservoirs-injection.md",
+                "agent-guide/08-reservoir-extraction.md",
+                "agent-guide/09-execution-view-modes-diagnostics.md",
+            ],
+        )
+
+        self.assertGreater(len(metadata), 0)
+        self.assertIn("## Planning And Execution Rhythm", expanded)
+        self.assertIn("target_validation.suggested_targets", expanded)
+        self.assertIn("## Droplets, Reservoirs, And Injection", expanded)
+        self.assertIn("intermediate parking position", expanded)
+        self.assertIn("## Reservoir Extraction", expanded)
+        self.assertIn("## Visualizers, Cockpit, And Stage", expanded)
+        self.assertIn("## Execution View Modes And Diagnostics", expanded)
+        self.assertIn("whole_chip_camera", expanded)
+
+    def test_guide_shard_selection_parser_filters_unknown_paths(self) -> None:
+        selection = parse_guide_shard_selection(
+            '{"paths":["agent-guide/06-planning-execution-rhythm.md","agent-guide/missing.md",'
+            '"agent-guide/07-droplets-reservoirs-injection.md"],"reason":"routing"}',
+            allowed_paths=[
+                "agent-guide/06-planning-execution-rhythm.md",
+                "agent-guide/07-droplets-reservoirs-injection.md",
+            ],
+            max_files=1,
+        )
+
+        self.assertEqual(selection["paths"], ["agent-guide/06-planning-execution-rhythm.md"])
+
+    def test_agent_guide_does_not_inject_keyword_selected_sections(self) -> None:
+        guide = "\n".join(
+            [
+                "# BoxMini Agent Guide",
+                "## Planning And Execution Rhythm",
+                "Use target_validation.suggested_targets and split batches.",
+                "## Droplets, Reservoirs, And Injection",
+                "Move blockers to intermediate parking positions.",
+            ]
+        )
+
+        compacted, _metadata = compact_pinned_context_file("agent-guide.md", guide)
+
+        self.assertNotIn("Relevant Full Guide Sections", compacted)
+        self.assertIn("Use target_validation.suggested_targets and split batches.", compacted)
 
     def test_large_json_context_keeps_structured_cartridge_fields(self) -> None:
         cartridge = {

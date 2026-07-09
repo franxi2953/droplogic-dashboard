@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
+import json
+import tempfile
 import types
 import unittest
+from types import SimpleNamespace
 
 sys.modules.setdefault("httpx", types.ModuleType("httpx"))
 from backend.live_snapshot import (
@@ -174,6 +177,31 @@ class SceneSessionFallbackTests(unittest.TestCase):
                 now=1001.0,
             )
         )
+
+
+class LiveSceneSnapshotFileTests(unittest.TestCase):
+    def test_read_dashboard_scene_snapshot_rejects_stale_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = f"{temp_dir}/dashboard_scene.json"
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"available": True, "session_id": "session-1"}, handle)
+
+            app = FakeLiveSnapshot()
+            app.config = SimpleNamespace(
+                live_state_interval_seconds=1.0,
+                live_scene_interval_seconds=0.1,
+                mcp=SimpleNamespace(env={"DROPLOGIC_DASHBOARD_SCENE_PATH": path}),
+            )
+            old_time = 1000.0
+            import os
+
+            os.utime(path, (old_time, old_time))
+
+            scene = app.read_dashboard_scene_snapshot(runtime_session_id="session-1")
+
+            self.assertFalse(scene["available"])
+            self.assertEqual(scene["reason"], "scene_snapshot_stale")
+            self.assertGreater(scene["dashboard_snapshot_age_seconds"], scene["dashboard_snapshot_max_age_seconds"])
 
 
 if __name__ == "__main__":
