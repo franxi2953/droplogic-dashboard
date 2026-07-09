@@ -96,6 +96,34 @@ class ContextCompactionPolicyTests(unittest.TestCase):
         self.assertEqual(latest_result["result"], {"i": 4})
         self.assertTrue(latest_result["_protected_latest_tool_output"])
 
+    def test_latest_tool_result_survives_final_history_summary(self) -> None:
+        events = []
+        for index in range(5):
+            call_t = float(len(events) + 1)
+            events.append({"type": "mcp_tool_call", "t": call_t, "tool": "runtime_status", "arguments": {"i": index}})
+            events.append(
+                {
+                    "type": "mcp_tool_result",
+                    "t": float(len(events) + 1),
+                    "tool": "runtime_status",
+                    "ok": True,
+                    "call_event_id": call_t,
+                    "result": {"i": index},
+                }
+            )
+        for index in range(170):
+            events.append({"type": "agent_note", "message": f"temperature sample {index}"})
+
+        model_context = build_model_context(events, recent_event_target=80, large_event_chars=1_000)
+        retained_events = model_context.events[1:]
+        latest_result = next(event for event in retained_events if event.get("type") == "mcp_tool_result")
+
+        self.assertEqual(model_context.events[0]["type"], "run_memory")
+        self.assertEqual(model_context.events[0]["retained_recent_event_count"], 80)
+        self.assertEqual(len(retained_events), 80)
+        self.assertEqual(latest_result["result"], {"i": 4})
+        self.assertTrue(latest_result["_protected_latest_tool_output"])
+
     def test_agent_guide_is_sent_as_turn_manual(self) -> None:
         large_guide = "# BoxMini Agent Quick Guide\n\n" + "\n".join(
             f"## Section {index}\nImportant detail {index}."

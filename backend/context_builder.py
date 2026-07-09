@@ -142,6 +142,14 @@ def build_model_context(
             current_chars += event_chars
 
         selected_events = list(reversed(selected_reversed))
+        selected_events = carry_protected_latest_tool_result(
+            compacted_events,
+            selected_events,
+            latest_tool_result_index,
+            memory,
+            target_chars,
+            recent_event_target,
+        )
         omitted_events = max(0, len(compacted_events) - len(selected_events))
 
     model_events = selected_events
@@ -235,6 +243,53 @@ def should_summarize_event_history(
     if after_compact_chars > target_chars:
         return True
     return event_count > recent_event_target * 2
+
+
+def carry_protected_latest_tool_result(
+    compacted_events: list[dict[str, Any]],
+    selected_events: list[dict[str, Any]],
+    latest_tool_result_index: int | None,
+    memory: dict[str, Any],
+    budget: int,
+    recent_event_target: int,
+) -> list[dict[str, Any]]:
+    if latest_tool_result_index is None:
+        return selected_events
+    if latest_tool_result_index < 0 or latest_tool_result_index >= len(compacted_events):
+        return selected_events
+
+    protected_event = compacted_events[latest_tool_result_index]
+    if any(event is protected_event for event in selected_events):
+        return selected_events
+
+    event_indices = {id(event): index for index, event in enumerate(compacted_events)}
+    selected = list(selected_events)
+    insert_index = len(selected)
+    for index, event in enumerate(selected):
+        if event_indices.get(id(event), len(compacted_events)) > latest_tool_result_index:
+            insert_index = index
+            break
+    selected.insert(insert_index, protected_event)
+
+    def removable_index() -> int | None:
+        for index, event in enumerate(selected):
+            if event is not protected_event:
+                return index
+        return None
+
+    while len(selected) > max(1, recent_event_target):
+        index = removable_index()
+        if index is None:
+            break
+        del selected[index]
+
+    while len(selected) > 1 and encoded_json_length([memory, *selected]) > budget:
+        index = removable_index()
+        if index is None:
+            break
+        del selected[index]
+
+    return selected
 
 
 def compact_tool_output_for_model(
