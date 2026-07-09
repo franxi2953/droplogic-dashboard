@@ -827,7 +827,7 @@ def latest_tool_results_by_tool(events: list[dict[str, Any]]) -> list[dict[str, 
             "ok": event.get("ok"),
             "summary": summarize_event_line(event),
         }
-    return list(latest.values())
+    return sorted(latest.values(), key=lambda item: item["event_index"])
 
 
 def build_ai_memory_event(ai_summary: str) -> dict[str, Any]:

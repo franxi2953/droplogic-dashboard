@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from backend.context_builder import old_tool_event_indices
+from backend.context_builder import latest_tool_results_by_tool, old_tool_event_indices
 from backend.pinned_context import compact_pinned_context_file
 
 
@@ -33,6 +33,38 @@ class ContextCompactionPolicyTests(unittest.TestCase):
 
         self.assertEqual([event["tool"] for event in raw_results], ["runtime_status", "plan_summary"])
         self.assertEqual([event["result"]["i"] for event in raw_results], [9, 9])
+
+    def test_latest_tool_results_are_ordered_by_latest_event_index(self) -> None:
+        events = [
+            {
+                "type": "mcp_tool_result",
+                "tool": "core_status",
+                "ok": True,
+                "result": {"generation": 0},
+            }
+        ]
+        for index in range(31):
+            events.append(
+                {
+                    "type": "mcp_tool_result",
+                    "tool": f"tool_{index}",
+                    "ok": True,
+                    "result": {"generation": index},
+                }
+            )
+        events.append(
+            {
+                "type": "mcp_tool_result",
+                "tool": "core_status",
+                "ok": True,
+                "result": {"generation": 1},
+            }
+        )
+
+        retained_tools = [item["tool"] for item in latest_tool_results_by_tool(events)[-30:]]
+
+        self.assertIn("core_status", retained_tools)
+        self.assertNotIn("tool_0", retained_tools)
 
     def test_agent_guide_is_sent_as_turn_manual(self) -> None:
         large_guide = "# BoxMini Agent Quick Guide\n\n" + "\n".join(
