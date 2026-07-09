@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from backend.context_builder import build_model_context, latest_tool_results_by_tool, old_tool_event_indices
@@ -136,6 +137,50 @@ class ContextCompactionPolicyTests(unittest.TestCase):
         self.assertLess(metadata["sent_chars"], metadata["original_chars"])
         self.assertIn("BoxMini Turn Manual", compacted)
         self.assertIn("Use read_context_file", compacted)
+
+    def test_large_json_context_keeps_structured_cartridge_fields(self) -> None:
+        cartridge = {
+            "cartridge": {
+                "name": "boxmini",
+                "geometry": {
+                    "matrix": {"rows": 32, "columns": 48},
+                    "electrode_pitch_um": 550,
+                    "injection_holes": [
+                        {"id": "left", "row": 4, "column": 2},
+                        {"id": "right", "row": 27, "column": 45},
+                    ],
+                },
+                "stage_presets": {
+                    "manual_injection": {"row": 4, "column": 2},
+                    "whole_chip_camera": {"row": 16, "column": 24},
+                },
+            },
+            "padding": "x" * 13_000,
+        }
+
+        compacted, metadata = compact_pinned_context_file("cartridge.default.json", json.dumps(cartridge))
+
+        self.assertTrue(metadata["compacted"])
+        self.assertLess(metadata["sent_chars"], metadata["original_chars"])
+        self.assertIn("Compacted JSON Pinned Context", compacted)
+        self.assertIn("read_context_file", compacted)
+        self.assertIn("Top-level keys (2): cartridge, padding", compacted)
+        self.assertIn("$.cartridge.geometry.matrix: object with 2 keys (rows, columns)", compacted)
+        self.assertIn("$.cartridge.geometry.matrix.rows: 32", compacted)
+        self.assertIn("$.cartridge.geometry.matrix.columns: 48", compacted)
+        self.assertIn("$.cartridge.geometry.injection_holes: array[2]", compacted)
+        self.assertIn("$.cartridge.stage_presets.manual_injection", compacted)
+        self.assertNotIn("No markdown headings found", compacted)
+
+    def test_large_markdown_context_still_uses_heading_index(self) -> None:
+        large_markdown = "# Root\n\n" + "\n".join(f"## Section {index}\nBody." for index in range(700))
+
+        compacted, metadata = compact_pinned_context_file("operator-notes.md", large_markdown)
+
+        self.assertTrue(metadata["compacted"])
+        self.assertIn("## Headings", compacted)
+        self.assertIn("- Root", compacted)
+        self.assertIn("-   Section 0", compacted)
 
 
 if __name__ == "__main__":
