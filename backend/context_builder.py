@@ -35,8 +35,9 @@ STATE_SNAPSHOT_TOOLS = {
     "timeline_status",
 }
 STATE_SNAPSHOT_KEEP_RECENT = 1
-RECENT_TOOL_EVENT_KEEP = 12
 RECENT_TOOL_EVENT_ALWAYS_KEEP = 4
+RECENT_TOOL_RESULT_MAX_AGE_EVENTS = 80
+RECENT_PENDING_TOOL_CALL_MAX_AGE_EVENTS = 20
 NOISY_LIVE_EVENT_TYPES = {
     "live_poll_error",
     "live_scene_error",
@@ -373,29 +374,60 @@ def compact_stale_state_event(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def old_tool_event_indices(events: list[dict[str, Any]]) -> set[int]:
-    """Select older tool chatter that should become a compact timeline marker.
+    """Select tool chatter that should become a compact timeline marker.
 
     Tool calls/results dominate long dashboard histories. The complete event log
-    stays on disk; model context only needs recent tool detail plus errors.
+    stays on disk; model context gets at most one recent non-error result per
+    tool, plus the matching call and any recent pending call.
     """
     tool_indices = [
         index
         for index, event in enumerate(events)
         if event.get("type") in {"mcp_tool_call", "mcp_tool_result"}
     ]
-    if len(tool_indices) <= RECENT_TOOL_EVENT_KEEP:
+    if len(tool_indices) <= RECENT_TOOL_EVENT_ALWAYS_KEEP:
         return set()
-    recent_keep = set(tool_indices[-RECENT_TOOL_EVENT_KEEP:])
-    always_keep = set(tool_indices[-RECENT_TOOL_EVENT_ALWAYS_KEEP:])
-    selected: set[int] = set()
-    for index in tool_indices:
-        if index in recent_keep or index in always_keep:
-            continue
+
+    call_index_by_event_id = {
+        str(event.get("t")): index
+        for index, event in enumerate(events)
+        if event.get("type") == "mcp_tool_call" and event.get("t") is not None
+    }
+    keep_indices: set[int] = set()
+    kept_result_tools: set[str] = set()
+    kept_pending_call_tools: set[str] = set()
+    result_call_ids: set[str] = set()
+
+    for index in range(len(events) - 1, -1, -1):
         event = events[index]
-        if event.get("level") == "error" or event.get("ok") is False or event.get("error"):
+        event_type = event.get("type")
+        if event_type not in {"mcp_tool_call", "mcp_tool_result"}:
             continue
-        selected.add(index)
-    return selected
+        if event.get("level") == "error" or event.get("ok") is False or event.get("error"):
+            keep_indices.add(index)
+            continue
+        tool = str(event.get("tool") or "")
+        if not tool:
+            continue
+        age = len(events) - 1 - index
+        if event_type == "mcp_tool_result":
+            call_id = str(event.get("call_event_id") or "")
+            if call_id:
+                result_call_ids.add(call_id)
+            if tool not in kept_result_tools and age <= RECENT_TOOL_RESULT_MAX_AGE_EVENTS:
+                keep_indices.add(index)
+                kept_result_tools.add(tool)
+                if call_id and call_id in call_index_by_event_id:
+                    keep_indices.add(call_index_by_event_id[call_id])
+            continue
+        call_id = str(event.get("t") or "")
+        if call_id and call_id in result_call_ids:
+            continue
+        if tool not in kept_pending_call_tools and age <= RECENT_PENDING_TOOL_CALL_MAX_AGE_EVENTS:
+            keep_indices.add(index)
+            kept_pending_call_tools.add(tool)
+
+    return {index for index in tool_indices if index not in keep_indices}
 
 
 def compact_old_tool_event(event: dict[str, Any]) -> dict[str, Any]:
@@ -752,6 +784,17 @@ def build_run_memory(events: list[dict[str, Any]]) -> dict[str, Any]:
                 }
             )
 
+    working_state = {
+        "recent_user_goal": short_text(prompts[-1], 900) if prompts else "",
+        "last_agent_response": short_text(responses[-1], 700) if responses else "",
+        "last_error": errors[-1] if errors else "",
+        "latest_state_snapshots": list(latest_state_snapshots.values())[-20:],
+        "latest_tool_results_by_tool": latest_tool_results_by_tool(events)[-30:],
+        "note": (
+            "This working state is compact memory, not proof of live hardware state. "
+            "Refresh physical state before hardware actions."
+        ),
+    }
     return {
         "type": "run_memory",
         "message": (
@@ -766,7 +809,25 @@ def build_run_memory(events: list[dict[str, Any]]) -> dict[str, Any]:
         "recent_errors": errors[-8:],
         "latest_tool_events": latest_tools[-16:],
         "latest_state_snapshots": list(latest_state_snapshots.values())[-20:],
+        "working_state": {key: value for key, value in working_state.items() if value not in ("", [], {})},
     }
+
+
+def latest_tool_results_by_tool(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for index, event in enumerate(events):
+        if event.get("type") != "mcp_tool_result" or event.get("error"):
+            continue
+        tool = str(event.get("tool") or "")
+        if not tool:
+            continue
+        latest[tool] = {
+            "event_index": index,
+            "tool": tool,
+            "ok": event.get("ok"),
+            "summary": summarize_event_line(event),
+        }
+    return list(latest.values())
 
 
 def build_ai_memory_event(ai_summary: str) -> dict[str, Any]:

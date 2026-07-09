@@ -37,6 +37,7 @@ if __package__ in {None, ""}:
     )
     from backend.live_snapshot import LiveSnapshotMixin
     from backend.mcp_client import McpStdioClient
+    from backend.pinned_context import compact_pinned_context_file
     from backend.recorder import RunRecorder
     from backend.runtime_utils import safe_filename, websocket_closed_ok
     from backend.tool_payloads import (
@@ -64,6 +65,7 @@ else:
     )
     from .live_snapshot import LiveSnapshotMixin
     from .mcp_client import McpStdioClient
+    from .pinned_context import compact_pinned_context_file
     from .recorder import RunRecorder
     from .runtime_utils import safe_filename, websocket_closed_ok
     from .tool_payloads import (
@@ -450,20 +452,23 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 continue
             source, path, root = found
             text = path.read_text(encoding="utf-8")
+            context_text, context_metadata = compact_pinned_context_file(clean_path, text)
             loaded.append(
                 {
                     "path": clean_path,
                     "source": source,
                     "root": str(root),
                     "chars": len(text),
+                    **context_metadata,
                 }
             )
-            sections.append(f"### {clean_path} ({source})\n{text.strip()}")
+            sections.append(f"### {clean_path} ({source})\n{context_text.strip()}")
 
         metadata = {
             "files": loaded,
             "missing": missing,
             "total_chars": sum(item["chars"] for item in loaded),
+            "sent_chars": sum(int(item.get("sent_chars") or item["chars"]) for item in loaded),
         }
         context = "\n\n".join(sections)
         return context, metadata
