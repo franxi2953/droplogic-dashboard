@@ -4,7 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-from backend.context_builder import build_model_context, latest_tool_results_by_tool, old_tool_event_indices
+from backend.context_builder import build_model_context, compact_old_tool_event, latest_tool_results_by_tool, old_tool_event_indices
 from backend.config import DROPLOGIC_ROOT
 from backend.pinned_context import (
     build_guide_expansion_context,
@@ -69,6 +69,25 @@ class ContextCompactionPolicyTests(unittest.TestCase):
         self.assertEqual(len(raw_results), 1)
         self.assertEqual(raw_results[0]["tool"], "executor_status")
         self.assertEqual(raw_results[0]["error"], "executor failed 5")
+
+    def test_compacted_old_failed_tool_result_preserves_failure_metadata(self) -> None:
+        event = {
+            "type": "mcp_tool_result",
+            "t": 2.0,
+            "tool": "executor_status",
+            "ok": False,
+            "level": "error",
+            "error": "executor crashed before reporting status",
+            "result": {"details": "x" * 200},
+        }
+
+        compacted = compact_old_tool_event(event)
+
+        self.assertEqual(compacted["type"], "old_mcp_tool_result_omitted")
+        self.assertEqual(compacted["ok"], False)
+        self.assertEqual(compacted["level"], "error")
+        self.assertEqual(compacted["error"], "executor crashed before reporting status")
+        self.assertIn("result_summary", compacted)
 
     def test_latest_tool_results_are_ordered_by_latest_event_index(self) -> None:
         events = [

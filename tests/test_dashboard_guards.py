@@ -77,6 +77,7 @@ class AgentExecutionWaitRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_executor_status_routes_to_timed_wait_when_background_wait_running(self) -> None:
         class FakeMcp:
             def __init__(self) -> None:
+                self.running = False
                 self.calls: list[tuple[str, dict[str, object]]] = []
 
             async def call_tool(self, tool: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
@@ -105,6 +106,29 @@ class AgentExecutionWaitRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["status_wait"]["requested_seconds"], 12.0)
         self.assertEqual(payload["status_wait"]["effective_seconds"], 12.0)
         self.assertEqual(payload["status_wait"]["return_reason"], "wait_completed")
+
+    async def test_executor_status_routed_wait_uses_execution_wait_health_guard(self) -> None:
+        class FakeMcp:
+            def __init__(self) -> None:
+                self.running = True
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_tool(self, tool: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                self.calls.append((tool, arguments))
+                return {"structuredContent": {"running": True}}
+
+        app = object.__new__(CockpitApp)
+        app.mcp = FakeMcp()
+        app.ensure_mcp_started_for_tool = fake_no_restart
+        app.safe_tool = fake_unhealthy_tool
+
+        result = await app.call_agent_mcp_tool("executor_status", {})
+
+        self.assertEqual(app.mcp.calls, [])
+        self.assertEqual(result["reason"], "mcp_runtime_health_failed")
+        self.assertEqual(result["tool_not_run"], "execution_wait_status")
+        self.assertEqual(result["dashboard_routed_from_tool"], "executor_status")
+        self.assertEqual(result["dashboard_actual_tool"], "execution_wait_status")
 
     async def test_planning_job_status_waits_when_background_planning_running(self) -> None:
         class FakeMcp:
@@ -140,6 +164,10 @@ async def fake_no_restart(*_args: object, **_kwargs: object) -> bool:
 
 async def fake_sleep(_seconds: float) -> None:
     return None
+
+
+async def fake_unhealthy_tool(*_args: object, **_kwargs: object) -> dict[str, object]:
+    return {"ok": False, "error": "queue workers stopped"}
 
 
 class HealthGuardTests(unittest.TestCase):

@@ -3282,7 +3282,19 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             return self.annotate_routed_tool_result(result, tool, actual_tool)
 
         if tool == "executor_status":
-            wait_result = await self.mcp.call_tool("execution_wait_status", {"wait_seconds": 0.0})
+            wait_arguments = {"wait_seconds": 0.0}
+            guard_result = await self.mcp_health_guard_result(
+                "execution_wait_status",
+                via="agent",
+                arguments=wait_arguments,
+            )
+            if guard_result is not None:
+                return self.annotate_execution_routed_tool_result(
+                    guard_result,
+                    original_tool=tool,
+                    actual_tool="execution_wait_status",
+                )
+            wait_result = await self.mcp.call_tool("execution_wait_status", wait_arguments)
             wait_payload = compact_tool_payload(wait_result)
             if isinstance(wait_payload, dict) and wait_payload.get("running"):
                 wait_seconds = parse_optional_float(wait_payload.get("recommended_wait_seconds"))

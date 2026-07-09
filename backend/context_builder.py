@@ -495,13 +495,16 @@ def compact_old_tool_event(event: dict[str, Any]) -> dict[str, Any]:
         "t": event.get("t"),
         "via": event.get("via"),
         "message": (
-            "Older non-error tool call/result omitted from model context to keep the active "
-            "context focused. Full details remain in events.jsonl/artifacts."
+            "Older tool call/result omitted from model context to keep the active context "
+            "focused. Full details remain in events.jsonl/artifacts."
         ),
     }
     compacted.update(tool_origin_fields(event))
     if event_type == "mcp_tool_result":
         compacted["ok"] = event.get("ok")
+        if event.get("ok") is False or event.get("error") or event.get("level") == "error":
+            compacted["error"] = event.get("error")
+            compacted["level"] = event.get("level")
         compacted["artifact"] = extract_artifact_ref(event)
         compacted["result_summary"] = summarize_tool_result_event(event)
     elif event_type == "mcp_tool_call":
