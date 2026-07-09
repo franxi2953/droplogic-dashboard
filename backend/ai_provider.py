@@ -25,6 +25,7 @@ RETRY_PAYLOAD_MIN_EVENT_LOG_TARGET_CHARS = 16_000
 RETRY_PAYLOAD_MIN_TOOL_OUTPUT_CHARS = 1_500
 MODEL_ATTACHMENTS_KEY = "_cockpit_model_attachments"
 RECENT_INPUT_TOOL_PAIRS_KEEP = 2
+RECENT_INPUT_TOOL_RESULT_WINDOW = 8
 MAX_ACTIVE_TOOL_OUTPUT_CHARS = 2_500
 MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS = 6_000
 MIN_ACTIVE_TOOL_OUTPUT_CHARS = 500
@@ -598,6 +599,12 @@ class AiProvider:
                         "content": json.dumps(compacted_result, ensure_ascii=True, default=str),
                     }
                 )
+            compacted_tool_history = compact_consumed_tool_history(messages)
+            compacted_tools = await compact_consumed_tool_outputs(
+                messages,
+                max_chars=max_tool_output_chars,
+                on_context_compacted=on_context_compacted,
+            )
             followup = {
                 "model": self.config.model,
                 "messages": messages,
@@ -617,14 +624,15 @@ class AiProvider:
                 ),
             )
             if on_model_response is not None:
-                await on_model_response(
-                    chat_model_response_metrics(
-                        data,
-                        round_index=round_index,
-                        elapsed_seconds=time.monotonic() - request_started,
-                        payload=followup,
-                    )
+                metrics = chat_model_response_metrics(
+                    data,
+                    round_index=round_index,
+                    elapsed_seconds=time.monotonic() - request_started,
+                    payload=followup,
                 )
+                metrics["compacted_prior_tool_outputs"] = compacted_tools
+                metrics["compacted_prior_tool_history"] = compacted_tool_history
+                await on_model_response(metrics)
             await emit_chat_response_text(data, round_index, emitted_texts, on_text)
 
         text = extract_chat_response_text(data)
@@ -751,6 +759,12 @@ class AiProvider:
                     }
                 )
             messages.append({"role": "user", "content": tool_results})
+            compacted_tool_history = compact_consumed_tool_history(messages)
+            compacted_tools = await compact_consumed_tool_outputs(
+                messages,
+                max_chars=max_tool_output_chars,
+                on_context_compacted=on_context_compacted,
+            )
             followup = {
                 "model": self.config.model,
                 "system": instructions,
@@ -771,14 +785,15 @@ class AiProvider:
                 ),
             )
             if on_model_response is not None:
-                await on_model_response(
-                    anthropic_model_response_metrics(
-                        data,
-                        round_index=round_index,
-                        elapsed_seconds=time.monotonic() - request_started,
-                        payload=followup,
-                    )
+                metrics = anthropic_model_response_metrics(
+                    data,
+                    round_index=round_index,
+                    elapsed_seconds=time.monotonic() - request_started,
+                    payload=followup,
                 )
+                metrics["compacted_prior_tool_outputs"] = compacted_tools
+                metrics["compacted_prior_tool_history"] = compacted_tool_history
+                await on_model_response(metrics)
             await emit_anthropic_thinking(data, round_index, emitted_reasoning, on_reasoning)
             all_reasoning.extend(extract_anthropic_thinking(data))
             await emit_anthropic_text(data, round_index, emitted_texts, on_text)
@@ -1118,10 +1133,13 @@ def compact_payload_for_retry(
     max_tool_output_chars: int,
 ) -> dict[str, Any]:
     input_list = payload.get("input")
+    if input_list is None:
+        input_list = payload.get("messages")
     if not isinstance(input_list, list):
         return {
             "attempt": attempt,
             "user_context_sections": 0,
+            "image_messages": 0,
             "tool_outputs": 0,
             "protected_latest_tool_output": False,
             "event_log_target_chars": retry_event_log_target_chars(level),
@@ -1326,30 +1344,56 @@ def compact_retry_tool_outputs(input_list: list[dict[str, Any]], max_chars: int)
     protected_latest = False
 
     for index, item in enumerate(input_list):
-        if not isinstance(item, dict) or item.get("type") != "function_call_output":
-            continue
-        output = item.get("output")
-        if not isinstance(output, str):
+        if not isinstance(item, dict):
             continue
         is_latest_batch = index in protected_indices
-        if len(output) <= max_chars:
+        compacted_here = False
+        if item.get("type") == "function_call_output":
+            compacted_here = compact_single_tool_output(
+                item,
+                key="output",
+                max_chars=max_chars,
+                tool=call_names.get(str(item.get("call_id") or ""), str(item.get("call_id") or "") or "tool"),
+            )
+        elif item.get("role") == "tool":
+            compacted_here = compact_single_tool_output(
+                item,
+                key="content",
+                max_chars=max_chars,
+                tool=call_names.get(str(item.get("tool_call_id") or ""), str(item.get("tool_call_id") or "") or "tool"),
+            )
+        elif is_anthropic_tool_result_message(item):
+            for part in item.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                call_id = str(part.get("tool_use_id") or "")
+                tool = call_names.get(call_id, call_id or "tool")
+                compacted_here = compact_single_tool_output(part, key="content", max_chars=max_chars, tool=tool) or compacted_here
+        if compacted_here:
+            compacted_count += 1
+        else:
             protected_latest = protected_latest or is_latest_batch
-            continue
-        call_id = str(item.get("call_id") or "")
-        tool = call_names.get(call_id, call_id or "tool")
-        try:
-            parsed = json.loads(output)
-        except json.JSONDecodeError:
-            parsed = output
-        compacted, details = compact_tool_output_for_model(tool, parsed, max_chars=max_chars)
-        compacted_output = json.dumps(compacted, ensure_ascii=True, default=str)
-        if len(compacted_output) > max_chars:
-            compacted = force_compact_tool_output(tool, compacted, max_chars=max_chars)
-            compacted_output = json.dumps(compacted, ensure_ascii=True, default=str)
-        item["output"] = compacted_output
-        compacted_count += 1
 
     return compacted_count, protected_latest
+
+
+def compact_single_tool_output(item: dict[str, Any], key: str, max_chars: int, tool: str) -> bool:
+    output = item.get(key)
+    if not isinstance(output, str):
+        return False
+    if len(output) <= max_chars:
+        return False
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        parsed = output
+    compacted, _details = compact_tool_output_for_model(tool, parsed, max_chars=max_chars)
+    compacted_output = json.dumps(compacted, ensure_ascii=True, default=str)
+    if len(compacted_output) > max_chars:
+        compacted = force_compact_tool_output(tool, compacted, max_chars=max_chars)
+        compacted_output = json.dumps(compacted, ensure_ascii=True, default=str)
+    item[key] = compacted_output
+    return True
 
 
 def preview_response_body(body: str, limit: int = 220) -> str:
@@ -1716,82 +1760,187 @@ def compact_consumed_tool_history(input_list: list[dict[str, Any]]) -> int:
     pairs = tool_pairs(input_list)
     if len(pairs) <= RECENT_INPUT_TOOL_PAIRS_KEEP:
         return 0
-    keep_call_ids = {pair["call_id"] for pair in pairs[-RECENT_INPUT_TOOL_PAIRS_KEEP:]}
+    keep_call_ids = latest_tool_pair_call_ids(pairs)
     compacted = 0
     for pair in pairs:
         call_id = pair["call_id"]
         if call_id in keep_call_ids:
             continue
-        output_item = input_list[pair["output_index"]]
-        if tool_output_is_error(output_item):
+        output = tool_pair_output(input_list, pair)
+        if tool_output_is_error(output):
             continue
-        call_item = input_list[pair["call_index"]]
-        if tool_history_already_compacted(output_item):
+        if tool_history_already_compacted(input_list, pair):
             continue
-        tool = str(call_item.get("name") or call_item.get("function", {}).get("name") or call_id or "tool")
-        arguments = call_item.get("arguments") or call_item.get("function", {}).get("arguments")
-        call_item.clear()
-        call_item.update(
-            {
-                "type": "function_call",
-                "call_id": call_id,
-                "name": tool,
-                "arguments": json.dumps(
-                    {
-                        "_compacted_prior_tool_call": True,
-                        "tool": tool,
-                        "arguments_summary": compact_value(parse_json_maybe(arguments), path=f"tool_history.{tool}.arguments"),
-                    },
-                    ensure_ascii=True,
-                    default=str,
-                ),
-            }
-        )
-        output_item["output"] = json.dumps(
+        compact_tool_call_item(input_list[pair["call_index"]], pair)
+        set_tool_pair_output(
+            input_list,
+            pair,
+            json.dumps(
             {
                 "_compacted_prior_tool_output": True,
-                "tool": tool,
-                "summary": compact_tool_history_output(output_item.get("output"), tool),
+                "tool": pair["tool"],
+                "summary": compact_tool_history_output(output, pair["tool"]),
             },
             ensure_ascii=True,
             default=str,
+            ),
         )
         compacted += 1
     return compacted
 
 
+def latest_tool_pair_call_ids(pairs: list[dict[str, Any]]) -> set[str]:
+    keep: set[str] = set()
+    seen_tools: set[str] = set()
+    recent_pairs = pairs[-RECENT_INPUT_TOOL_RESULT_WINDOW:]
+    for pair in reversed(recent_pairs):
+        tool = str(pair.get("tool") or "")
+        if not tool or tool in seen_tools:
+            continue
+        keep.add(str(pair["call_id"]))
+        seen_tools.add(tool)
+    return keep
+
+
 def tool_pairs(input_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    calls: dict[str, int] = {}
+    calls: dict[str, dict[str, Any]] = {}
     pairs = []
     for index, item in enumerate(input_list):
         if not isinstance(item, dict):
             continue
         if item.get("type") in {"function_call", "tool_call"}:
             call_id = item.get("call_id") or item.get("id")
+            name = item.get("name") or item.get("function", {}).get("name") or call_id or "tool"
             if call_id:
-                calls[str(call_id)] = index
+                calls[str(call_id)] = {"call_index": index, "tool": str(name), "arguments": item.get("arguments") or item.get("function", {}).get("arguments")}
+            continue
+        if item.get("role") == "assistant":
+            for tool_call in item.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = tool_call.get("id")
+                function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                name = function.get("name") or call_id or "tool"
+                if call_id:
+                    calls[str(call_id)] = {"call_index": index, "tool": str(name), "arguments": function.get("arguments")}
+            for part in item.get("content") or []:
+                if not isinstance(part, dict) or part.get("type") != "tool_use":
+                    continue
+                call_id = part.get("id")
+                name = part.get("name") or call_id or "tool"
+                if call_id:
+                    calls[str(call_id)] = {"call_index": index, "tool": str(name), "arguments": part.get("input")}
+            continue
         elif item.get("type") == "function_call_output":
             call_id = item.get("call_id")
             if call_id and str(call_id) in calls:
-                pairs.append({"call_id": str(call_id), "call_index": calls[str(call_id)], "output_index": index})
+                pairs.append({**calls[str(call_id)], "call_id": str(call_id), "output_index": index, "output_key": "output"})
+        elif item.get("role") == "tool":
+            call_id = item.get("tool_call_id")
+            if call_id and str(call_id) in calls:
+                pairs.append({**calls[str(call_id)], "call_id": str(call_id), "output_index": index, "output_key": "content"})
+        elif item.get("role") == "user" and isinstance(item.get("content"), list):
+            for part_index, part in enumerate(item.get("content") or []):
+                if not isinstance(part, dict) or part.get("type") != "tool_result":
+                    continue
+                call_id = part.get("tool_use_id")
+                if call_id and str(call_id) in calls:
+                    pairs.append(
+                        {
+                            **calls[str(call_id)],
+                            "call_id": str(call_id),
+                            "output_index": index,
+                            "output_part_index": part_index,
+                            "output_key": "content",
+                        }
+                    )
     return pairs
 
 
-def tool_output_is_error(item: dict[str, Any]) -> bool:
-    output = item.get("output")
+def tool_pair_output(input_list: list[dict[str, Any]], pair: dict[str, Any]) -> Any:
+    item = input_list[pair["output_index"]]
+    if "output_part_index" in pair:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, list):
+            part_index = int(pair["output_part_index"])
+            if 0 <= part_index < len(content) and isinstance(content[part_index], dict):
+                return content[part_index].get(pair.get("output_key") or "content")
+        return None
+    return item.get(pair.get("output_key") or "output") if isinstance(item, dict) else None
+
+
+def set_tool_pair_output(input_list: list[dict[str, Any]], pair: dict[str, Any], value: str) -> None:
+    item = input_list[pair["output_index"]]
+    if "output_part_index" in pair:
+        content = item.get("content") if isinstance(item, dict) else None
+        if isinstance(content, list):
+            part_index = int(pair["output_part_index"])
+            if 0 <= part_index < len(content) and isinstance(content[part_index], dict):
+                content[part_index][pair.get("output_key") or "content"] = value
+        return
+    if isinstance(item, dict):
+        item[pair.get("output_key") or "output"] = value
+
+
+def tool_history_already_compacted(input_list: list[dict[str, Any]], pair: dict[str, Any]) -> bool:
+    parsed = parse_json_maybe(tool_pair_output(input_list, pair))
+    return isinstance(parsed, dict) and bool(parsed.get("_compacted_prior_tool_output"))
+
+
+def tool_output_is_error(output: Any) -> bool:
     parsed = parse_json_maybe(output)
     if isinstance(parsed, dict):
         if parsed.get("isError") or parsed.get("error") or parsed.get("ok") is False:
             return True
         text = json.dumps(parsed, ensure_ascii=True, default=str).lower()
-    else:
-        text = str(output or "").lower()
-    return "error executing tool" in text or '"error"' in text[:800]
+        if tool_output_text_looks_error(text):
+            return True
+        return any(tool_output_is_error(value) for value in parsed.values())
+    if isinstance(parsed, list):
+        text = json.dumps(parsed, ensure_ascii=True, default=str).lower()
+        if tool_output_text_looks_error(text):
+            return True
+        return any(tool_output_is_error(value) for value in parsed)
+    return tool_output_text_looks_error(str(parsed or "").lower())
 
 
-def tool_history_already_compacted(item: dict[str, Any]) -> bool:
-    parsed = parse_json_maybe(item.get("output"))
-    return isinstance(parsed, dict) and bool(parsed.get("_compacted_prior_tool_output"))
+def tool_output_text_looks_error(text: str) -> bool:
+    sample = text[:800]
+    stripped = text.strip()
+    return (
+        "error executing tool" in sample
+        or '"error"' in sample
+        or "'error'" in sample
+        or '"iserror": true' in sample
+        or '"iserror":true' in sample
+        or "'iserror': true" in sample
+        or '"ok": false' in sample
+        or '"ok":false' in sample
+        or stripped.startswith(("error:", "error ", "failed:", "exception:", "traceback "))
+    )
+
+
+def compact_tool_call_item(item: dict[str, Any], pair: dict[str, Any]) -> None:
+    tool = str(pair.get("tool") or pair.get("call_id") or "tool")
+    arguments = pair.get("arguments")
+    summary = {
+        "_compacted_prior_tool_call": True,
+        "tool": tool,
+        "arguments_summary": compact_value(parse_json_maybe(arguments), path=f"tool_history.{tool}.arguments"),
+    }
+    if item.get("type") in {"function_call", "tool_call"}:
+        item.clear()
+        item.update(
+            {
+                "type": "function_call",
+                "call_id": pair["call_id"],
+                "name": tool,
+                "arguments": json.dumps(summary, ensure_ascii=True, default=str),
+            }
+        )
+        return
+    if item.get("role") == "assistant":
+        return
 
 
 def compact_tool_history_output(output: Any, tool: str) -> Any:
@@ -1820,20 +1969,17 @@ async def compact_consumed_tool_outputs(
     on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> int:
     """Compact tool outputs, preserving only reasonably sized latest outputs verbatim."""
-    protected_indices = latest_tool_output_batch_indices(input_list)
-    call_names = function_call_names_by_id(input_list)
+    pairs = tool_pairs(input_list)
+    protected_call_ids = latest_tool_pair_call_ids(pairs)
     compacted_count = 0
     max_chars = min(max_chars, MAX_ACTIVE_TOOL_OUTPUT_CHARS)
 
-    for index, item in enumerate(input_list):
-        if item.get("type") != "function_call_output":
-            continue
-        output = item.get("output")
+    for pair in pairs:
+        output = tool_pair_output(input_list, pair)
         if not isinstance(output, str) or len(output) <= max_chars:
             continue
-        is_latest_batch = index in protected_indices
-        call_id = str(item.get("call_id") or "")
-        tool = call_names.get(call_id, call_id or "tool")
+        is_latest_batch = str(pair["call_id"]) in protected_call_ids
+        tool = str(pair.get("tool") or pair.get("call_id") or "tool")
         try:
             parsed = json.loads(output)
         except json.JSONDecodeError:
@@ -1843,7 +1989,7 @@ async def compact_consumed_tool_outputs(
         if len(compacted_output) > max_chars:
             compacted = force_compact_tool_output(tool, compacted, max_chars=max_chars)
             compacted_output = json.dumps(compacted, ensure_ascii=True, default=str)
-        item["output"] = compacted_output
+        set_tool_pair_output(input_list, pair, compacted_output)
         compacted_count += 1
         if details and on_context_compacted is not None:
             details = {
@@ -1909,7 +2055,11 @@ def latest_tool_output_batch_indices(input_list: list[dict[str, Any]]) -> set[in
     index = len(input_list) - 1
     while index >= 0:
         item = input_list[index]
-        if item.get("type") == "function_call_output":
+        if (
+            item.get("type") == "function_call_output"
+            or item.get("role") == "tool"
+            or is_anthropic_tool_result_message(item)
+        ):
             protected.add(index)
             index -= 1
             continue
@@ -1920,12 +2070,30 @@ def latest_tool_output_batch_indices(input_list: list[dict[str, Any]]) -> set[in
 def function_call_names_by_id(input_list: list[dict[str, Any]]) -> dict[str, str]:
     names: dict[str, str] = {}
     for item in input_list:
-        if not isinstance(item, dict) or item.get("type") not in {"function_call", "tool_call"}:
+        if not isinstance(item, dict):
             continue
-        call_id = item.get("call_id") or item.get("id")
-        name = item.get("name") or item.get("function", {}).get("name")
-        if call_id and name:
-            names[str(call_id)] = str(name)
+        if item.get("type") in {"function_call", "tool_call"}:
+            call_id = item.get("call_id") or item.get("id")
+            name = item.get("name") or item.get("function", {}).get("name")
+            if call_id and name:
+                names[str(call_id)] = str(name)
+            continue
+        if item.get("role") == "assistant":
+            for tool_call in item.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = tool_call.get("id")
+                function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+                name = function.get("name")
+                if call_id and name:
+                    names[str(call_id)] = str(name)
+            for part in item.get("content") or []:
+                if not isinstance(part, dict) or part.get("type") != "tool_use":
+                    continue
+                call_id = part.get("id")
+                name = part.get("name")
+                if call_id and name:
+                    names[str(call_id)] = str(name)
     return names
 
 
