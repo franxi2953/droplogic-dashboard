@@ -397,6 +397,9 @@ def old_tool_event_indices(events: list[dict[str, Any]]) -> set[int]:
     kept_result_tools: set[str] = set()
     kept_pending_call_tools: set[str] = set()
     result_call_ids: set[str] = set()
+    latest_result_index = latest_tool_result_event_index(events)
+    if latest_result_index is not None:
+        keep_indices.add(latest_result_index)
 
     for index in range(len(events) - 1, -1, -1):
         event = events[index]

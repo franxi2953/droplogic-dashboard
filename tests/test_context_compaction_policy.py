@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from backend.context_builder import latest_tool_results_by_tool, old_tool_event_indices
+from backend.context_builder import build_model_context, latest_tool_results_by_tool, old_tool_event_indices
 from backend.pinned_context import compact_pinned_context_file
 
 
@@ -65,6 +65,36 @@ class ContextCompactionPolicyTests(unittest.TestCase):
 
         self.assertIn("core_status", retained_tools)
         self.assertNotIn("tool_0", retained_tools)
+
+    def test_latest_tool_result_is_protected_after_many_non_tool_events(self) -> None:
+        events = []
+        for index in range(5):
+            call_t = float(len(events) + 1)
+            events.append({"type": "mcp_tool_call", "t": call_t, "tool": "runtime_status", "arguments": {"i": index}})
+            events.append(
+                {
+                    "type": "mcp_tool_result",
+                    "t": float(len(events) + 1),
+                    "tool": "runtime_status",
+                    "ok": True,
+                    "call_event_id": call_t,
+                    "result": {"i": index},
+                }
+            )
+        for index in range(100):
+            events.append({"type": "agent_note", "message": f"temperature sample {index}"})
+
+        compact_indices = old_tool_event_indices(events)
+        latest_result_index = 9
+
+        self.assertNotIn(latest_result_index, compact_indices)
+
+        model_context = build_model_context(events, large_event_chars=1_000)
+        latest_result = model_context.events[latest_result_index]
+
+        self.assertEqual(latest_result["type"], "mcp_tool_result")
+        self.assertEqual(latest_result["result"], {"i": 4})
+        self.assertTrue(latest_result["_protected_latest_tool_output"])
 
     def test_agent_guide_is_sent_as_turn_manual(self) -> None:
         large_guide = "# BoxMini Agent Quick Guide\n\n" + "\n".join(
