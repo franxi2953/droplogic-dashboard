@@ -1766,6 +1766,9 @@ def compact_consumed_tool_history(input_list: list[dict[str, Any]]) -> int:
         call_id = pair["call_id"]
         if call_id in keep_call_ids:
             continue
+        output = tool_pair_output(input_list, pair)
+        if tool_output_is_error(output):
+            continue
         if tool_history_already_compacted(input_list, pair):
             continue
         compact_tool_call_item(input_list[pair["call_index"]], pair)
@@ -1776,7 +1779,7 @@ def compact_consumed_tool_history(input_list: list[dict[str, Any]]) -> int:
             {
                 "_compacted_prior_tool_output": True,
                 "tool": pair["tool"],
-                "summary": compact_tool_history_output(tool_pair_output(input_list, pair), pair["tool"]),
+                "summary": compact_tool_history_output(output, pair["tool"]),
             },
             ensure_ascii=True,
             default=str,
@@ -1882,6 +1885,39 @@ def set_tool_pair_output(input_list: list[dict[str, Any]], pair: dict[str, Any],
 def tool_history_already_compacted(input_list: list[dict[str, Any]], pair: dict[str, Any]) -> bool:
     parsed = parse_json_maybe(tool_pair_output(input_list, pair))
     return isinstance(parsed, dict) and bool(parsed.get("_compacted_prior_tool_output"))
+
+
+def tool_output_is_error(output: Any) -> bool:
+    parsed = parse_json_maybe(output)
+    if isinstance(parsed, dict):
+        if parsed.get("isError") or parsed.get("error") or parsed.get("ok") is False:
+            return True
+        text = json.dumps(parsed, ensure_ascii=True, default=str).lower()
+        if tool_output_text_looks_error(text):
+            return True
+        return any(tool_output_is_error(value) for value in parsed.values())
+    if isinstance(parsed, list):
+        text = json.dumps(parsed, ensure_ascii=True, default=str).lower()
+        if tool_output_text_looks_error(text):
+            return True
+        return any(tool_output_is_error(value) for value in parsed)
+    return tool_output_text_looks_error(str(parsed or "").lower())
+
+
+def tool_output_text_looks_error(text: str) -> bool:
+    sample = text[:800]
+    stripped = text.strip()
+    return (
+        "error executing tool" in sample
+        or '"error"' in sample
+        or "'error'" in sample
+        or '"iserror": true' in sample
+        or '"iserror":true' in sample
+        or "'iserror': true" in sample
+        or '"ok": false' in sample
+        or '"ok":false' in sample
+        or stripped.startswith(("error:", "error ", "failed:", "exception:", "traceback "))
+    )
 
 
 def compact_tool_call_item(item: dict[str, Any], pair: dict[str, Any]) -> None:

@@ -91,6 +91,82 @@ class RetryPayloadCompactionTests(unittest.TestCase):
         self.assertEqual(latest_plan["plan"], "latest")
         self.assertEqual(latest_status["status"], "latest")
 
+    def test_tool_history_does_not_compact_error_outputs(self) -> None:
+        messages = [
+            {
+                "type": "function_call",
+                "call_id": "failed_response",
+                "name": "runtime_status",
+                "arguments": json.dumps({"verbose": True}),
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "failed_response",
+                "output": json.dumps({"ok": False, "error": "Connection refused", "details": "x" * 1200}),
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "failed_anthropic", "name": "plan_summary", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "failed_anthropic",
+                        "content": json.dumps({"content": [{"text": json.dumps({"isError": True, "message": "bad request"})}]}),
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "failed_chat",
+                        "type": "function",
+                        "function": {"name": "file_read", "arguments": json.dumps({"path": "missing"})},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "failed_chat",
+                "content": "Error executing tool: missing file",
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "latest_status", "name": "runtime_status", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "latest_status", "content": json.dumps({"ok": True})}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "latest_plan", "name": "plan_summary", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "latest_plan", "content": json.dumps({"ok": True})}],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "latest_file", "name": "file_read", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "latest_file", "content": json.dumps({"ok": True})}],
+            },
+        ]
+
+        compacted_count = compact_consumed_tool_history(messages)
+
+        self.assertEqual(compacted_count, 0)
+        self.assertEqual(json.loads(messages[1]["output"])["error"], "Connection refused")
+        anthropic_result = json.loads(messages[3]["content"][0]["content"])
+        self.assertTrue(json.loads(anthropic_result["content"][0]["text"])["isError"])
+        self.assertEqual(messages[5]["content"], "Error executing tool: missing file")
+
 
 if __name__ == "__main__":
     unittest.main()
