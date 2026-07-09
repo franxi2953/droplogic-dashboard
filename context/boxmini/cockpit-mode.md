@@ -14,4 +14,6 @@ This MCP server was launched by DropLogic Dashboard.
 - Avoid frequent `bring_visualizer_to_front` calls in dashboard mode; they are unnecessary and may be a no-op.
 - For live observation, prefer compact targeted status tools (`runtime_status`, `state_summary`, `visualizer_status`) and let the dashboard poll frames and matrix scenes in the background.
 - Avoid repeated broad `execution_status_summary` calls. Request visualizer, planning-job, or execution-wait details only when that specific detail is needed; Dashboard may strip those optional sections from agent calls to keep context compact.
+- If execution is in a background wait, call `execution_wait_status(wait_seconds=<recommended_wait_seconds>)` as a timer and use the returned recommendation instead of repeatedly polling `executor_status`; Dashboard may route agent `executor_status` calls through `execution_wait_status` while a wait is active.
+- If a planning job is running, call `planning_job_status` once and wait for its returned result or recommendation instead of polling in a tight loop.
 - If a tool result has `reason: "mcp_runtime_health_failed"` or `tool_not_run`, stop hardware execution and inspect the reported health payload before continuing. Restart/reload from the current physical state only after the runtime is healthy.
