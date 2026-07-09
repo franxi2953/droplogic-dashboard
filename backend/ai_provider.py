@@ -1766,6 +1766,8 @@ def compact_consumed_tool_history(input_list: list[dict[str, Any]]) -> int:
         call_id = pair["call_id"]
         if call_id in keep_call_ids:
             continue
+        if tool_pair_output_is_error(input_list, pair):
+            continue
         if tool_history_already_compacted(input_list, pair):
             continue
         compact_tool_call_item(input_list[pair["call_index"]], pair)
@@ -1882,6 +1884,18 @@ def set_tool_pair_output(input_list: list[dict[str, Any]], pair: dict[str, Any],
 def tool_history_already_compacted(input_list: list[dict[str, Any]], pair: dict[str, Any]) -> bool:
     parsed = parse_json_maybe(tool_pair_output(input_list, pair))
     return isinstance(parsed, dict) and bool(parsed.get("_compacted_prior_tool_output"))
+
+
+def tool_pair_output_is_error(input_list: list[dict[str, Any]], pair: dict[str, Any]) -> bool:
+    output = tool_pair_output(input_list, pair)
+    parsed = parse_json_maybe(output)
+    if isinstance(parsed, dict):
+        if parsed.get("isError") or parsed.get("error") or parsed.get("ok") is False:
+            return True
+        text = json.dumps(parsed, ensure_ascii=True, default=str).lower()
+    else:
+        text = str(output or "").lower()
+    return "error executing tool" in text or '"error"' in text[:800]
 
 
 def compact_tool_call_item(item: dict[str, Any], pair: dict[str, Any]) -> None:

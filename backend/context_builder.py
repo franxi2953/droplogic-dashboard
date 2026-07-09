@@ -126,22 +126,31 @@ def build_model_context(
 
     if should_summarize_event_history(after_compact_chars, len(compacted_events), target_chars, recent_event_target):
         memory = build_run_memory(events)
-        selected_reversed: list[dict[str, Any]] = []
+        selected_indices_reversed: list[int] = []
         budget = target_chars
         current_chars = encoded_json_length([memory])
 
-        for event in reversed(compacted_events):
+        for index in range(len(compacted_events) - 1, -1, -1):
+            event = compacted_events[index]
             event_chars = encoded_json_length(event) + 2
             if event.get("_stale_state_snapshot"):
                 continue
-            if selected_reversed and current_chars + event_chars > budget:
+            if selected_indices_reversed and current_chars + event_chars > budget:
                 break
-            if len(selected_reversed) >= recent_event_target:
+            if len(selected_indices_reversed) >= recent_event_target:
                 break
-            selected_reversed.append(event)
+            selected_indices_reversed.append(index)
             current_chars += event_chars
 
-        selected_events = list(reversed(selected_reversed))
+        selected_indices = list(reversed(selected_indices_reversed))
+        if latest_tool_result_index is not None and latest_tool_result_index not in selected_indices:
+            insert_index = len(selected_indices)
+            for index, selected_index in enumerate(selected_indices):
+                if selected_index > latest_tool_result_index:
+                    insert_index = index
+                    break
+            selected_indices.insert(insert_index, latest_tool_result_index)
+        selected_events = [compacted_events[index] for index in selected_indices]
         omitted_events = max(0, len(compacted_events) - len(selected_events))
 
     model_events = selected_events
@@ -388,12 +397,15 @@ def old_tool_event_indices(events: list[dict[str, Any]]) -> set[int]:
     if len(tool_indices) <= RECENT_TOOL_EVENT_ALWAYS_KEEP:
         return set()
 
+    latest_result_index = latest_tool_result_event_index(events)
     call_index_by_event_id = {
         str(event.get("t")): index
         for index, event in enumerate(events)
         if event.get("type") == "mcp_tool_call" and event.get("t") is not None
     }
     keep_indices: set[int] = set()
+    if latest_result_index is not None:
+        keep_indices.add(latest_result_index)
     kept_result_tools: set[str] = set()
     kept_pending_call_tools: set[str] = set()
     result_call_ids: set[str] = set()
@@ -827,7 +839,7 @@ def latest_tool_results_by_tool(events: list[dict[str, Any]]) -> list[dict[str, 
             "ok": event.get("ok"),
             "summary": summarize_event_line(event),
         }
-    return list(latest.values())
+    return sorted(latest.values(), key=lambda item: int(item.get("event_index") or 0))
 
 
 def build_ai_memory_event(ai_summary: str) -> dict[str, Any]:

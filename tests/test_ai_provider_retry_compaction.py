@@ -91,6 +91,34 @@ class RetryPayloadCompactionTests(unittest.TestCase):
         self.assertEqual(latest_plan["plan"], "latest")
         self.assertEqual(latest_status["status"], "latest")
 
+    def test_history_compaction_preserves_failed_outputs(self) -> None:
+        messages = [
+            {"type": "function_call", "call_id": "old_error", "name": "runtime_status", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "old_error", "output": json.dumps({"ok": False, "error": "boom"})},
+            {"role": "assistant", "tool_calls": [{"id": "chat_error", "function": {"name": "plan_summary", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "chat_error", "content": json.dumps({"isError": True, "error": "chat boom"})},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "anthropic_error", "name": "execution_status_summary", "input": {}}]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "anthropic_error",
+                        "content": json.dumps({"error": "anthropic boom"}),
+                    }
+                ],
+            },
+            {"type": "function_call", "call_id": "latest", "name": "runtime_status", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "latest", "output": json.dumps({"ok": True, "latest": True})},
+        ]
+
+        compacted_count = compact_consumed_tool_history(messages)
+
+        self.assertEqual(compacted_count, 0)
+        self.assertEqual(json.loads(messages[1]["output"])["error"], "boom")
+        self.assertEqual(json.loads(messages[3]["content"])["error"], "chat boom")
+        self.assertEqual(json.loads(messages[5]["content"][0]["content"])["error"], "anthropic boom")
+
 
 if __name__ == "__main__":
     unittest.main()
