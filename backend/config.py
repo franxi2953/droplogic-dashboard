@@ -140,6 +140,7 @@ class CockpitConfig:
     port: int = 8787
     runs_dir: str = "runs"
     live_frame_interval_seconds: float = 0.33
+    live_scene_interval_seconds: float = 0.1
     live_streamer_interval_seconds: float = 0.12
     live_state_interval_seconds: float = 1.0
     mcp: McpConfig = field(default_factory=McpConfig)
@@ -161,6 +162,7 @@ def load_config(path: str | None = None) -> CockpitConfig:
         port=int(raw.get("port", 8787)),
         runs_dir=str(raw.get("runs_dir", "runs")),
         live_frame_interval_seconds=float(raw.get("live_frame_interval_seconds", 0.33)),
+        live_scene_interval_seconds=float(raw.get("live_scene_interval_seconds", 0.1)),
         live_streamer_interval_seconds=float(raw.get("live_streamer_interval_seconds", 0.12)),
         live_state_interval_seconds=float(raw.get("live_state_interval_seconds", 1.0)),
         mcp=McpConfig(
@@ -291,6 +293,9 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     cfg.live_frame_interval_seconds = float(
         os.environ.get("COCKPIT_LIVE_FRAME_INTERVAL_SECONDS", cfg.live_frame_interval_seconds)
     )
+    cfg.live_scene_interval_seconds = float(
+        os.environ.get("COCKPIT_LIVE_SCENE_INTERVAL_SECONDS", cfg.live_scene_interval_seconds)
+    )
     cfg.live_streamer_interval_seconds = float(
         os.environ.get("COCKPIT_LIVE_STREAMER_INTERVAL_SECONDS", cfg.live_streamer_interval_seconds)
     )
@@ -390,6 +395,8 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     env.setdefault("DROPLOGIC_MCP_CONTEXT_DIR", str(COCKPIT_CONTEXT_ROOT))
     env.setdefault("DROPLOGIC_COCKPIT_URL", f"http://{cfg.host}:{cfg.port}")
     env.setdefault("DROPLOGIC_DASHBOARD_SCENE_PATH", str(COCKPIT_ROOT / "runtime" / "dashboard_scene.json"))
+    env.setdefault("DROPLOGIC_DASHBOARD_SCENE_INTERVAL_SECONDS", str(cfg.live_scene_interval_seconds))
+    env.setdefault("DROPLOGIC_DASHBOARD_STATE_INTERVAL_SECONDS", str(cfg.live_state_interval_seconds))
     context_dir = Path(env["DROPLOGIC_MCP_CONTEXT_DIR"])
     if not context_dir.is_absolute():
         context_dir = (COCKPIT_ROOT / context_dir).resolve()

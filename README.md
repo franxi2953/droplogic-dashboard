@@ -103,6 +103,7 @@ Live polling is split by cadence so state refreshes, matrix scene snapshots, and
 ```json
 {
   "live_frame_interval_seconds": 0.33,
+  "live_scene_interval_seconds": 0.1,
   "live_streamer_interval_seconds": 0.12,
   "live_state_interval_seconds": 1.0
 }

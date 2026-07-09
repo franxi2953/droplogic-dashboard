@@ -3,6 +3,7 @@
   "port": 8787,
   "runs_dir": "runs",
   "live_frame_interval_seconds": 0.33,
+  "live_scene_interval_seconds": 0.1,
   "live_streamer_interval_seconds": 0.12,
   "live_state_interval_seconds": 1.0,
   "mcp": {

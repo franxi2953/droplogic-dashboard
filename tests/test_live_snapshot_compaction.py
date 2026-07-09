@@ -16,6 +16,23 @@ class FakeLiveSnapshot(LiveSnapshotMixin):
     pass
 
 
+class LiveSceneMergeTests(unittest.TestCase):
+    def test_live_scene_merge_uses_runtime_state_and_visualizers_from_scene(self) -> None:
+        scene = {
+            "available": True,
+            "session_id": "session-1",
+            "runtime": {"session_id": "session-1", "system": {"loaded": True}},
+            "state": {"value": {"electrode_matrix": {"voltage_status": {"display": "40 V x4"}}}},
+            "visualizers": {"streamer": {"available": True}},
+        }
+
+        live = FakeLiveSnapshot().merge_live_scene({"runtime": {"session_id": "old"}}, scene)
+
+        self.assertEqual(live["runtime"]["session_id"], "session-1")
+        self.assertEqual(live["state"]["value"]["electrode_matrix"]["voltage_status"]["display"], "40 V x4")
+        self.assertTrue(live["visualizers"]["streamer"]["available"])
+
+
 class LiveSceneCompactionTests(unittest.TestCase):
     def test_heavy_timeline_frames_are_sampled_for_live_scene(self) -> None:
         frames = [

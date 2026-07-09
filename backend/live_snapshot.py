@@ -137,13 +137,15 @@ class LiveSnapshotMixin:
                                 "updated_at": datetime.now(timezone.utc).isoformat(),
                                 "sequence": live_scene_sequence(scene),
                                 "runtime": self.live.get("runtime"),
+                                "state": self.live.get("state"),
+                                "visualizers": self.live.get("visualizers"),
                                 "scene": scene,
                             }
                         )
             except Exception as exc:
                 await self.record_live_loop_error("live_scene_error", exc)
             elapsed = time.monotonic() - started
-            interval = max(0.05, float(getattr(self.config, "live_streamer_interval_seconds", 0.12)))
+            interval = max(0.05, float(getattr(self.config, "live_scene_interval_seconds", 0.1)))
             await asyncio.sleep(max(0.01, interval - elapsed))
 
     async def record_live_loop_error(self, event_type: str, exc: Exception) -> None:
@@ -183,32 +185,43 @@ class LiveSnapshotMixin:
         runtime = previous.get("runtime")
         state = previous.get("state")
         visualizer_status = previous.get("visualizers")
+        scene = None
+        if prefer_scene_file:
+            scene = await self.read_dashboard_scene_snapshot_async(
+                runtime_session_id=live_runtime_session_id(runtime),
+            )
         if include_state:
-            runtime_result = await self.safe_tool("runtime_status", timeout_seconds=3.0)
             runtime_captured_ts = time.time()
             runtime_captured_at = datetime.now(timezone.utc).isoformat()
-            runtime = compact_tool_payload(runtime_result)
+            if isinstance(scene, dict) and scene.get("available"):
+                runtime = scene.get("runtime") if isinstance(scene.get("runtime"), dict) else runtime
+                state = scene.get("state") if isinstance(scene.get("state"), dict) else state
+                visualizer_status = scene.get("visualizers") if isinstance(scene.get("visualizers"), dict) else visualizer_status
+            else:
+                runtime_result = await self.safe_tool("runtime_status", timeout_seconds=3.0)
+                runtime = compact_tool_payload(runtime_result)
+                if not runtime_result.get("ok"):
+                    return {
+                        **previous,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "runtime": runtime,
+                        "live_poll_degraded": True,
+                        "live_poll_error": runtime_result.get("error"),
+                    }
+                state = compact_tool_payload(await self.safe_tool("state_summary", timeout_seconds=3.0))
+                voltage_status = compact_tool_payload(await self.safe_tool("matrix_voltage_status", timeout_seconds=3.0))
+                state = attach_matrix_voltage_status(state, voltage_status)
+                visualizer_status = compact_tool_payload(await self.safe_tool("visualizer_status", timeout_seconds=3.0))
             if isinstance(runtime, dict):
                 runtime = dict(runtime)
                 runtime["dashboard_live_captured_at"] = runtime_captured_at
                 runtime["dashboard_live_captured_ts"] = runtime_captured_ts
-            if not runtime_result.get("ok"):
-                return {
-                    **previous,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "runtime": runtime,
-                    "live_poll_degraded": True,
-                    "live_poll_error": runtime_result.get("error"),
-                }
-            state = compact_tool_payload(await self.safe_tool("state_summary", timeout_seconds=3.0))
-            voltage_status = compact_tool_payload(await self.safe_tool("matrix_voltage_status", timeout_seconds=3.0))
-            state = attach_matrix_voltage_status(state, voltage_status)
-            visualizer_status = compact_tool_payload(await self.safe_tool("visualizer_status", timeout_seconds=3.0))
             self._direct_stream_available = streamer_direct_stream_available(visualizer_status)
-        scene = await self.safe_dashboard_scene(
-            prefer_file=prefer_scene_file,
-            runtime=runtime,
-        )
+        if not (isinstance(scene, dict) and scene.get("available")):
+            scene = await self.safe_dashboard_scene(
+                prefer_file=prefer_scene_file,
+                runtime=runtime,
+            )
         scene = self.compact_live_scene(scene)
 
         streamer_options = getattr(self, "streamer_frame_options", {}) or {}
@@ -275,9 +288,14 @@ class LiveSnapshotMixin:
         next_live = dict(live or {})
         compact_scene = self.compact_live_scene(scene)
         next_live["scene"] = compact_scene
-        runtime = runtime_with_scene_session(next_live.get("runtime"), compact_scene)
+        runtime = compact_scene.get("runtime") if isinstance(compact_scene.get("runtime"), dict) else next_live.get("runtime")
+        runtime = runtime_with_scene_session(runtime, compact_scene)
         if runtime is not None:
             next_live["runtime"] = runtime
+        if isinstance(compact_scene.get("state"), dict):
+            next_live["state"] = compact_scene["state"]
+        if isinstance(compact_scene.get("visualizers"), dict):
+            next_live["visualizers"] = compact_scene["visualizers"]
         next_live["updated_at"] = datetime.now(timezone.utc).isoformat()
         return next_live
 
