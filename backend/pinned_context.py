@@ -67,6 +67,8 @@ Droplets and routing:
 - Retarget droplets instead of deleting/recreating them.
 - For real hardware, keep plan_move batches to 5-10 droplets, prefer 5 for 2x2 droplets, dense layouts, crossings, or reordering.
 - plan_move moves every active droplet whose target differs from current position, not only recently retargeted droplets.
+- Read update_droplet_targets target_validation every time. If ok=false, do not call plan_move; use target_validation.suggested_targets when present or choose staged parking/intermediate targets.
+- Treat warnings such as large_move_batch and pending_targets_not_in_request as operational blockers for hardware unless you intentionally split/reset targets first.
 - For swaps/crossings/overlaps, use staged parking moves. Do not expect SIPP to move one droplet into another active start footprint in one call.
 - After each segment, trust targets_reached only for the droplets reported in that segment.
 
