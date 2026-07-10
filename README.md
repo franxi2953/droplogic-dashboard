@@ -111,7 +111,7 @@ Live polling is split by cadence so state refreshes, matrix scene snapshots, and
 
 Large live matrix scenes are compacted before broadcast. When a plan timeline is heavy, Dashboard sends sampled compact frames around the first frames, final frames, and current execution focus; the full run record remains on disk.
 
-Live frame and scene payloads carry dashboard sequence metadata. The browser keeps the newest payload per channel, resets freshness on live WebSocket reconnect, and ignores older matrix scenes from stale sessions.
+Live frame and scene payloads carry dashboard sequence metadata. The browser keeps the newest payload per channel, resets freshness on live WebSocket reconnect, and ignores older matrix scenes from stale sessions. Backend scene-file fallback also rejects stale `dashboard_scene.json` snapshots after the greater of 10 seconds or six live poll intervals.
 
 ## AI Provider
 
@@ -231,12 +231,13 @@ Dashboard tracks the size of every model request and compacts old context aggres
 
 - the default AI context target is `40000` characters with a `300000` character hard limit, and tool outputs are trimmed to the configured `4000` character limit or a tighter active-call cap for model requests;
 - old state snapshots are pruned from model context when newer snapshots exist;
-- old successful tool chatter is reduced to compact timeline markers while the latest non-error result per tool, recent pending calls, and errors are preserved;
+- old tool chatter, including older failed results, is reduced to compact timeline markers while the latest result per tool, recent pending calls, and failure metadata summaries are preserved;
 - the latest tool result is protected through history summarization and retry-time compaction so the agent can still see the most recent observation;
 - large tool outputs are replaced with compact summaries for the model while full logs stay on disk, including OpenAI Responses, Chat Completions, and Anthropic tool-result payloads;
 - visualizer images are attached once, then degraded to artifact references;
 - repeated live polling/streaming errors are summarized for the model while full events stay in `events.jsonl`;
-- `agent-guide.md` pinned context is sent as a compact per-turn manual, large JSON pinned files are sent as structured summaries, and other large pinned files are sent as heading indexes with the full file still available through `read_context_file`;
+- pinned guide context is sent from the configured context roots, large JSON pinned files are sent as structured summaries, and other large pinned files are sent as heading indexes with the full file still available through `read_context_file`;
+- before each agent turn, Dashboard can select up to five detailed `agent-guide/*.md` shards from the available BoxMini guide catalog and append them as turn-scoped guide expansions that are not retained for future turns;
 - persistent context checkpoints keep old conversations reloadable without replaying huge logs.
 
 This is especially important for BoxMini runs, where matrix state and visualizer data can otherwise explode a provider request.

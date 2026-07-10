@@ -432,8 +432,9 @@ def old_tool_event_indices(events: list[dict[str, Any]]) -> set[int]:
     """Select tool chatter that should become a compact timeline marker.
 
     Tool calls/results dominate long dashboard histories. The complete event log
-    stays on disk; model context gets at most one recent non-error result per
-    tool, plus the matching call and any recent pending call.
+    stays on disk; model context gets at most one recent result per tool, plus
+    the matching call and any recent pending call. Old failed results are
+    summarized instead of being kept verbatim forever.
     """
     tool_indices = [
         index
@@ -460,9 +461,6 @@ def old_tool_event_indices(events: list[dict[str, Any]]) -> set[int]:
         event = events[index]
         event_type = event.get("type")
         if event_type not in {"mcp_tool_call", "mcp_tool_result"}:
-            continue
-        if event.get("level") == "error" or event.get("ok") is False or event.get("error"):
-            keep_indices.add(index)
             continue
         tool = str(event.get("tool") or "")
         if not tool:
@@ -497,13 +495,16 @@ def compact_old_tool_event(event: dict[str, Any]) -> dict[str, Any]:
         "t": event.get("t"),
         "via": event.get("via"),
         "message": (
-            "Older non-error tool call/result omitted from model context to keep the active "
-            "context focused. Full details remain in events.jsonl/artifacts."
+            "Older tool call/result omitted from model context to keep the active context "
+            "focused. Full details remain in events.jsonl/artifacts."
         ),
     }
     compacted.update(tool_origin_fields(event))
     if event_type == "mcp_tool_result":
         compacted["ok"] = event.get("ok")
+        if event.get("ok") is False or event.get("error") or event.get("level") == "error":
+            compacted["error"] = event.get("error")
+            compacted["level"] = event.get("level")
         compacted["artifact"] = extract_artifact_ref(event)
         compacted["result_summary"] = summarize_tool_result_event(event)
     elif event_type == "mcp_tool_call":

@@ -37,7 +37,11 @@ if __package__ in {None, ""}:
     )
     from backend.live_snapshot import LiveSnapshotMixin
     from backend.mcp_client import McpStdioClient
-    from backend.pinned_context import compact_pinned_context_file
+    from backend.pinned_context import (
+        GUIDE_EXPANSION_CHAR_LIMIT,
+        compact_pinned_context_file,
+        guide_shard_catalog,
+    )
     from backend.recorder import RunRecorder
     from backend.runtime_utils import safe_filename, websocket_closed_ok
     from backend.tool_payloads import (
@@ -65,7 +69,11 @@ else:
     )
     from .live_snapshot import LiveSnapshotMixin
     from .mcp_client import McpStdioClient
-    from .pinned_context import compact_pinned_context_file
+    from .pinned_context import (
+        GUIDE_EXPANSION_CHAR_LIMIT,
+        compact_pinned_context_file,
+        guide_shard_catalog,
+    )
     from .recorder import RunRecorder
     from .runtime_utils import safe_filename, websocket_closed_ok
     from .tool_payloads import (
@@ -83,12 +91,15 @@ FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 GOAL_COMPLETE_TOOL = "dashboard_complete_goal"
 DEFAULT_AGENT_FRAME_DELAY_SECONDS = 1.0
 DEFAULT_AGENT_EXECUTION_WAIT_SECONDS = 30.0
+DEFAULT_AGENT_PLANNING_WAIT_SECONDS = 15.0
 DASHBOARD_USER_TOOL_DEFAULT_TIMEOUT_SECONDS = 45.0
 FRAME_DELAY_AGENT_TOOLS = {"start_plan", "execute_segment_to_breakpoint"}
 MCP_STATEFUL_EXECUTION_TOOLS = {
     "cancel_execution_wait",
     "execute_segment_to_breakpoint",
     "execution_wait_status",
+    "resume_plan",
+    "start_plan",
 }
 MCP_HEALTH_GUARDED_TOOLS = {
     "calibration_stage_jog",
@@ -472,6 +483,96 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         }
         context = "\n\n".join(sections)
         return context, metadata
+
+    def available_guide_shards(self) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for source, root in self.pinned_context_roots():
+            for item in guide_shard_catalog(root):
+                path = str(item.get("path") or "")
+                if path and path not in merged:
+                    merged[path] = {**item, "source": source, "root": str(root.resolve())}
+        return [merged[path] for path in sorted(merged)]
+
+    def load_turn_guide_expansions(self, paths: list[str]) -> tuple[str, dict[str, Any]]:
+        sections: list[str] = []
+        loaded: list[dict[str, Any]] = []
+        missing: list[str] = []
+        current_chars = 0
+        seen: set[str] = set()
+        for raw_path in paths:
+            clean_path = str(raw_path).strip().replace("\\", "/")
+            if not clean_path or clean_path in seen:
+                continue
+            seen.add(clean_path)
+            found = None
+            for source, root in self.pinned_context_roots():
+                candidate = (root / clean_path).resolve()
+                try:
+                    candidate.relative_to(root.resolve())
+                except ValueError:
+                    continue
+                if candidate.is_file() and candidate.suffix.lower() == ".md":
+                    found = (source, root.resolve(), candidate)
+                    break
+            if found is None:
+                missing.append(clean_path)
+                continue
+            source, root, path = found
+            text = path.read_text(encoding="utf-8").strip()
+            section = f"### {clean_path}\n{text}"
+            next_chars = len(section) + 2
+            if sections and current_chars + next_chars > GUIDE_EXPANSION_CHAR_LIMIT:
+                loaded.append({"path": clean_path, "omitted": True, "reason": "guide_expansion_char_limit"})
+                break
+            sections.append(section)
+            current_chars += next_chars
+            loaded.append({"path": clean_path, "source": source, "root": str(root), "chars": len(text), "sent_chars": len(section)})
+        if not sections:
+            return "", {"files": loaded, "missing": missing, "sent_chars": 0}
+        context = (
+            "# Turn-Scoped Detailed Guide Expansions\n"
+            "These detailed guide files were selected for this model turn only. "
+            "Re-evaluate guide needs on the next turn.\n\n"
+            + "\n\n".join(sections)
+        )
+        return context, {
+            "files": loaded,
+            "missing": missing,
+            "sent_chars": len(context),
+        }
+
+    async def select_turn_guide_shards(
+        self,
+        prompt: str,
+        goal: dict[str, Any],
+        events: list[dict[str, Any]],
+        on_retry: Any,
+        on_context_compacted: Any,
+    ) -> dict[str, Any]:
+        shards = self.available_guide_shards()
+        if not shards:
+            return {"paths": [], "reason": "no guide shards available", "catalog_count": 0}
+        selector_prompt = prompt
+        if goal.get("status") == "active" and goal.get("objective"):
+            selector_prompt = f"{prompt}\n\nActive goal:\n{goal.get('objective')}"
+        try:
+            selection = await self.ai.select_guide_shards(
+                selector_prompt,
+                events,
+                shards,
+                max_files=5,
+                on_retry=on_retry,
+                on_context_compacted=on_context_compacted,
+            )
+        except Exception as exc:
+            return {
+                "paths": [],
+                "reason": f"guide shard selector failed: {exc}",
+                "catalog_count": len(shards),
+                "error": str(exc),
+            }
+        selection["catalog_count"] = len(shards)
+        return selection
 
     async def broadcast_event(self, event: dict[str, Any]) -> None:
         message = json.dumps({"type": "event", "event": event}, ensure_ascii=True)
@@ -3081,8 +3182,30 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if model_context.compacted:
                 await self.record("context_compacted", **model_context.details)
 
-            pinned_context, pinned_context_metadata = self.load_pinned_context()
             goal = self.goal_status()
+            pinned_context, pinned_context_metadata = self.load_pinned_context()
+            guide_selection = await self.select_turn_guide_shards(
+                prompt,
+                goal,
+                model_context.events,
+                logged_provider_retry,
+                logged_context_compaction,
+            )
+            guide_context, guide_metadata = self.load_turn_guide_expansions(guide_selection.get("paths") or [])
+            if guide_context:
+                pinned_context = f"{pinned_context}\n\n{guide_context}" if pinned_context else guide_context
+            await self.record(
+                "guide_context_selected",
+                message=(
+                    "Turn-scoped detailed guide shards selected before the agent call. "
+                    "These guide expansions are not retained across future turns."
+                ),
+                selected_paths=guide_selection.get("paths") or [],
+                selector_reason=guide_selection.get("reason"),
+                selector_error=guide_selection.get("error"),
+                catalog_count=guide_selection.get("catalog_count"),
+                **guide_metadata,
+            )
             goal_context = self.goal_pinned_context(goal)
             if goal_context:
                 tools = [*tools, *self.goal_completion_tool(goal)]
@@ -3158,12 +3281,77 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             )
             return self.annotate_routed_tool_result(result, tool, actual_tool)
 
+        if tool == "executor_status":
+            wait_arguments = {"wait_seconds": 0.0}
+            guard_result = await self.mcp_health_guard_result(
+                "execution_wait_status",
+                via="agent",
+                arguments=wait_arguments,
+            )
+            if guard_result is not None:
+                return self.annotate_execution_routed_tool_result(
+                    guard_result,
+                    original_tool=tool,
+                    actual_tool="execution_wait_status",
+                )
+            wait_result = await self.mcp.call_tool("execution_wait_status", wait_arguments)
+            wait_payload = compact_tool_payload(wait_result)
+            if isinstance(wait_payload, dict) and wait_payload.get("running"):
+                wait_seconds = parse_optional_float(wait_payload.get("recommended_wait_seconds"))
+                if wait_seconds is None or wait_seconds <= 0:
+                    wait_seconds = DEFAULT_AGENT_EXECUTION_WAIT_SECONDS
+                result = await self.call_agent_execution_wait_status({"wait_seconds": wait_seconds})
+                return self.annotate_execution_routed_tool_result(
+                    result,
+                    original_tool=tool,
+                    actual_tool="execution_wait_status",
+                )
+            return await self.mcp.call_tool(tool, call_arguments)
+
+        if tool == "planning_job_status":
+            return await self.call_agent_planning_job_status(call_arguments)
+
         if tool != "execution_wait_status":
             return await self.mcp.call_tool(tool, call_arguments)
 
+        return await self.call_agent_execution_wait_status(call_arguments)
+
+    async def call_agent_planning_job_status(self, call_arguments: dict[str, Any]) -> Any:
+        initial_result = await self.mcp.call_tool("planning_job_status", call_arguments)
+        initial_payload = compact_tool_payload(initial_result)
+        if not isinstance(initial_payload, dict) or not initial_payload.get("running"):
+            return initial_result
+
+        wait_seconds = parse_optional_float(initial_payload.get("recommended_wait_seconds"))
+        if wait_seconds is None:
+            wait_seconds = DEFAULT_AGENT_PLANNING_WAIT_SECONDS
+        effective_wait = min(max(0.0, wait_seconds), DEFAULT_AGENT_PLANNING_WAIT_SECONDS)
+        if effective_wait <= 0:
+            return initial_result
+
+        started_at = time.monotonic()
+        await asyncio.sleep(effective_wait)
+        mcp_auto_started = await self.ensure_mcp_started_for_tool(via="agent", tool="planning_job_status")
+        if mcp_auto_started:
+            return self.mcp_runtime_restarted_result("planning_job_status", via="agent")
+
+        final_result = await self.mcp.call_tool("planning_job_status", call_arguments)
+        final_payload = compact_tool_payload(final_result)
+        return_reason = "timer_elapsed"
+        if isinstance(final_payload, dict) and not final_payload.get("running"):
+            return_reason = "planning_completed"
+        return self.add_dashboard_wait_metadata(
+            final_result,
+            requested_wait=wait_seconds,
+            effective_wait=effective_wait,
+            started_at=started_at,
+            return_reason=return_reason,
+        )
+
+    async def call_agent_execution_wait_status(self, call_arguments: dict[str, Any]) -> Any:
         requested_wait = parse_optional_float(call_arguments.get("wait_seconds"))
         if requested_wait is None or requested_wait <= 0:
-            return await self.mcp.call_tool(tool, call_arguments)
+            return await self.mcp.call_tool("execution_wait_status", call_arguments)
 
         effective_wait = min(
             max(0.0, requested_wait),
@@ -3173,7 +3361,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         immediate_arguments["wait_seconds"] = 0.0
         started_at = time.monotonic()
 
-        initial_result = await self.mcp.call_tool(tool, immediate_arguments)
+        initial_result = await self.mcp.call_tool("execution_wait_status", immediate_arguments)
         initial_payload = compact_tool_payload(initial_result)
         if not isinstance(initial_payload, dict) or not initial_payload.get("running"):
             return self.add_dashboard_wait_metadata(
@@ -3185,11 +3373,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             )
 
         await asyncio.sleep(effective_wait)
-        mcp_auto_started = await self.ensure_mcp_started_for_tool(via="agent", tool=tool)
+        mcp_auto_started = await self.ensure_mcp_started_for_tool(via="agent", tool="execution_wait_status")
         if mcp_auto_started:
-            return self.mcp_runtime_restarted_result(tool, via="agent")
+            return self.mcp_runtime_restarted_result("execution_wait_status", via="agent")
 
-        final_result = await self.mcp.call_tool(tool, immediate_arguments)
+        final_result = await self.mcp.call_tool("execution_wait_status", immediate_arguments)
         final_payload = compact_tool_payload(final_result)
         return_reason = "timer_elapsed"
         if isinstance(final_payload, dict) and not final_payload.get("running"):
@@ -3201,6 +3389,25 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             started_at=started_at,
             return_reason=return_reason,
         )
+
+    def annotate_execution_routed_tool_result(self, result: Any, original_tool: str, actual_tool: str) -> Any:
+        payload = compact_tool_payload(result)
+        if not isinstance(payload, dict):
+            return result
+        payload = dict(payload)
+        payload["dashboard_routed_from_tool"] = original_tool
+        payload["dashboard_actual_tool"] = actual_tool
+        if actual_tool == "execute_segment_to_breakpoint":
+            payload["next"] = (
+                "Dashboard routed this execution command through execute_segment_to_breakpoint with "
+                "wait_mode='background'. Use the returned recommended_status_call, not executor_status polling."
+            )
+        elif actual_tool == "execution_wait_status":
+            payload["next"] = (
+                "Dashboard routed executor_status to execution_wait_status because a background wait is active. "
+                "Use recommended_status_call or wait_seconds instead of immediate executor_status polling."
+            )
+        return replace_mcp_text_payload(result, payload)
 
     def add_dashboard_wait_metadata(
         self,

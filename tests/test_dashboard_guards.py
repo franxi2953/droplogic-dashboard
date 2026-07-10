@@ -1,11 +1,173 @@
 from __future__ import annotations
 
 import unittest
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.modules.setdefault("websockets", SimpleNamespace(serve=None))
+sys.modules.setdefault(
+    "httpx",
+    SimpleNamespace(
+        AsyncClient=object,
+        HTTPStatusError=RuntimeError,
+        RequestError=RuntimeError,
+    ),
+)
+sys.modules.setdefault(
+    "mcp",
+    SimpleNamespace(
+        ClientSession=object,
+        StdioServerParameters=object,
+        types=SimpleNamespace(
+            CallToolResult=object,
+            TextContent=object,
+            Tool=object,
+        ),
+    ),
+)
+sys.modules.setdefault("mcp.client", SimpleNamespace())
+sys.modules.setdefault("mcp.client.stdio", SimpleNamespace(stdio_client=None))
+sys.modules.setdefault("mcp.server", SimpleNamespace(Server=object))
+sys.modules.setdefault("mcp.server.stdio", SimpleNamespace(stdio_server=None))
+
 from backend.server import CockpitApp
+
+
+class AgentExecutionWaitRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_plan_is_not_rewritten_to_breakpoint_execution(self) -> None:
+        class FakeMcp:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_tool(self, tool: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                self.calls.append((tool, arguments))
+                return {"structuredContent": {"ok": True, "resumed": True}}
+
+        app = object.__new__(CockpitApp)
+        app.mcp = FakeMcp()
+        app.ensure_mcp_started_for_tool = fake_no_restart
+
+        result = await app.call_agent_mcp_tool(
+            "resume_plan",
+            {
+                "execution_view_mode": "whole_chip_camera",
+                "verify_positions": False,
+                "frame_delay": 1.0,
+                "restart_from_beginning": True,
+            },
+        )
+        payload = result["structuredContent"]
+
+        self.assertEqual(app.mcp.calls, [
+            (
+                "resume_plan",
+                {
+                    "execution_view_mode": "whole_chip_camera",
+                    "verify_positions": False,
+                    "frame_delay": 1.0,
+                    "restart_from_beginning": True,
+                },
+            )
+        ])
+        self.assertEqual(payload["resumed"], True)
+        self.assertNotIn("dashboard_routed_from_tool", payload)
+
+    async def test_executor_status_routes_to_timed_wait_when_background_wait_running(self) -> None:
+        class FakeMcp:
+            def __init__(self) -> None:
+                self.running = False
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_tool(self, tool: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                self.calls.append((tool, arguments))
+                if len(self.calls) == 1:
+                    return {"structuredContent": {"running": True, "recommended_wait_seconds": 12.0}}
+                if len(self.calls) == 2:
+                    return {"structuredContent": {"running": True, "recommended_wait_seconds": 12.0}}
+                return {"structuredContent": {"running": False, "completed": True, "ok": True}}
+
+        app = object.__new__(CockpitApp)
+        app.mcp = FakeMcp()
+        app.ensure_mcp_started_for_tool = fake_no_restart
+
+        with patch("backend.server.asyncio.sleep", new=fake_sleep):
+            result = await app.call_agent_mcp_tool("executor_status", {})
+        payload = result["structuredContent"]
+
+        self.assertEqual(app.mcp.calls, [
+            ("execution_wait_status", {"wait_seconds": 0.0}),
+            ("execution_wait_status", {"wait_seconds": 0.0}),
+            ("execution_wait_status", {"wait_seconds": 0.0}),
+        ])
+        self.assertEqual(payload["dashboard_routed_from_tool"], "executor_status")
+        self.assertEqual(payload["dashboard_actual_tool"], "execution_wait_status")
+        self.assertEqual(payload["status_wait"]["requested_seconds"], 12.0)
+        self.assertEqual(payload["status_wait"]["effective_seconds"], 12.0)
+        self.assertEqual(payload["status_wait"]["return_reason"], "wait_completed")
+
+    async def test_executor_status_routed_wait_uses_execution_wait_health_guard(self) -> None:
+        class FakeMcp:
+            def __init__(self) -> None:
+                self.running = True
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_tool(self, tool: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                self.calls.append((tool, arguments))
+                return {"structuredContent": {"running": True}}
+
+        app = object.__new__(CockpitApp)
+        app.mcp = FakeMcp()
+        app.ensure_mcp_started_for_tool = fake_no_restart
+        app.safe_tool = fake_unhealthy_tool
+
+        result = await app.call_agent_mcp_tool("executor_status", {})
+
+        self.assertEqual(app.mcp.calls, [])
+        self.assertEqual(result["reason"], "mcp_runtime_health_failed")
+        self.assertEqual(result["tool_not_run"], "execution_wait_status")
+        self.assertEqual(result["dashboard_routed_from_tool"], "executor_status")
+        self.assertEqual(result["dashboard_actual_tool"], "execution_wait_status")
+
+    async def test_planning_job_status_waits_when_background_planning_running(self) -> None:
+        class FakeMcp:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_tool(self, tool: str, arguments: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                self.calls.append((tool, arguments))
+                if len(self.calls) == 1:
+                    return {"structuredContent": {"running": True, "recommended_wait_seconds": 9.0}}
+                return {"structuredContent": {"running": False, "completed": True, "ok": True}}
+
+        app = object.__new__(CockpitApp)
+        app.mcp = FakeMcp()
+        app.ensure_mcp_started_for_tool = fake_no_restart
+
+        with patch("backend.server.asyncio.sleep", new=fake_sleep):
+            result = await app.call_agent_mcp_tool("planning_job_status", {})
+        payload = result["structuredContent"]
+
+        self.assertEqual(app.mcp.calls, [
+            ("planning_job_status", {}),
+            ("planning_job_status", {}),
+        ])
+        self.assertEqual(payload["status_wait"]["requested_seconds"], 9.0)
+        self.assertEqual(payload["status_wait"]["effective_seconds"], 9.0)
+        self.assertEqual(payload["status_wait"]["return_reason"], "planning_completed")
+
+
+async def fake_no_restart(*_args: object, **_kwargs: object) -> bool:
+    return False
+
+
+async def fake_sleep(_seconds: float) -> None:
+    return None
+
+
+async def fake_unhealthy_tool(*_args: object, **_kwargs: object) -> dict[str, object]:
+    return {"ok": False, "error": "queue workers stopped"}
 
 
 class HealthGuardTests(unittest.TestCase):
