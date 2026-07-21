@@ -440,6 +440,23 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         roots.append(("default", DROPLOGIC_ROOT / "droplogic" / "mcp" / "context" / "boxmini"))
         return roots
 
+    def resolve_context_file_path(self, relative_path: str) -> Path | None:
+        clean_path = str(relative_path or "").strip().replace("\\", "/")
+        if not clean_path:
+            return None
+        for _, root in self.pinned_context_roots():
+            candidate = (root / clean_path).resolve()
+            try:
+                candidate.relative_to(root.resolve())
+            except ValueError:
+                continue
+            if candidate.is_file():
+                return candidate
+        roots = self.pinned_context_roots()
+        if not roots:
+            return None
+        return (roots[0][1].resolve() / clean_path).resolve()
+
     def load_pinned_context(self) -> tuple[str, dict[str, Any]]:
         sections: list[str] = []
         loaded: list[dict[str, Any]] = []
@@ -1810,6 +1827,110 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             )
             return
 
+        if msg_type == "calibration_select_mode":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            mode = str(message.get("mode") or "focus")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.set_mode(mode),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_select":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            hole_id = str(message.get("hole_id") or "")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.select_input_hole(hole_id),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_new":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            side = str(message.get("side") or "left")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.create_input_hole(side=side),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_delete":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.delete_selected_input_hole(),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_update":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            calibration = self.calibration.update_selected_input_hole(
+                hole_id=message.get("hole_id"),
+                side=message.get("side"),
+                role=message.get("role"),
+                notes=message.get("notes"),
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": calibration,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_capture":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            await self.guarded_safe_tool("calibration_stage_jog", {"stop_all": True}, via="calibration")
+            fresh_position = compact_tool_payload(await self.safe_tool("calibration_stage_position"))
+            position = (
+                fresh_position.get("position")
+                if isinstance(fresh_position, dict) and fresh_position.get("position")
+                else message.get("position") or {}
+            )
+            calibration = self.calibration.capture_selected_input_hole_endpoint(
+                str(message.get("endpoint") or ""),
+                position,
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": calibration,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
         if msg_type == "calibration_jog":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
@@ -1875,6 +1996,17 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if msg_type == "calibration_move_to_target":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
+            if self.calibration.mode != "focus":
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "calibration_state",
+                            "calibration": self.calibration.state(error="Move to target is only available in focus calibration mode."),
+                        },
+                        ensure_ascii=True,
+                    )
+                )
+                return
             move = await self.move_calibration_to_current_target(wait_timeout_seconds=20)
             await websocket.send(
                 json.dumps(
@@ -1900,6 +2032,17 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if msg_type == "calibration_record":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
+            if self.calibration.mode != "focus":
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "calibration_state",
+                            "calibration": self.calibration.state(error="Accept step is only available in focus calibration mode."),
+                        },
+                        ensure_ascii=True,
+                    )
+                )
+                return
             await self.guarded_safe_tool("calibration_stage_jog", {"stop_all": True}, via="calibration")
             fresh_position = compact_tool_payload(await self.safe_tool("calibration_stage_position"))
             position = (
@@ -1938,9 +2081,14 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if msg_type == "calibration_save":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
-            self.calibration.save()
-            apply_result = await self.apply_calibration_to_runtime()
-            await self.record("calibration_saved", config_path=str(self.calibration.config_path))
+            apply_result = None
+            if self.calibration.mode == "injection_holes":
+                self.calibration.save_cartridge()
+                await self.record("calibration_saved", config_path=str(self.calibration.cartridge_path), kind="input_holes")
+            else:
+                self.calibration.save()
+                apply_result = await self.apply_calibration_to_runtime()
+                await self.record("calibration_saved", config_path=str(self.calibration.config_path), kind="focus")
             await websocket.send(
                 json.dumps(
                     {
@@ -1951,6 +2099,9 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     ensure_ascii=True,
                 )
             )
+            if self.mcp.running:
+                self.live = await self.collect_live_snapshot(include_state=True)
+                await self.broadcast_live_json({"type": "live", "live": self.live})
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
@@ -2270,6 +2421,53 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
+        if msg_type == "set_streamer_overlay":
+            enabled = bool(message.get("enabled", True))
+            if not self.mcp.running:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "streamer_overlay_result",
+                            "result": {"ok": False, "error": "MCP is not running."},
+                        },
+                        ensure_ascii=True,
+                    )
+                )
+                return
+            current = compact_tool_payload(await self.safe_tool("visualizer_status", {}))
+            streamer = {}
+            if isinstance(current, dict):
+                streamer = current.get("streamer") if isinstance(current.get("streamer"), dict) else current
+            source = str(streamer.get("source") or "microscope").strip().lower()
+            coordinates = streamer.get("coordinates")
+            result = compact_tool_payload(
+                await self.guarded_safe_tool(
+                    "set_streamer_source",
+                    {
+                        "source": source,
+                        "electrode_overlay": enabled,
+                        "coordinates": bool(coordinates) if coordinates is not None else None,
+                        "bring_to_front": False,
+                    },
+                    via="dashboard_user",
+                )
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "streamer_overlay_result",
+                        "result": result,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if self.mcp.running:
+                live = await self.collect_live_snapshot(include_state=True)
+                self.live = live
+                await self.broadcast_live_json({"type": "live", "live": live})
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
         if msg_type == "ask_agent":
             requested_run_id = str(message.get("run_id", "")).strip()
             if requested_run_id and requested_run_id != self.recorder.run_id:
@@ -2306,7 +2504,10 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         await self.record("unknown_message", level="warning", message=message)
 
     async def start_calibration_session(self, websocket: Any) -> None:
-        self.calibration = DashboardCalibrationSession()
+        self.calibration = DashboardCalibrationSession(
+            cartridge_path=self.resolve_context_file_path("cartridge.default.json"),
+            context_roots=[root for _, root in self.pinned_context_roots()],
+        )
         self.streamer_frame_options = {"full_resolution": True}
         self.now = "Cartridge calibration"
         await self.mcp.start()

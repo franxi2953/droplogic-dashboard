@@ -1,6 +1,8 @@
 let activeMetricEdit = null;
 let pendingMetricEdit = null;
 let lastStateGridRenderKey = "";
+let pendingStreamerSource = "";
+let pendingStreamerSourceAt = 0;
 
 const STAGE_SPEED_PRESETS = {
   slow: { label: "Slow", velocity: 1000, acceleration: 10000 },
@@ -25,7 +27,13 @@ function renderStateGrid(live) {
   container.innerHTML = "";
 
   const value = live?.state?.value || live?.state?.result?.value || live?.state;
+  const streamerStatus = streamerStatusFromLive(live);
   const rows = [
+    {
+      kind: "streamer",
+      label: "Streamer",
+      content: renderStreamerSourceCard(streamerStatus),
+    },
     {
       kind: "stage",
       label: "Stage",
@@ -79,8 +87,16 @@ function stateGridRenderKey(live) {
   const microscope = getPath(value, "microscope_settings") || {};
   const camera = getPath(value, "camera_settings") || {};
   const light = getPath(value, "light_settings") || {};
+  const streamer = streamerStatusFromLive(live);
   return JSON.stringify({
     pending: pendingMetricEdit ? `${pendingMetricEdit.kind}:${pendingMetricEdit.field || pendingMetricEdit.axis || ""}:${pendingMetricEdit.value}` : "",
+    streamer: {
+      source: streamerSourceFromStatus(streamer),
+      device: streamer?.device,
+      raw: streamer?.raw_frame_buffered,
+      processed: streamer?.processed_frame_buffered,
+      pending: pendingStreamerSource,
+    },
     stage: {
       position: stage.position || {},
       motion: stage.motion_params || {},
@@ -103,6 +119,88 @@ function stateGridRenderKey(live) {
       coaxial: firstDefined(light.coaxial_intensity, light.coaxial, light.coaxial_light),
       ring: firstDefined(light.ring_intensity, light.ring, light.ring_light),
       on: firstDefined(light.light_on, light.enabled, light.on),
+    },
+  });
+}
+
+function streamerStatusFromLive(live = state.live) {
+  const visualizers = live?.visualizers?.result
+    || live?.visualizers?.value
+    || live?.visualizers
+    || {};
+  const candidates = [
+    visualizers.streamer,
+    getPath(visualizers, "result.streamer"),
+    getPath(visualizers, "structuredContent.result.streamer"),
+  ];
+  return candidates.find((candidate) => candidate && typeof candidate === "object") || {};
+}
+
+function streamerSourceFromStatus(status = streamerStatusFromLive()) {
+  const source = String(status?.source || "").trim().toLowerCase();
+  if (source === "microscope" || source === "camera") return source;
+  const device = String(status?.device || "").toLowerCase();
+  if (device.includes("microscope")) return "microscope";
+  if (device.includes("camera")) return "camera";
+  return "";
+}
+
+function streamerSourceLabel(source) {
+  if (source === "microscope") return "Microscope";
+  if (source === "camera") return "Camera";
+  return "Unknown";
+}
+
+function renderStreamerSourceCard(status) {
+  const source = streamerSourceFromStatus(status);
+  return metricGrid([
+    ["Source", pendingStreamerSource ? `${streamerSourceLabel(source)} -> ${streamerSourceLabel(pendingStreamerSource)}` : streamerSourceLabel(source)],
+    ["Device", status?.device || "-"],
+    ["Raw", status?.raw_frame_buffered ? "yes" : "no"],
+    ["Proc", status?.processed_frame_buffered ? "yes" : "no"],
+  ], "streamer-source");
+}
+
+function updateStreamerSourceControl(live = state.live) {
+  const button = $("streamerSourceToggle");
+  if (!button) return;
+  const status = streamerStatusFromLive(live);
+  const source = streamerSourceFromStatus(status);
+  if (pendingStreamerSource && source === pendingStreamerSource) {
+    pendingStreamerSource = "";
+    pendingStreamerSourceAt = 0;
+  }
+  if (pendingStreamerSource && Date.now() - Number(pendingStreamerSourceAt || 0) > 12000) {
+    pendingStreamerSource = "";
+    pendingStreamerSourceAt = 0;
+  }
+  const effectiveSource = pendingStreamerSource || source;
+  const nextSource = effectiveSource === "camera" ? "microscope" : "camera";
+  button.disabled = Boolean(pendingStreamerSource);
+  button.dataset.source = source || "";
+  button.textContent = pendingStreamerSource
+    ? `Streamer: switching to ${streamerSourceLabel(pendingStreamerSource)}`
+    : `Streamer: ${streamerSourceLabel(source)} | Switch to ${streamerSourceLabel(nextSource)}`;
+  button.title = source
+    ? `Current streamer source: ${streamerSourceLabel(source)}`
+    : "Streamer source is unknown; click to switch to Camera.";
+}
+
+function toggleStreamerSource() {
+  const source = streamerSourceFromStatus(streamerStatusFromLive(state.live));
+  const target = source === "camera" ? "microscope" : "camera";
+  pendingStreamerSource = target;
+  pendingStreamerSourceAt = Date.now();
+  updateStreamerSourceControl(state.live);
+  renderStateGrid(state.live || {});
+  send({
+    type: "mcp_tool",
+    tool: "set_streamer_source",
+    arguments: {
+      source: target,
+      electrode_overlay: target === "microscope",
+      coordinates: false,
+      bring_to_front: false,
     },
   });
 }

@@ -77,9 +77,6 @@ class LiveSnapshotMixin:
         while self.mcp.running:
             started = time.monotonic()
             try:
-                if getattr(self, "_direct_stream_available", False):
-                    await asyncio.sleep(max(0.2, float(getattr(self.config, "live_state_interval_seconds", 1.0))))
-                    continue
                 frame = await self.collect_streamer_frame()
                 self.live = self.merge_live_frame(self.live or {}, "streamer", frame)
                 await self.broadcast_live_json(
@@ -235,19 +232,17 @@ class LiveSnapshotMixin:
         streamer_max_width = None if streamer_full_resolution else int(streamer_options.get("max_width") or 720)
         streamer_max_height = None if streamer_full_resolution else int(streamer_options.get("max_height") or 460)
         previous_frames = previous.get("frames") if isinstance(previous.get("frames"), dict) else {}
-        direct_stream_available = bool(getattr(self, "_direct_stream_available", False))
         streamer_frame = None
-        if not direct_stream_available:
-            if include_streamer_frame:
-                streamer_frame = self.annotate_live_frame("streamer", await self.safe_frame(
-                    "streamer",
-                    "snapshot",
-                    max_width=streamer_max_width,
-                    max_height=streamer_max_height,
-                    image_quality=72,
-                ))
-            else:
-                streamer_frame = previous_frames.get("streamer")
+        if include_streamer_frame:
+            streamer_frame = self.annotate_live_frame("streamer", await self.safe_frame(
+                "streamer",
+                "snapshot",
+                max_width=streamer_max_width,
+                max_height=streamer_max_height,
+                image_quality=72,
+            ))
+        else:
+            streamer_frame = previous_frames.get("streamer")
         matrix_frame = previous_frames.get("matrix")
         if not (isinstance(scene, dict) and scene.get("available")):
             matrix_frame = self.annotate_live_frame(

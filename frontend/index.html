@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>DropLogic Dashboard</title>
-    <link rel="stylesheet" href="/styles.css?v=20260704-composer-layout" />
+    <link rel="stylesheet" href="/styles.css?v=20260721-streamer-levels" />
   </head>
   <body>
     <main class="app">
@@ -78,6 +78,13 @@
                     </div>
                     <div class="visual-actions">
                       <code id="streamerMeta">waiting</code>
+                      <label class="streamer-overlay-toggle" title="Show electrode overlay on the streamer">
+                        <input id="streamerOverlayToggle" type="checkbox" checked />
+                        <span>Overlay</span>
+                      </label>
+                      <button id="streamerLevelsToggle" class="streamer-levels-toggle" type="button" aria-expanded="false" title="Open streamer histogram and levels">
+                        Histogram
+                      </button>
                       <button id="downloadStreamer" class="frame-download download-frame" type="button" title="Download raw camera frame" aria-label="Download raw camera frame">
                         <svg class="download-icon" viewBox="0 0 24 24" aria-hidden="true">
                           <circle class="download-icon-ring" cx="12" cy="12" r="8.25"></circle>
@@ -89,7 +96,33 @@
                   </header>
                   <div class="viewer streamer">
                     <img id="streamerFrame" alt="Streamer visualizer frame" />
+                    <canvas id="streamerCanvas" aria-label="Streamer adjusted frame"></canvas>
                     <div id="streamerEmpty" class="empty">No streamer frame yet</div>
+                    <section id="streamerLevelsPanel" class="streamer-levels-panel" hidden>
+                      <header>
+                        <div>
+                          <strong>Histogram</strong>
+                          <span>Live pixel range fit</span>
+                        </div>
+                        <button id="streamerLevelsClose" class="streamer-levels-close" type="button" aria-label="Close streamer levels">×</button>
+                      </header>
+                      <canvas id="streamerHistogram" width="320" height="136" aria-label="Streamer histogram"></canvas>
+                      <div class="streamer-levels-actions">
+                        <button id="streamerLevelsAutoOnce" type="button">Auto once</button>
+                        <button id="streamerLevelsAutoLive" type="button" aria-pressed="false">Auto live</button>
+                        <button id="streamerLevelsReset" type="button">Reset</button>
+                      </div>
+                      <label class="streamer-level-row" for="streamerBlackLevel">
+                        <span>Black</span>
+                        <input id="streamerBlackLevel" type="range" min="0" max="254" value="0" />
+                        <output id="streamerBlackValue" for="streamerBlackLevel">0</output>
+                      </label>
+                      <label class="streamer-level-row" for="streamerWhiteLevel">
+                        <span>White</span>
+                        <input id="streamerWhiteLevel" type="range" min="1" max="255" value="255" />
+                        <output id="streamerWhiteValue" for="streamerWhiteLevel">255</output>
+                      </label>
+                    </section>
                   </div>
                 </article>
 
@@ -201,7 +234,10 @@
                   <article class="panel state-panel">
                     <header>
                       <h2>BoxMini State</h2>
-                      <code id="liveState">-</code>
+                      <div class="state-header-actions">
+                        <button id="streamerSourceToggle" type="button" title="Switch streamer between microscope and camera">Streamer: -</button>
+                        <code id="liveState">-</code>
+                      </div>
                     </header>
                     <div id="stateGrid" class="state-grid"></div>
                   </article>
@@ -539,29 +575,85 @@
               <div class="calibration-target-box" aria-hidden="true"></div>
             </div>
             <aside class="calibration-panel">
-              <div class="calibration-step">
-                <span id="calibrationStepIndex">-</span>
-                <strong id="calibrationStepLabel">-</strong>
+              <div class="calibration-tabs" role="tablist" aria-label="Calibration mode">
+                <button id="calibrationModeFocus" type="button" class="active" role="tab" aria-selected="true">Focus</button>
+                <button id="calibrationModeHoles" type="button" role="tab" aria-selected="false">Injection Holes</button>
               </div>
               <div class="calibration-position-grid">
                 <div><span>X</span><code id="calibrationX">-</code></div>
                 <div><span>Y</span><code id="calibrationY">-</code></div>
                 <div><span>Z</span><code id="calibrationZ">-</code></div>
               </div>
-              <div class="calibration-position-grid secondary">
-                <div><span>dX</span><code id="calibrationRowX">-</code></div>
-                <div><span>dY</span><code id="calibrationRowY">-</code></div>
-                <div><span>dZ</span><code id="calibrationRowZ">-</code></div>
+              <div id="calibrationFocusPanel" class="calibration-mode-panel">
+                <div class="calibration-step">
+                  <span id="calibrationStepIndex">-</span>
+                  <strong id="calibrationStepLabel">-</strong>
+                </div>
+                <div class="calibration-position-grid secondary">
+                  <div><span>dX</span><code id="calibrationRowX">-</code></div>
+                  <div><span>dY</span><code id="calibrationRowY">-</code></div>
+                  <div><span>dZ</span><code id="calibrationRowZ">-</code></div>
+                </div>
+                <div class="calibration-position-grid secondary">
+                  <div><span>cX</span><code id="calibrationColumnX">-</code></div>
+                  <div><span>cY</span><code id="calibrationColumnY">-</code></div>
+                  <div><span>cZ</span><code id="calibrationColumnZ">-</code></div>
+                </div>
+                <div class="calibration-controls">
+                  <button id="calibrationMoveTarget" type="button" title="Move to current target estimate">Target</button>
+                  <button id="calibrationAccept" type="button" title="Accept current target">Accept</button>
+                  <button id="calibrationSave" type="button" title="Save calibration">Save</button>
+                </div>
               </div>
-              <div class="calibration-position-grid secondary">
-                <div><span>cX</span><code id="calibrationColumnX">-</code></div>
-                <div><span>cY</span><code id="calibrationColumnY">-</code></div>
-                <div><span>cZ</span><code id="calibrationColumnZ">-</code></div>
-              </div>
-              <div class="calibration-controls">
-                <button id="calibrationMoveTarget" type="button" title="Move to current target estimate">Target</button>
-                <button id="calibrationAccept" type="button" title="Accept current target">Accept</button>
-                <button id="calibrationSave" type="button" title="Save calibration">Save</button>
+              <div id="calibrationHolesPanel" class="calibration-mode-panel" hidden>
+                <div class="calibration-step">
+                  <span id="calibrationHoleStepIndex">Hole</span>
+                  <strong id="calibrationHoleStepLabel">-</strong>
+                </div>
+                <div class="calibration-position-grid secondary">
+                  <div><span>Row</span><code id="calibrationHoleRow">-</code></div>
+                  <div><span>Col</span><code id="calibrationHoleColumn">-</code></div>
+                  <div><span>File</span><code id="calibrationCartridgeConfig">-</code></div>
+                </div>
+                <div class="calibration-hole-form">
+                  <label>
+                    <span>Hole</span>
+                    <select id="calibrationHoleSelect"></select>
+                  </label>
+                  <label>
+                    <span>ID</span>
+                    <input id="calibrationHoleId" type="text" spellcheck="false" />
+                  </label>
+                  <label>
+                    <span>Side</span>
+                    <select id="calibrationHoleSide">
+                      <option value="left">left</option>
+                      <option value="right">right</option>
+                      <option value="top">top</option>
+                      <option value="bottom">bottom</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Role</span>
+                    <input id="calibrationHoleRole" type="text" spellcheck="false" />
+                  </label>
+                  <label class="wide">
+                    <span>Notes</span>
+                    <input id="calibrationHoleNotes" type="text" spellcheck="false" />
+                  </label>
+                </div>
+                <div class="calibration-position-grid secondary">
+                  <div><span>Rows</span><code id="calibrationHoleRows">-</code></div>
+                  <div><span>Cols</span><code id="calibrationHoleColumns">-</code></div>
+                  <div><span>Shape</span><code id="calibrationHoleShape">-</code></div>
+                </div>
+                <div class="calibration-controls calibration-controls-wrap">
+                  <button id="calibrationHoleNew" type="button">New</button>
+                  <button id="calibrationHoleDelete" type="button">Delete</button>
+                  <button id="calibrationHoleCaptureStart" type="button">Set Start</button>
+                  <button id="calibrationHoleCaptureEnd" type="button">Set End</button>
+                  <button id="calibrationHoleSave" type="button" title="Save cartridge holes">Save</button>
+                </div>
               </div>
               <div class="calibration-speed" role="group" aria-label="Jog speed">
                 <button type="button" data-calibration-speed="1">Fine</button>
@@ -574,8 +666,8 @@
       </section>
     </main>
 
-    <script src="/js/state-panel.js?v=20260704-live-render-throttle"></script>
+    <script src="/js/state-panel.js?v=20260716-streamer-source-toggle"></script>
     <script src="/js/timeline-cursor.js?v=20260702-calibration"></script>
-    <script src="/app.js?v=20260706-live-ws-freshness"></script>
+    <script src="/app.js?v=20260721-streamer-levels"></script>
   </body>
 </html>
