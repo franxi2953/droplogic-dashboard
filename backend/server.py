@@ -2080,8 +2080,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                             "mode": mode,
                             "remove_duplicate_frames": False,
                             "planning_timeout": 120.0,
-                            "background": False,
-                            "allow_long_sync": True,
+                            "background": True,
                         },
                     )
                 )
@@ -2189,8 +2188,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                             "mode": mode,
                             "remove_duplicate_frames": False,
                             "planning_timeout": 120.0,
-                            "background": False,
-                            "allow_long_sync": True,
+                            "background": True,
                         },
                     )
                 )
