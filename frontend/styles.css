@@ -1368,20 +1368,6 @@ button:disabled {
   min-width: 0;
 }
 
-#streamerSourceToggle {
-  min-height: 24px;
-  padding: 4px 8px;
-  border-color: rgba(100, 210, 255, 0.38);
-  background: rgba(18, 40, 50, 0.88);
-  color: #d8ecff;
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-#streamerSourceToggle:disabled {
-  opacity: 0.68;
-}
-
 .panel-title {
   display: flex;
   align-items: center;
@@ -2614,6 +2600,10 @@ button:disabled {
   border-left-color: #64d2ff;
 }
 
+.state-card[data-kind="queues"] {
+  border-left-color: #ffd60a;
+}
+
 .state-card[data-kind="light"] {
   border-left-color: var(--orange);
 }
@@ -2673,6 +2663,51 @@ button:disabled {
 
 .metric-grid.streamer-source {
   grid-template-columns: minmax(70px, 1fr) minmax(68px, 1fr) repeat(2, minmax(34px, 0.56fr));
+}
+
+.metric-grid.queue-summary {
+  grid-template-columns: repeat(4, minmax(34px, 1fr));
+}
+
+.metric-grid.queue-summary .metric {
+  padding-inline: 3px;
+  text-align: center;
+}
+
+.metric-grid.queue-summary .metric-label {
+  font-size: 8px;
+}
+
+.metric-grid.queue-summary .metric-value {
+  color: #fff4bf;
+}
+
+.streamer-source-select {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.1;
+  cursor: pointer;
+}
+
+.streamer-source-select:focus-visible {
+  outline: 1px solid rgba(100, 210, 255, 0.72);
+  outline-offset: 2px;
+}
+
+.streamer-source-select:disabled {
+  cursor: wait;
+  opacity: 0.64;
 }
 
 .metric-grid.matrix-voltage-boxes .metric {

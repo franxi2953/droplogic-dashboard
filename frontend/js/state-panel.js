@@ -21,6 +21,7 @@ function renderStateGrid(live) {
   if (!container) return;
   if (container.querySelector(".metric.editing")) return;
   resolvePendingMetricEditFromLive(live);
+  syncPendingStreamerSource(live);
   const renderKey = stateGridRenderKey(live);
   if (renderKey === lastStateGridRenderKey && container.childElementCount > 0) return;
   lastStateGridRenderKey = renderKey;
@@ -28,11 +29,17 @@ function renderStateGrid(live) {
 
   const value = live?.state?.value || live?.state?.result?.value || live?.state;
   const streamerStatus = streamerStatusFromLive(live);
+  const queueSummary = queueSummaryFromLive(live);
   const rows = [
     {
       kind: "streamer",
       label: "Streamer",
       content: renderStreamerSourceCard(streamerStatus),
+    },
+    {
+      kind: "queues",
+      label: "Queues",
+      content: renderQueueCard(queueSummary),
     },
     {
       kind: "stage",
@@ -88,6 +95,7 @@ function stateGridRenderKey(live) {
   const camera = getPath(value, "camera_settings") || {};
   const light = getPath(value, "light_settings") || {};
   const streamer = streamerStatusFromLive(live);
+  const queues = queueSummaryFromLive(live);
   return JSON.stringify({
     pending: pendingMetricEdit ? `${pendingMetricEdit.kind}:${pendingMetricEdit.field || pendingMetricEdit.axis || ""}:${pendingMetricEdit.value}` : "",
     streamer: {
@@ -97,6 +105,7 @@ function stateGridRenderKey(live) {
       processed: streamer?.processed_frame_buffered,
       pending: pendingStreamerSource,
     },
+    queues,
     stage: {
       position: stage.position || {},
       motion: stage.motion_params || {},
@@ -121,6 +130,32 @@ function stateGridRenderKey(live) {
       on: firstDefined(light.light_on, light.enabled, light.on),
     },
   });
+}
+
+function queueSummaryFromLive(live = state.live) {
+  const runtime = live?.runtime || {};
+  const roots = [
+    runtime,
+    runtime?.result,
+    runtime?.value,
+    getPath(runtime, "structuredContent.result"),
+  ];
+  for (const root of roots) {
+    const summary = root?.system?.queue_summary;
+    if (summary && typeof summary === "object") return summary;
+  }
+  return { pending_commands: null, queues: {} };
+}
+
+function renderQueueCard(summary) {
+  const queues = summary?.queues && typeof summary.queues === "object" ? summary.queues : {};
+  const priorities = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
+  const items = priorities.map((priority) => {
+    const queue = queues[priority] || {};
+    const pending = firstDefined(queue.pending_commands, queue.unfinished_tasks, queue.queue_size);
+    return [priority.slice(0, 4), Number.isFinite(Number(pending)) ? Math.max(0, Number(pending)) : "-"];
+  });
+  return metricGrid(items, "queue-summary");
 }
 
 function streamerStatusFromLive(live = state.live) {
@@ -153,17 +188,41 @@ function streamerSourceLabel(source) {
 
 function renderStreamerSourceCard(status) {
   const source = streamerSourceFromStatus(status);
-  return metricGrid([
-    ["Source", pendingStreamerSource ? `${streamerSourceLabel(source)} -> ${streamerSourceLabel(pendingStreamerSource)}` : streamerSourceLabel(source)],
+  const grid = metricGrid([
+    ["Source", streamerSourceLabel(source)],
     ["Device", status?.device || "-"],
     ["Raw", status?.raw_frame_buffered ? "yes" : "no"],
     ["Proc", status?.processed_frame_buffered ? "yes" : "no"],
   ], "streamer-source");
+  const sourceMetric = grid.querySelector(".metric");
+  const value = sourceMetric?.querySelector(".metric-value");
+  if (!sourceMetric || !value) return grid;
+
+  const select = document.createElement("select");
+  const selectedSource = pendingStreamerSource || source;
+  select.className = "streamer-source-select";
+  select.disabled = Boolean(pendingStreamerSource);
+  select.title = pendingStreamerSource
+    ? `Switching to ${streamerSourceLabel(pendingStreamerSource)}`
+    : "Select the streamer source";
+  for (const option of [
+    { value: "", label: "Unknown", disabled: true },
+    { value: "microscope", label: "Microscope" },
+    { value: "camera", label: "Camera" },
+  ]) {
+    const node = document.createElement("option");
+    node.value = option.value;
+    node.textContent = option.label;
+    node.disabled = Boolean(option.disabled);
+    select.appendChild(node);
+  }
+  select.value = selectedSource;
+  select.addEventListener("change", () => selectStreamerSource(select.value));
+  value.replaceChildren(select);
+  return grid;
 }
 
-function updateStreamerSourceControl(live = state.live) {
-  const button = $("streamerSourceToggle");
-  if (!button) return;
+function syncPendingStreamerSource(live = state.live) {
   const status = streamerStatusFromLive(live);
   const source = streamerSourceFromStatus(status);
   if (pendingStreamerSource && source === pendingStreamerSource) {
@@ -174,24 +233,14 @@ function updateStreamerSourceControl(live = state.live) {
     pendingStreamerSource = "";
     pendingStreamerSourceAt = 0;
   }
-  const effectiveSource = pendingStreamerSource || source;
-  const nextSource = effectiveSource === "camera" ? "microscope" : "camera";
-  button.disabled = Boolean(pendingStreamerSource);
-  button.dataset.source = source || "";
-  button.textContent = pendingStreamerSource
-    ? `Streamer: switching to ${streamerSourceLabel(pendingStreamerSource)}`
-    : `Streamer: ${streamerSourceLabel(source)} | Switch to ${streamerSourceLabel(nextSource)}`;
-  button.title = source
-    ? `Current streamer source: ${streamerSourceLabel(source)}`
-    : "Streamer source is unknown; click to switch to Camera.";
 }
 
-function toggleStreamerSource() {
+function selectStreamerSource(target) {
+  if (target !== "camera" && target !== "microscope") return;
   const source = streamerSourceFromStatus(streamerStatusFromLive(state.live));
-  const target = source === "camera" ? "microscope" : "camera";
+  if (target === source) return;
   pendingStreamerSource = target;
   pendingStreamerSourceAt = Date.now();
-  updateStreamerSourceControl(state.live);
   renderStateGrid(state.live || {});
   send({
     type: "mcp_tool",

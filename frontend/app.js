@@ -305,6 +305,14 @@ const state = {
       key: "",
       data: null,
     },
+    markerCache: {
+      key: "",
+      data: null,
+    },
+    temperatureRenderCache: {
+      key: "",
+      data: null,
+    },
     rangeCache: {
       key: "",
       data: null,
@@ -338,6 +346,7 @@ const state = {
       bitmap: null,
     },
     renderQueued: false,
+    wheelRenderTimer: null,
     telemetryRenderTimer: null,
     rangeDrag: {
       active: false,
@@ -1107,7 +1116,33 @@ function appendEvent(event, options = {}) {
     state.compactingUntil = Date.now() + 2600;
   }
   if (options.liveAgent === true) scheduleTypewriter(event);
+  if (isConversationStreamEvent(event)) {
+    renderConversationStreamUpdate();
+    return;
+  }
   render();
+}
+
+function isConversationStreamEvent(event) {
+  return [
+    "agent_prompt",
+    "agent_steer",
+    "agent_response",
+    "agent_message",
+    "agent_started",
+    "agent_thinking",
+    "agent_finished",
+    "agent_model_response",
+  ].includes(String(event?.type || ""));
+}
+
+function renderConversationStreamUpdate() {
+  state.lastRenderedConversationKey = "";
+  if (state.conversationAtLatest) renderConversation();
+  updateCopyOutputButton();
+  updateThinkingOverlay();
+  renderTokenAnalytics();
+  updateJumpToBottomButton();
 }
 
 function isFrontendTelemetryOnlyEvent(event) {
@@ -1634,7 +1669,7 @@ function renderConversation() {
   if (renderKey === state.lastRenderedConversationKey) return;
   if (!state.forceConversationRender && hasTextSelectionInside(list)) return;
   const shouldFollowLatest = state.conversationAtLatest;
-  const distanceFromBottom = list.scrollHeight - list.scrollTop - list.clientHeight;
+  const readingScrollTop = list.scrollTop;
   state.forceConversationRender = false;
   state.lastRenderedConversationKey = renderKey;
   list.innerHTML = "";
@@ -1690,7 +1725,10 @@ function renderConversation() {
   if (shouldFollowLatest) {
     scrollConversationToLatest(false);
   } else {
-    list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight - distanceFromBottom);
+    // New events belong below the reader's current viewport. Keep the exact
+    // top offset instead of preserving distance from the end, which otherwise
+    // pulls an upward-scrolling reader down as streamed text grows.
+    list.scrollTop = Math.min(readingScrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
   }
   state.conversationAtLatest = isConversationAtLatest();
   updateJumpToBottomButton();
@@ -1891,6 +1929,7 @@ function advanceTypewriter() {
   if (!changed) return;
   state.typewriterVersion += 1;
   state.lastRenderedConversationKey = "";
+  if (!state.conversationAtLatest) return;
   renderConversation();
 }
 
@@ -3857,9 +3896,9 @@ window.addEventListener("DOMContentLoaded", () => {
         const rect = planTimeline.getBoundingClientRect();
         const layout = timelineLayout(rect.width || planTimeline.clientWidth || 1, rect.height || planTimeline.clientHeight || 1, count, scene);
         const delta = (event.deltaX || event.deltaY) / Math.max(24, layout.trackWidth || planTimeline.clientWidth || 1);
-        panTimelineTime(delta * layout.visibleTimeRange.duration);
+        panTimelineTime(delta * layout.visibleTimeRange.duration, { deferRender: true });
       } else {
-        zoomTimelineAtEvent(event);
+        zoomTimelineAtEvent(event, { deferRender: true });
       }
     }, { passive: false });
     planTimeline.addEventListener("pointerdown", (event) => {
@@ -3939,7 +3978,6 @@ window.addEventListener("DOMContentLoaded", () => {
   $("startMcp").onclick = () => send({ type: "start_mcp" });
   $("stopMcp").onclick = () => send({ type: "stop_mcp" });
   $("statusBtn").onclick = () => send({ type: "mcp_tool", tool: "runtime_status", arguments: {} });
-  $("streamerSourceToggle").onclick = () => toggleStreamerSource();
   $("streamerOverlayToggle").onchange = (event) => setStreamerOverlay(event.target.checked);
   $("streamerLevelsToggle").onclick = () => setStreamerLevelsPanelOpen(!state.streamerLevels.panelOpen);
   $("streamerLevelsClose").onclick = () => setStreamerLevelsPanelOpen(false);
@@ -4122,7 +4160,11 @@ window.addEventListener("DOMContentLoaded", () => {
   $("wakeInput").onclick = () => toggleWakeListening();
   $("jumpToBottom").onclick = () => jumpConversationToLatest();
   $("conversation").addEventListener("scroll", () => {
+    const wasAtLatest = state.conversationAtLatest;
     state.conversationAtLatest = isConversationAtLatest();
+    if (state.conversationAtLatest && !wasAtLatest && state.lastRenderedConversationKey === "") {
+      renderConversation();
+    }
     updateJumpToBottomButton();
   });
   $("filtersToggle").onclick = () => toggleFilters();
@@ -5349,7 +5391,6 @@ function renderLive() {
     renderCalibrationFrame(live.frames?.streamer);
   }
   updateTemperatureHistory(live);
-  updateStreamerSourceControl(live);
   updateStreamerOverlayControl(live);
   if (isStatePanelVisible()) {
     renderStateGrid(live);
@@ -7348,6 +7389,7 @@ function timelineSemanticTimes(scene = null, timeline = null, range = null) {
   if (state.timeline.semanticTimesCache.key === cacheKey && state.timeline.semanticTimesCache.data) {
     return state.timeline.semanticTimesCache.data;
   }
+  const markers = timelineStaticOverlayData(scene, timeline);
   const times = [];
   const push = (value) => {
     const number = Number(value);
@@ -7361,15 +7403,15 @@ function timelineSemanticTimes(scene = null, timeline = null, range = null) {
     const markerTime = timelineToolExecutionStartTime(event) ?? eventTimeSeconds(event);
     if (activePlanEvents.has(event) && timelineToolIsPlanOrExecution(String(event?.tool || "").toLowerCase())) push(markerTime);
   }
-  for (const marker of timelineStageMarkers(scene)) push(marker.time);
-  for (const marker of timelinePhotoMarkers(scene)) push(marker.time);
-  for (const marker of timelineTargetTemperatureMarkers(scene)) push(marker.time);
+  for (const marker of markers.stage) push(marker.time);
+  for (const marker of markers.photos) push(marker.time);
+  for (const marker of markers.targetTemperature) push(marker.time);
   const telemetryTail = timelineTelemetryTailRange(scene);
   if (telemetryTail) {
     push(telemetryTail.start);
     push(telemetryTail.end);
   }
-  for (const marker of timelineStopMarkers(scene, timeline)) {
+  for (const marker of markers.timelineStops) {
     push(marker.startTime);
     push(marker.endTime);
   }
@@ -7477,7 +7519,7 @@ function panTimelineFrames(deltaFrames) {
   panTimelineTime(deltaFrames * delay);
 }
 
-function panTimelineTime(deltaSeconds) {
+function panTimelineTime(deltaSeconds, options = {}) {
   const scene = state.live?.scene?.result || state.live?.scene;
   const count = timelineFrameCount(scene);
   if (!count) return;
@@ -7488,10 +7530,11 @@ function panTimelineTime(deltaSeconds) {
   const visible = timelineVisibleTimeRange(range);
   const maxOffset = Math.max(0, range.duration - visible.duration);
   state.timeline.timeOffset = clamp((Number(state.timeline.timeOffset) || 0) + Number(deltaSeconds || 0), 0, maxOffset);
-  schedulePlanTimelineRender();
+  if (options.deferRender) queueTimelineWheelRender();
+  else schedulePlanTimelineRender();
 }
 
-function zoomTimelineAtEvent(event) {
+function zoomTimelineAtEvent(event, options = {}) {
   const canvas = $("planTimeline");
   const scene = state.live?.scene?.result || state.live?.scene;
   const count = timelineFrameCount(scene);
@@ -7513,7 +7556,16 @@ function zoomTimelineAtEvent(event) {
   const cursorRatio = clamp((event.clientX - rect.left - oldLayout.left) / oldLayout.trackWidth, 0, 1);
   const maxOffset = Math.max(0, range.duration - visibleDuration);
   state.timeline.timeOffset = clamp(cursorTime - range.start - cursorRatio * visibleDuration, 0, maxOffset);
-  schedulePlanTimelineRender();
+  if (options.deferRender) queueTimelineWheelRender();
+  else schedulePlanTimelineRender();
+}
+
+function queueTimelineWheelRender() {
+  if (state.timeline.wheelRenderTimer !== null) return;
+  state.timeline.wheelRenderTimer = window.setTimeout(() => {
+    state.timeline.wheelRenderTimer = null;
+    schedulePlanTimelineRender();
+  }, 40);
 }
 
 function zoomTimelineButton(factor) {
@@ -8085,17 +8137,29 @@ function timelineOverlayData(scene, timeline, count) {
   if (state.timeline.overlayCache.key === key && state.timeline.overlayCache.data) {
     return state.timeline.overlayCache.data;
   }
-  const range = timelineOverlayTimeRange(scene);
-  const samples = timelineMeasuredTemperatureSamples(scene);
+  const markers = timelineStaticOverlayData(scene, timeline);
+  const range = timelineOverlayTimeRange(scene, markers);
   const data = {
     timeRange: range,
-    temperatureSamples: samples,
+    ...markers,
+  };
+  state.timeline.overlayCache = { key, data };
+  return data;
+}
+
+function timelineStaticOverlayData(scene = null, timeline = null) {
+  const key = timelineDataCacheKey(scene);
+  if (state.timeline.markerCache.key === key && state.timeline.markerCache.data) {
+    return state.timeline.markerCache.data;
+  }
+  const data = {
+    temperatureSamples: timelineMeasuredTemperatureSamples(scene),
     targetTemperature: timelineTargetTemperatureMarkers(scene),
     stage: timelineStageMarkers(scene),
     photos: timelinePhotoMarkers(scene),
     timelineStops: timelineStopMarkers(scene, timeline),
   };
-  state.timeline.overlayCache = { key, data };
+  state.timeline.markerCache = { key, data };
   return data;
 }
 
@@ -8144,13 +8208,14 @@ function timelineDataCacheKey(scene = null) {
   ].join("|");
 }
 
-function timelineOverlayTimeRange(scene = null) {
+function timelineOverlayTimeRange(scene = null, markerData = null) {
   const key = timelineDataCacheKey(scene);
   if (state.timeline.rangeCache.key === key && state.timeline.rangeCache.data) {
     return state.timeline.rangeCache.data;
   }
   const times = [];
-  for (const stop of timelineStopMarkers(scene)) {
+  const markers = markerData || timelineStaticOverlayData(scene, effectiveTimeline(scene));
+  for (const stop of markers.timelineStops) {
     if (Number.isFinite(Number(stop.startTime))) times.push(Number(stop.startTime));
     if (!stop.active && Number.isFinite(Number(stop.endTime))) times.push(Number(stop.endTime));
   }
@@ -8175,7 +8240,7 @@ function timelineOverlayTimeRange(scene = null) {
     const t = eventTime;
     if (Number.isFinite(t)) times.push(t);
   }
-  for (const marker of timelineTargetTemperatureMarkers(scene)) {
+  for (const marker of markers.targetTemperature) {
     if (Number.isFinite(Number(marker.time)) && !timelineTimeIsStopped(marker.time, scene)) {
       times.push(Number(marker.time));
     }
@@ -8734,8 +8799,9 @@ function drawTimelineTemperatureLines(ctx, layout, overlays, hitboxes) {
   const targetEnabled = timelineOverlayEnabled("targetTemperature");
   if (!measuredEnabled && !targetEnabled) return;
   const timeRange = layout.visibleTimeRange || overlays.timeRange;
-  const measured = measuredEnabled ? visibleTimelineTemperatureValues(overlays.temperatureSamples, timeRange, layout) : [];
-  const measuredForRender = measuredEnabled ? simplifyTimelineTemperatureSamplesForRender(measured, layout) : [];
+  const measuredForRender = measuredEnabled
+    ? timelineTemperatureSamplesForRender(overlays.temperatureSamples, timeRange, layout)
+    : [];
   const targets = targetEnabled ? (overlays.targetTemperature || []).filter((marker) => Number.isFinite(Number(marker.value))) : [];
   const visibleTargets = visibleTimelineTimeValues(targets, timeRange);
   const targetValues = targetEnabled ? timelineTargetValuesForRange(targets, timeRange) : [];
@@ -8767,15 +8833,54 @@ function drawTimelineTemperatureLines(ctx, layout, overlays, hitboxes) {
 }
 
 function visibleTimelineTimeValues(items, range) {
-  return (items || [])
-    .filter((item) => Number.isFinite(Number(item.time)) && Number.isFinite(Number(item.value)))
-    .filter((item) => !range?.duration || (item.time >= range.start && item.time <= range.end))
-    .sort((a, b) => Number(a.time) - Number(b.time));
+  const values = items || [];
+  if (!values.length) return [];
+  const start = range?.duration ? timelineTimeLowerBound(values, range.start) : 0;
+  const end = range?.duration ? timelineTimeUpperBound(values, range.end) : values.length;
+  return values.slice(start, end).filter((item) => (
+    Number.isFinite(Number(item.time)) && Number.isFinite(Number(item.value))
+  ));
 }
 
 function visibleTimelineTemperatureValues(items, range, layout) {
-  return visibleTimelineTimeValues(items, range)
-    .filter((item) => !timelineTimeInsideIdleGap(layout, item.time));
+  const values = visibleTimelineTimeValues(items, range);
+  const idleGaps = (layout?.timeWarp?.segments || []).filter((segment) => segment?.idle);
+  if (!idleGaps.length) return values;
+  const visible = [];
+  let gapIndex = 0;
+  for (const item of values) {
+    const time = Number(item.time);
+    while (gapIndex < idleGaps.length && time >= Number(idleGaps[gapIndex].realEnd)) {
+      gapIndex += 1;
+    }
+    const gap = idleGaps[gapIndex];
+    if (!gap || time <= Number(gap.realStart) || time >= Number(gap.realEnd)) visible.push(item);
+  }
+  return visible;
+}
+
+function timelineTimeLowerBound(items, value) {
+  let low = 0;
+  let high = items.length;
+  const target = Number(value);
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(items[middle]?.time) < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function timelineTimeUpperBound(items, value) {
+  let low = 0;
+  let high = items.length;
+  const target = Number(value);
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(items[middle]?.time) <= target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 function timelineTimeInsideIdleGap(layout, time) {
@@ -8802,9 +8907,7 @@ function timelineTimesCrossIdleGap(layout, start, end) {
 }
 
 function simplifyTimelineTemperatureSamplesForRender(samples, layout) {
-  const sorted = (samples || [])
-    .filter((sample) => Number.isFinite(Number(sample.time)) && Number.isFinite(Number(sample.value)))
-    .sort((a, b) => Number(a.time) - Number(b.time));
+  const sorted = samples || [];
   const maxPoints = Math.max(80, Math.min(
     TIMELINE_TEMPERATURE_RENDER_MAX_POINTS,
     Math.floor(Math.max(1, Number(layout?.trackWidth) || 1) / 3),
@@ -8814,19 +8917,22 @@ function simplifyTimelineTemperatureSamplesForRender(samples, layout) {
   const start = Number(sorted[0].time);
   const end = Number(sorted[sorted.length - 1].time);
   const duration = Math.max(0.001, end - start);
-  const buckets = Array.from({ length: bucketCount }, () => []);
+  const buckets = Array.from({ length: bucketCount }, () => null);
   for (const sample of sorted) {
     const index = clamp(Math.floor(((Number(sample.time) - start) / duration) * bucketCount), 0, bucketCount - 1);
-    buckets[index].push(sample);
+    const bucket = buckets[index];
+    if (!bucket) {
+      buckets[index] = { first: sample, min: sample, max: sample, last: sample };
+      continue;
+    }
+    bucket.last = sample;
+    if (Number(sample.value) < Number(bucket.min.value)) bucket.min = sample;
+    if (Number(sample.value) > Number(bucket.max.value)) bucket.max = sample;
   }
   const simplified = [];
   for (const bucket of buckets) {
-    if (!bucket.length) continue;
-    const first = bucket[0];
-    const min = bucket.reduce((best, item) => Number(item.value) < Number(best.value) ? item : best, first);
-    const max = bucket.reduce((best, item) => Number(item.value) > Number(best.value) ? item : best, first);
-    const last = bucket[bucket.length - 1];
-    for (const item of [first, min, max, last].sort((a, b) => Number(a.time) - Number(b.time))) {
+    if (!bucket) continue;
+    for (const item of [bucket.first, bucket.min, bucket.max, bucket.last].sort((a, b) => Number(a.time) - Number(b.time))) {
       const previous = simplified[simplified.length - 1];
       if (
         previous
@@ -8839,6 +8945,23 @@ function simplifyTimelineTemperatureSamplesForRender(samples, layout) {
     }
   }
   return simplified;
+}
+
+function timelineTemperatureSamplesForRender(samples, range, layout) {
+  const cacheKey = [
+    state.timeline.overlayCache.key,
+    Number(range?.start || 0).toFixed(3),
+    Number(range?.end || 0).toFixed(3),
+    Math.round(Number(layout?.trackWidth) || 0),
+    layout?.timeWarp?.key || "",
+  ].join("|");
+  if (state.timeline.temperatureRenderCache.key === cacheKey) {
+    return state.timeline.temperatureRenderCache.data || [];
+  }
+  const visible = visibleTimelineTemperatureValues(samples, range, layout);
+  const data = simplifyTimelineTemperatureSamplesForRender(visible, layout);
+  state.timeline.temperatureRenderCache = { key: cacheKey, data };
+  return data;
 }
 
 function timelineTargetValuesForRange(markers, range) {
