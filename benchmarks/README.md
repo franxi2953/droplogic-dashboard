@@ -7,7 +7,7 @@ Use two layers:
 
 ## 1. UI stress benchmark
 
-This benchmark creates a synthetic heavy run with many plan events, temperature samples, stage/photo markers, and chat events. It does not touch hardware.
+This benchmark replays every event from a recorded or generated run through fixture WebSockets, together with its temperature history and saved matrix scene. The stress-run generator creates a synthetic heavy run with many plan events, temperature samples, stage/photo markers, and chat events. Neither path starts the Dashboard backend or touches hardware.
 
 ```powershell
 py -3 scripts\generate_ui_stress_run.py --activate
@@ -20,7 +20,7 @@ Useful knobs:
 py -3 scripts\generate_ui_stress_run.py --frames 1600 --events 2500 --temperature-samples 60000 --chat-turns 600 --duration-seconds 32400 --activate
 ```
 
-The Playwright benchmark reports load time, timeline/matrix pointer latency, render call timings, long tasks, DOM size, event counts, and saves a screenshot plus JSON metrics.
+The Playwright benchmark reports fixture load time; conversation, timeline, matrix, and live-burst timings; timeline/matrix pointer latency; render call timings; long tasks; DOM size; event and temperature-sample counts; the rendered priority queue card; and the conversation scroll anchor before and after a streamed update. It fails if that update moves a reader's scroll offset by more than one pixel, and saves a screenshot plus JSON metrics.
 
 ## 2. Live WebSocket feed benchmark
 

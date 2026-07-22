@@ -19,7 +19,7 @@ Make the matrix visualizer behave like an RTS control surface for droplet plans:
 - Shift + right-click appends another waypoint to the selected droplet queue.
 - Render queued waypoints and preview legs directly on the matrix.
 - Add a compact command panel with queue count, clear, and SIPP plan action.
-- Send queued waypoints to the backend, where each waypoint becomes a target update followed by SIPP planning.
+- Send queued waypoints to the backend, where each waypoint becomes a target update followed by a serialized background SIPP planning job. Dashboard follows the job's recommended status-poll interval and reports failure if it has not completed within 135 seconds, leaving the control WebSocket responsive while planning runs.
 
 ## Phase 3: Timeline Execution Control
 
@@ -34,7 +34,7 @@ Make the matrix visualizer behave like an RTS control surface for droplet plans:
 ## Phase 4: Verification And Cleanup
 
 - Run syntax checks for edited JavaScript and Python files.
-- Run live responsiveness checks when matrix rendering or live payloads change: `npm run bench:matrix:motion`, `npm run bench:live`, and the agent matrix benchmark when agent-driven motion is affected.
+- Run live responsiveness checks when matrix rendering or live payloads change: `node scripts/bench_dashboard_ui.mjs --run <run-id>`, `npm run bench:matrix:motion`, `npm run bench:live`, and the agent matrix benchmark when agent-driven motion is affected.
 - Restart the dashboard backend.
 - Open the dashboard and visually inspect the matrix minimap, command panel, and timeline controls.
 - Remove temporary inspection artifacts after verification.
