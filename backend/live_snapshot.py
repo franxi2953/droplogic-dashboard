@@ -22,6 +22,12 @@ LIVE_DASHBOARD_SCENE_TIMEOUT_SECONDS = 2.0
 
 
 class LiveSnapshotMixin:
+    def streamer_snapshots_requested(self) -> bool:
+        clients = getattr(self, "_streamer_snapshot_clients", None)
+        if clients is not None:
+            return bool(clients)
+        return bool(getattr(self, "_streamer_snapshot_requested", False))
+
     def ensure_live_polling(self) -> None:
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self.live_poll_loop())
@@ -77,7 +83,10 @@ class LiveSnapshotMixin:
         while self.mcp.running:
             started = time.monotonic()
             try:
-                if getattr(self, "_direct_stream_available", False):
+                if (
+                    getattr(self, "_direct_stream_available", False)
+                    and not self.streamer_snapshots_requested()
+                ):
                     await asyncio.sleep(max(0.2, float(getattr(self.config, "live_state_interval_seconds", 1.0))))
                     continue
                 frame = await self.collect_streamer_frame()
@@ -235,19 +244,18 @@ class LiveSnapshotMixin:
         streamer_max_width = None if streamer_full_resolution else int(streamer_options.get("max_width") or 720)
         streamer_max_height = None if streamer_full_resolution else int(streamer_options.get("max_height") or 460)
         previous_frames = previous.get("frames") if isinstance(previous.get("frames"), dict) else {}
-        direct_stream_available = bool(getattr(self, "_direct_stream_available", False))
-        streamer_frame = None
-        if not direct_stream_available:
-            if include_streamer_frame:
-                streamer_frame = self.annotate_live_frame("streamer", await self.safe_frame(
-                    "streamer",
-                    "snapshot",
-                    max_width=streamer_max_width,
-                    max_height=streamer_max_height,
-                    image_quality=72,
-                ))
-            else:
-                streamer_frame = previous_frames.get("streamer")
+        streamer_frame = previous_frames.get("streamer")
+        snapshot_requested = self.streamer_snapshots_requested()
+        if include_streamer_frame and (
+            not getattr(self, "_direct_stream_available", False) or snapshot_requested
+        ):
+            streamer_frame = self.annotate_live_frame("streamer", await self.safe_frame(
+                "streamer",
+                "snapshot",
+                max_width=streamer_max_width,
+                max_height=streamer_max_height,
+                image_quality=72,
+            ))
         matrix_frame = previous_frames.get("matrix")
         if not (isinstance(scene, dict) and scene.get("available")):
             matrix_frame = self.annotate_live_frame(

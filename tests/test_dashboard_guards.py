@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 import sys
 from pathlib import Path
@@ -36,6 +37,156 @@ from backend.server import CockpitApp
 
 
 class AgentExecutionWaitRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dashboard_planning_message_is_dispatched_in_background(self) -> None:
+        received: list[dict[str, object]] = []
+
+        async def run_background(_websocket: object, message: dict[str, object]) -> None:
+            received.append(message)
+
+        app = object.__new__(CockpitApp)
+        app._dashboard_tasks = set()
+        app.run_background_dashboard_message = run_background
+        message = {"type": "matrix_plan_waypoint_paths", "droplet_id": 1, "waypoints": [[2, 3]]}
+
+        await app.handle_message(object(), message)
+        task = next(iter(app._dashboard_tasks))
+        await task
+
+        self.assertEqual(received, [message])
+
+    async def test_background_dashboard_planning_messages_are_serialized(self) -> None:
+        entered: list[int] = []
+        release_first = asyncio.Event()
+
+        async def handle_message(
+            _websocket: object,
+            message: dict[str, object],
+            *,
+            background: bool = False,
+        ) -> None:
+            self.assertTrue(background)
+            entered.append(int(message["droplet_id"]))
+            if message["droplet_id"] == 1:
+                await release_first.wait()
+
+        app = object.__new__(CockpitApp)
+        app._dashboard_planning_lock = asyncio.Lock()
+        app.handle_message = handle_message
+        first = asyncio.create_task(
+            app.run_background_dashboard_message(object(), {"droplet_id": 1})
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            app.run_background_dashboard_message(object(), {"droplet_id": 2})
+        )
+        await asyncio.sleep(0)
+
+        self.assertEqual(entered, [1])
+        release_first.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(entered, [1, 2])
+
+    async def test_dashboard_plan_waits_for_background_job_completion(self) -> None:
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        async def safe_tool(
+            tool: str,
+            arguments: dict[str, object] | None = None,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
+            calls.append((tool, arguments or {}))
+            if tool == "plan_move":
+                return {
+                    "ok": True,
+                    "result": {
+                        "structuredContent": {
+                            "ok": True,
+                            "running": True,
+                            "completed": False,
+                            "recommended_wait_seconds": 0.05,
+                        }
+                    },
+                }
+            return {
+                "ok": True,
+                "result": {
+                    "structuredContent": {
+                        "ok": True,
+                        "running": False,
+                        "completed": True,
+                    }
+                },
+            }
+
+        app = object.__new__(CockpitApp)
+        app.safe_tool = safe_tool
+
+        with patch("backend.server.asyncio.sleep", new=fake_sleep):
+            result = await app.plan_dashboard_move("sipp")
+
+        self.assertEqual(calls, [
+            (
+                "plan_move",
+                {
+                    "mode": "sipp",
+                    "remove_duplicate_frames": False,
+                    "planning_timeout": 120.0,
+                    "background": True,
+                },
+            ),
+            ("planning_job_status", {}),
+        ])
+        self.assertTrue(result["result"]["structuredContent"]["completed"])
+
+    async def test_dashboard_plan_rejects_terminal_incomplete_job(self) -> None:
+        responses = [
+            {"ok": True, "running": True, "completed": False, "recommended_wait_seconds": 0.05},
+            {"ok": True, "running": False, "completed": False},
+        ]
+
+        async def safe_tool(
+            _tool: str,
+            _arguments: dict[str, object] | None = None,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
+            return {"ok": True, "result": {"structuredContent": responses.pop(0)}}
+
+        app = object.__new__(CockpitApp)
+        app.safe_tool = safe_tool
+
+        with patch("backend.server.asyncio.sleep", new=fake_sleep):
+            result = await app.plan_dashboard_move("sipp")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["isError"])
+        self.assertIn("before completion", result["error"])
+
+    async def test_dashboard_plan_rejects_completed_job_with_error(self) -> None:
+        async def safe_tool(
+            _tool: str,
+            _arguments: dict[str, object] | None = None,
+            timeout_seconds: float | None = None,
+        ) -> dict[str, object]:
+            return {
+                "ok": True,
+                "result": {
+                    "structuredContent": {
+                        "ok": True,
+                        "running": False,
+                        "completed": True,
+                        "error": "planner failed",
+                    }
+                },
+            }
+
+        app = object.__new__(CockpitApp)
+        app.safe_tool = safe_tool
+
+        result = await app.plan_dashboard_move("sipp")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "planner failed")
+
     async def test_resume_plan_is_not_rewritten_to_breakpoint_execution(self) -> None:
         class FakeMcp:
             def __init__(self) -> None:

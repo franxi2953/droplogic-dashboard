@@ -92,6 +92,7 @@ GOAL_COMPLETE_TOOL = "dashboard_complete_goal"
 DEFAULT_AGENT_FRAME_DELAY_SECONDS = 1.0
 DEFAULT_AGENT_EXECUTION_WAIT_SECONDS = 30.0
 DEFAULT_AGENT_PLANNING_WAIT_SECONDS = 15.0
+DASHBOARD_PLANNING_TIMEOUT_SECONDS = 135.0
 DASHBOARD_USER_TOOL_DEFAULT_TIMEOUT_SECONDS = 45.0
 FRAME_DELAY_AGENT_TOOLS = {"start_plan", "execute_segment_to_breakpoint"}
 MCP_STATEFUL_EXECUTION_TOOLS = {
@@ -163,10 +164,13 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             "max_width": 720,
             "max_height": 460,
         }
+        self._streamer_snapshot_clients: set[Any] = set()
         self.calibration: DashboardCalibrationSession | None = None
         self._poll_task: asyncio.Task | None = None
         self._stream_task: asyncio.Task | None = None
         self._agent_task: asyncio.Task | None = None
+        self._dashboard_tasks: set[asyncio.Task[Any]] = set()
+        self._dashboard_planning_lock = asyncio.Lock()
         self._agent_queue: list[dict[str, Any]] = []
         self._direct_stream_available = False
         self._scene_task: asyncio.Task | None = None
@@ -439,6 +443,23 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             roots.append(("override", override if override.is_absolute() else (COCKPIT_ROOT / override).resolve()))
         roots.append(("default", DROPLOGIC_ROOT / "droplogic" / "mcp" / "context" / "boxmini"))
         return roots
+
+    def resolve_context_file_path(self, relative_path: str) -> Path | None:
+        clean_path = str(relative_path or "").strip().replace("\\", "/")
+        if not clean_path:
+            return None
+        for _, root in self.pinned_context_roots():
+            candidate = (root / clean_path).resolve()
+            try:
+                candidate.relative_to(root.resolve())
+            except ValueError:
+                continue
+            if candidate.is_file():
+                return candidate
+        roots = self.pinned_context_roots()
+        if not roots:
+            return None
+        return (roots[0][1].resolve() / clean_path).resolve()
 
     def load_pinned_context(self) -> tuple[str, dict[str, Any]]:
         sections: list[str] = []
@@ -1273,6 +1294,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     await websocket.send(json.dumps({"type": "event", "event": event}))
         finally:
             self.clients.discard(websocket)
+            self._streamer_snapshot_clients.discard(websocket)
             self._client_send_locks.pop(websocket, None)
 
     async def handle_live_ws(self, websocket: Any) -> None:
@@ -1291,8 +1313,40 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             self.live_clients.discard(websocket)
             self._client_send_locks.pop(websocket, None)
 
-    async def handle_message(self, websocket: Any, message: dict[str, Any]) -> None:
+    async def run_background_dashboard_message(self, websocket: Any, message: dict[str, Any]) -> None:
+        try:
+            async with self._dashboard_planning_lock:
+                await self.handle_message(websocket, message, background=True)
+        except Exception as exc:
+            msg_type = str(message.get("type") or "")
+            result_type = (
+                "matrix_waypoint_plan_result"
+                if msg_type == "matrix_plan_waypoint_paths"
+                else "matrix_selection_plan_result"
+            )
+            await self.record("ui_error", level="error", message=str(exc))
+            await self.safe_send(
+                websocket,
+                {
+                    "type": result_type,
+                    "droplet_id": message.get("droplet_id"),
+                    "result": {"ok": False, "error": str(exc)},
+                }
+            )
+
+    async def handle_message(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+        *,
+        background: bool = False,
+    ) -> None:
         msg_type = message.get("type")
+        if msg_type in {"matrix_plan_waypoint_paths", "matrix_plan_selection_move"} and not background:
+            task = asyncio.create_task(self.run_background_dashboard_message(websocket, message))
+            self._dashboard_tasks.add(task)
+            task.add_done_callback(self._dashboard_tasks.discard)
+            return
         if msg_type == "get_status":
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
@@ -1810,6 +1864,110 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             )
             return
 
+        if msg_type == "calibration_select_mode":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            mode = str(message.get("mode") or "focus")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.set_mode(mode),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_select":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            hole_id = str(message.get("hole_id") or "")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.select_input_hole(hole_id),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_new":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            side = str(message.get("side") or "left")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.create_input_hole(side=side),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_delete":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": self.calibration.delete_selected_input_hole(),
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_update":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            calibration = self.calibration.update_selected_input_hole(
+                hole_id=message.get("hole_id"),
+                side=message.get("side"),
+                role=message.get("role"),
+                notes=message.get("notes"),
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": calibration,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
+        if msg_type == "calibration_hole_capture":
+            if self.calibration is None:
+                raise RuntimeError("No calibration session is active.")
+            await self.guarded_safe_tool("calibration_stage_jog", {"stop_all": True}, via="calibration")
+            fresh_position = compact_tool_payload(await self.safe_tool("calibration_stage_position"))
+            position = (
+                fresh_position.get("position")
+                if isinstance(fresh_position, dict) and fresh_position.get("position")
+                else message.get("position") or {}
+            )
+            calibration = self.calibration.capture_selected_input_hole_endpoint(
+                str(message.get("endpoint") or ""),
+                position,
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "calibration_state",
+                        "calibration": calibration,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            return
+
         if msg_type == "calibration_jog":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
@@ -1875,6 +2033,17 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if msg_type == "calibration_move_to_target":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
+            if self.calibration.mode != "focus":
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "calibration_state",
+                            "calibration": self.calibration.state(error="Move to target is only available in focus calibration mode."),
+                        },
+                        ensure_ascii=True,
+                    )
+                )
+                return
             move = await self.move_calibration_to_current_target(wait_timeout_seconds=20)
             await websocket.send(
                 json.dumps(
@@ -1900,6 +2069,17 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if msg_type == "calibration_record":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
+            if self.calibration.mode != "focus":
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "calibration_state",
+                            "calibration": self.calibration.state(error="Accept step is only available in focus calibration mode."),
+                        },
+                        ensure_ascii=True,
+                    )
+                )
+                return
             await self.guarded_safe_tool("calibration_stage_jog", {"stop_all": True}, via="calibration")
             fresh_position = compact_tool_payload(await self.safe_tool("calibration_stage_position"))
             position = (
@@ -1938,9 +2118,14 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if msg_type == "calibration_save":
             if self.calibration is None:
                 raise RuntimeError("No calibration session is active.")
-            self.calibration.save()
-            apply_result = await self.apply_calibration_to_runtime()
-            await self.record("calibration_saved", config_path=str(self.calibration.config_path))
+            apply_result = None
+            if self.calibration.mode == "injection_holes":
+                self.calibration.save_cartridge()
+                await self.record("calibration_saved", config_path=str(self.calibration.cartridge_path), kind="input_holes")
+            else:
+                self.calibration.save()
+                apply_result = await self.apply_calibration_to_runtime()
+                await self.record("calibration_saved", config_path=str(self.calibration.config_path), kind="focus")
             await websocket.send(
                 json.dumps(
                     {
@@ -1951,6 +2136,9 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     ensure_ascii=True,
                 )
             )
+            if self.mcp.running:
+                self.live = await self.collect_live_snapshot(include_state=True)
+                await self.broadcast_live_json({"type": "live", "live": self.live})
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
@@ -2073,18 +2261,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     )
                     break
 
-                plan_result = mark_failed_mcp_payload(
-                    await self.safe_tool(
-                        "plan_move",
-                        {
-                            "mode": mode,
-                            "remove_duplicate_frames": False,
-                            "planning_timeout": 120.0,
-                            "background": False,
-                            "allow_long_sync": True,
-                        },
-                    )
-                )
+                plan_result = await self.plan_dashboard_move(mode)
                 plan_payload = compact_tool_payload(plan_result)
                 plan_ok = mcp_tool_call_succeeded(plan_result)
                 step.update(
@@ -2114,15 +2291,13 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 waypoint_count=len(waypoints),
                 error=result.get("error"),
             )
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "matrix_waypoint_plan_result",
-                        "droplet_id": droplet_id,
-                        "result": result,
-                    },
-                    ensure_ascii=True,
-                )
+            await self.safe_send(
+                websocket,
+                {
+                    "type": "matrix_waypoint_plan_result",
+                    "droplet_id": droplet_id,
+                    "result": result,
+                }
             )
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
@@ -2182,18 +2357,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     }
                 )
             else:
-                plan_result = mark_failed_mcp_payload(
-                    await self.safe_tool(
-                        "plan_move",
-                        {
-                            "mode": mode,
-                            "remove_duplicate_frames": False,
-                            "planning_timeout": 120.0,
-                            "background": False,
-                            "allow_long_sync": True,
-                        },
-                    )
-                )
+                plan_result = await self.plan_dashboard_move(mode)
                 plan_payload = compact_tool_payload(plan_result)
                 plan_ok = mcp_tool_call_succeeded(plan_result)
                 result["plan_result"] = plan_payload
@@ -2214,14 +2378,12 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 target_count=len(targets),
                 error=result.get("error"),
             )
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "matrix_selection_plan_result",
-                        "result": result,
-                    },
-                    ensure_ascii=True,
-                )
+            await self.safe_send(
+                websocket,
+                {
+                    "type": "matrix_selection_plan_result",
+                    "result": result,
+                }
             )
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
@@ -2272,6 +2434,60 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
 
+        if msg_type == "set_streamer_snapshot_demand":
+            if message.get("enabled"):
+                self._streamer_snapshot_clients.add(websocket)
+            else:
+                self._streamer_snapshot_clients.discard(websocket)
+            return
+
+        if msg_type == "set_streamer_overlay":
+            enabled = bool(message.get("enabled", True))
+            if not self.mcp.running:
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": "streamer_overlay_result",
+                            "result": {"ok": False, "error": "MCP is not running."},
+                        },
+                        ensure_ascii=True,
+                    )
+                )
+                return
+            current = compact_tool_payload(await self.safe_tool("visualizer_status", {}))
+            streamer = {}
+            if isinstance(current, dict):
+                streamer = current.get("streamer") if isinstance(current.get("streamer"), dict) else current
+            source = str(streamer.get("source") or "microscope").strip().lower()
+            coordinates = streamer.get("coordinates")
+            result = compact_tool_payload(
+                await self.guarded_safe_tool(
+                    "set_streamer_source",
+                    {
+                        "source": source,
+                        "electrode_overlay": enabled,
+                        "coordinates": bool(coordinates) if coordinates is not None else None,
+                        "bring_to_front": False,
+                    },
+                    via="dashboard_user",
+                )
+            )
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "streamer_overlay_result",
+                        "result": result,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+            if self.mcp.running:
+                live = await self.collect_live_snapshot(include_state=True)
+                self.live = live
+                await self.broadcast_live_json({"type": "live", "live": live})
+            await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
         if msg_type == "ask_agent":
             requested_run_id = str(message.get("run_id", "")).strip()
             if requested_run_id and requested_run_id != self.recorder.run_id:
@@ -2308,7 +2524,10 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         await self.record("unknown_message", level="warning", message=message)
 
     async def start_calibration_session(self, websocket: Any) -> None:
-        self.calibration = DashboardCalibrationSession()
+        self.calibration = DashboardCalibrationSession(
+            cartridge_path=self.resolve_context_file_path("cartridge.default.json"),
+            context_roots=[root for _, root in self.pinned_context_roots()],
+        )
         self.streamer_frame_options = {"full_resolution": True}
         self.now = "Cartridge calibration"
         await self.mcp.start()
@@ -3347,6 +3566,79 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             started_at=started_at,
             return_reason=return_reason,
         )
+
+    async def plan_dashboard_move(self, mode: str) -> Any:
+        result = mark_failed_mcp_payload(
+            await self.safe_tool(
+                "plan_move",
+                {
+                    "mode": mode,
+                    "remove_duplicate_frames": False,
+                    "planning_timeout": 120.0,
+                    "background": True,
+                },
+            )
+        )
+        payload = compact_tool_payload(result)
+        if not mcp_tool_call_succeeded(result) or not isinstance(payload, dict):
+            return result
+        if payload.get("completed") is True and not payload.get("error"):
+            return result
+        if payload.get("completed") is True:
+            return {
+                "ok": False,
+                "isError": True,
+                "error": str(payload["error"]),
+                "planning_job": payload,
+            }
+        if payload.get("running") is False:
+            return {
+                "ok": False,
+                "isError": True,
+                "error": str(payload.get("error") or "Background planning stopped before completion."),
+                "planning_job": payload,
+            }
+        if payload.get("running") is not True and payload.get("completed") is not False:
+            return result
+
+        deadline = time.monotonic() + DASHBOARD_PLANNING_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            wait_seconds = parse_optional_float(payload.get("recommended_wait_seconds"))
+            wait_seconds = DEFAULT_AGENT_PLANNING_WAIT_SECONDS if wait_seconds is None else wait_seconds
+            await asyncio.sleep(min(max(0.05, wait_seconds), max(0.05, deadline - time.monotonic())))
+            result = mark_failed_mcp_payload(
+                await self.safe_tool(
+                    "planning_job_status",
+                    {},
+                    timeout_seconds=30.0,
+                )
+            )
+            payload = compact_tool_payload(result)
+            if not mcp_tool_call_succeeded(result):
+                return result
+            if isinstance(payload, dict) and payload.get("completed") is True:
+                if payload.get("error"):
+                    return {
+                        "ok": False,
+                        "isError": True,
+                        "error": str(payload["error"]),
+                        "planning_job": payload,
+                    }
+                return result
+            if isinstance(payload, dict) and payload.get("running") is False:
+                return {
+                    "ok": False,
+                    "isError": True,
+                    "error": str(payload.get("error") or "Background planning stopped before completion."),
+                    "planning_job": payload,
+                }
+
+        return {
+            "ok": False,
+            "isError": True,
+            "running": True,
+            "error": "Timed out waiting for background planning to complete.",
+        }
 
     async def call_agent_execution_wait_status(self, call_arguments: dict[str, Any]) -> Any:
         requested_wait = parse_optional_float(call_arguments.get("wait_seconds"))

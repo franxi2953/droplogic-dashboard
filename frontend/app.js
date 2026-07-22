@@ -1,6 +1,7 @@
 const MATRIX_VIEW_STORAGE_KEY = "droplogic.matrixView.v1";
 const MATRIX_SCENE_STORAGE_KEY = "droplogic.matrixScene.v1";
 const STREAMER_VIEW_STORAGE_KEY = "droplogic.streamerView.v1";
+const STREAMER_LEVELS_STORAGE_KEY = "droplogic.streamerLevels.v1";
 const DASHBOARD_LAYOUT_STORAGE_KEY = "droplogic.dashboardLayout.v1";
 const TEMPERATURE_HISTORY_STORAGE_PREFIX = "droplogic.temperatureHistory.v1.";
 const TIMELINE_MIN_VISIBLE_SECONDS = 1;
@@ -15,12 +16,26 @@ const WAKE_RECOGNITION_RESTART_MS = 360;
 const AUDIO_AUTO_VOICE_THRESHOLD = 0.032;
 const LIVE_RENDER_MIN_INTERVAL_MS = 120;
 const TIMELINE_ACTIVE_EXECUTION_AUTO_FOLLOW_GRACE_MS = 1200;
+const WS_HEARTBEAT_INTERVAL_MS = 5000;
+const WS_STALE_TIMEOUT_MS = 15000;
+const LIVE_WS_HEARTBEAT_INTERVAL_MS = 3000;
+const LIVE_WS_STALE_TIMEOUT_MS = 8000;
+const STREAMER_HISTOGRAM_BINS = 256;
+const STREAMER_HISTOGRAM_SAMPLE_EDGE = 256;
+const STREAMER_HISTOGRAM_AUTO_BLACK_PERCENTILE = 0.01;
+const STREAMER_HISTOGRAM_AUTO_WHITE_PERCENTILE = 0.995;
+const STREAMER_HISTOGRAM_THROTTLE_MS = 140;
 
 const state = {
   ws: null,
   liveWs: null,
   liveWsConnected: false,
   liveWsReconnectTimer: null,
+  realtimeWatchdogTimer: null,
+  wsLastMessageAt: 0,
+  wsLastHeartbeatAt: 0,
+  liveWsLastMessageAt: 0,
+  liveWsLastHeartbeatAt: 0,
   events: [],
   eventKeys: new Set(),
   eventWindow: {
@@ -101,7 +116,27 @@ const state = {
     directUrl: "",
     directSrc: "",
     directActive: false,
+    directLoaded: false,
     directFailedAt: 0,
+  },
+  streamerLevels: {
+    panelOpen: false,
+    overlayPending: false,
+    overlayDesired: null,
+    black: 0,
+    white: 255,
+    autoLive: false,
+    histogram: null,
+    histogramPending: false,
+    histogramAt: 0,
+    histogramSourceKey: "",
+    renderQueued: false,
+    liveRaf: null,
+    snapshotDemand: null,
+    snapshotFrame: null,
+    snapshotImage: null,
+    snapshotLoadingKey: "",
+    snapshotSourceKey: "",
   },
   matrixPaths: {
     collapsed: true,
@@ -274,6 +309,14 @@ const state = {
       key: "",
       data: null,
     },
+    markerCache: {
+      key: "",
+      data: null,
+    },
+    temperatureRenderCache: {
+      key: "",
+      data: null,
+    },
     rangeCache: {
       key: "",
       data: null,
@@ -307,6 +350,7 @@ const state = {
       bitmap: null,
     },
     renderQueued: false,
+    wheelRenderTimer: null,
     telemetryRenderTimer: null,
     rangeDrag: {
       active: false,
@@ -407,6 +451,7 @@ const $ = (id) => document.getElementById(id);
 restoreMatrixView();
 restoreMatrixSceneCache();
 restoreStreamerView();
+restoreStreamerLevels();
 restoreDashboardLayout();
 
 function restoreMatrixView() {
@@ -1075,7 +1120,33 @@ function appendEvent(event, options = {}) {
     state.compactingUntil = Date.now() + 2600;
   }
   if (options.liveAgent === true) scheduleTypewriter(event);
+  if (isConversationStreamEvent(event)) {
+    renderConversationStreamUpdate();
+    return;
+  }
   render();
+}
+
+function isConversationStreamEvent(event) {
+  return [
+    "agent_prompt",
+    "agent_steer",
+    "agent_response",
+    "agent_message",
+    "agent_started",
+    "agent_thinking",
+    "agent_finished",
+    "agent_model_response",
+  ].includes(String(event?.type || ""));
+}
+
+function renderConversationStreamUpdate() {
+  state.lastRenderedConversationKey = "";
+  if (state.conversationAtLatest) renderConversation();
+  updateCopyOutputButton();
+  updateThinkingOverlay();
+  renderTokenAnalytics();
+  updateJumpToBottomButton();
 }
 
 function isFrontendTelemetryOnlyEvent(event) {
@@ -1602,7 +1673,7 @@ function renderConversation() {
   if (renderKey === state.lastRenderedConversationKey) return;
   if (!state.forceConversationRender && hasTextSelectionInside(list)) return;
   const shouldFollowLatest = state.conversationAtLatest;
-  const distanceFromBottom = list.scrollHeight - list.scrollTop - list.clientHeight;
+  const readingScrollTop = list.scrollTop;
   state.forceConversationRender = false;
   state.lastRenderedConversationKey = renderKey;
   list.innerHTML = "";
@@ -1658,7 +1729,10 @@ function renderConversation() {
   if (shouldFollowLatest) {
     scrollConversationToLatest(false);
   } else {
-    list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight - distanceFromBottom);
+    // New events belong below the reader's current viewport. Keep the exact
+    // top offset instead of preserving distance from the end, which otherwise
+    // pulls an upward-scrolling reader down as streamed text grows.
+    list.scrollTop = Math.min(readingScrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
   }
   state.conversationAtLatest = isConversationAtLatest();
   updateJumpToBottomButton();
@@ -1859,6 +1933,7 @@ function advanceTypewriter() {
   if (!changed) return;
   state.typewriterVersion += 1;
   state.lastRenderedConversationKey = "";
+  if (!state.conversationAtLatest) return;
   renderConversation();
 }
 
@@ -3121,20 +3196,102 @@ function connectLive() {
     }
     resetLiveFreshnessForReconnect();
     state.liveWsConnected = true;
+    state.liveWsLastMessageAt = Date.now();
+    state.liveWsLastHeartbeatAt = 0;
     ws.send(JSON.stringify({ type: "get_live" }));
   };
   ws.onclose = () => {
     if (state.liveWs === ws) {
       state.liveWsConnected = false;
       state.liveWs = null;
+      state.liveWsLastMessageAt = 0;
+      state.liveWsLastHeartbeatAt = 0;
     }
     if (state.liveWsReconnectTimer) window.clearTimeout(state.liveWsReconnectTimer);
     state.liveWsReconnectTimer = window.setTimeout(connectLive, 1000);
   };
   ws.onmessage = (message) => {
+    state.liveWsLastMessageAt = Date.now();
     const data = JSON.parse(message.data);
     handleRealtimeMessage(data);
   };
+}
+
+function closeStaleSocket(socket, code, reason) {
+  if (!socket) return;
+  try {
+    socket.close(code, reason);
+  } catch {
+    try {
+      socket.close();
+    } catch {}
+  }
+}
+
+function restoreStreamerLevels() {
+  try {
+    const raw = window.localStorage?.getItem(STREAMER_LEVELS_STORAGE_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    if (!saved || typeof saved !== "object") return;
+    const black = Number(saved.black);
+    const white = Number(saved.white);
+    if (Number.isFinite(black)) state.streamerLevels.black = clamp(black, 0, 254);
+    if (Number.isFinite(white)) state.streamerLevels.white = clamp(white, 1, 255);
+    if (typeof saved.autoLive === "boolean") state.streamerLevels.autoLive = saved.autoLive;
+    if (typeof saved.panelOpen === "boolean") state.streamerLevels.panelOpen = saved.panelOpen;
+    if (typeof saved.overlayDesired === "boolean") state.streamerLevels.overlayDesired = saved.overlayDesired;
+  } catch {
+    // Best-effort persistence only.
+  }
+}
+
+function saveStreamerLevels() {
+  try {
+    window.localStorage?.setItem(
+      STREAMER_LEVELS_STORAGE_KEY,
+      JSON.stringify({
+        black: state.streamerLevels.black,
+        white: state.streamerLevels.white,
+        autoLive: state.streamerLevels.autoLive,
+        panelOpen: state.streamerLevels.panelOpen,
+        overlayDesired: state.streamerLevels.overlayDesired,
+      }),
+    );
+  } catch {
+    // Best-effort persistence only.
+  }
+}
+
+function ensureRealtimeWatchdogs() {
+  if (state.realtimeWatchdogTimer) return;
+  state.realtimeWatchdogTimer = window.setInterval(() => {
+    const now = Date.now();
+
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      if (now - state.wsLastHeartbeatAt >= WS_HEARTBEAT_INTERVAL_MS) {
+        state.wsLastHeartbeatAt = now;
+        try {
+          send({ type: "get_status" });
+        } catch {}
+      }
+      if (state.wsLastMessageAt && now - state.wsLastMessageAt >= WS_STALE_TIMEOUT_MS) {
+        closeStaleSocket(state.ws, 4000, "dashboard main websocket stale");
+      }
+    }
+
+    if (state.liveWs?.readyState === WebSocket.OPEN) {
+      if (now - state.liveWsLastHeartbeatAt >= LIVE_WS_HEARTBEAT_INTERVAL_MS) {
+        state.liveWsLastHeartbeatAt = now;
+        try {
+          state.liveWs.send(JSON.stringify({ type: "get_live" }));
+        } catch {}
+      }
+      if (state.liveWsLastMessageAt && now - state.liveWsLastMessageAt >= LIVE_WS_STALE_TIMEOUT_MS) {
+        closeStaleSocket(state.liveWs, 4001, "dashboard live websocket stale");
+      }
+    }
+  }, 1000);
 }
 
 function connect() {
@@ -3142,19 +3299,27 @@ function connect() {
   const wsPort = Number(location.port || (location.protocol === "https:" ? 443 : 80)) + 1;
   state.ws = new WebSocket(`${proto}://${location.hostname}:${wsPort}/ws`);
   state.ws.onopen = () => {
+    state.wsLastMessageAt = Date.now();
+    state.wsLastHeartbeatAt = 0;
     appendEvent({ ts: new Date().toISOString(), type: "ui_connected" });
     send({ type: "get_status" });
+    state.streamerLevels.snapshotDemand = null;
+    syncStreamerSnapshotDemand(true);
     state.streamerView.lastRequestKey = "";
     requestStreamerResolutionUpdate();
     connectLive();
+    ensureRealtimeWatchdogs();
   };
   state.ws.onclose = () => {
+    state.wsLastMessageAt = 0;
+    state.wsLastHeartbeatAt = 0;
     state.audio.transcribing = false;
     updateAudioUi();
     appendEvent({ ts: new Date().toISOString(), type: "ui_disconnected", level: "warning" });
     setTimeout(connect, 1000);
   };
   state.ws.onmessage = (message) => {
+    state.wsLastMessageAt = Date.now();
     const data = JSON.parse(message.data);
     if (data.type === "status") {
       state.status = data.status;
@@ -3363,6 +3528,19 @@ function connect() {
       if ((data.result?.error || data.event?.ok === false) && typeof clearPendingMetricEdit === "function") {
         clearPendingMetricEdit();
       }
+    } else if (data.type === "streamer_overlay_result") {
+      if (data.result?.ok === false || data.result?.error) {
+        state.streamerLevels.overlayPending = false;
+        state.streamerLevels.overlayDesired = streamerOverlayEnabled(state.live);
+        saveStreamerLevels();
+        appendEvent({
+          ts: new Date().toISOString(),
+          type: "ui_error",
+          level: "warning",
+          message: data.result?.error || "Could not update streamer overlay",
+        });
+      }
+      updateStreamerOverlayControl(state.live);
     } else if (data.type === "artifact_reveal_result") {
       handleArtifactRevealResult(data.result);
     } else if (data.type === "visualizer_download") {
@@ -3443,31 +3621,41 @@ window.addEventListener("DOMContentLoaded", () => {
   const streamerFrame = $("streamerFrame");
   const streamerViewer = streamerFrame?.closest(".viewer.streamer");
   streamerFrame?.addEventListener("load", () => {
+    if (state.streamerView.directActive) state.streamerView.directLoaded = true;
     applyStreamerView();
     requestStreamerResolutionUpdate();
+    if (streamerLevelsHasAdjustment()) renderStreamerProcessedFrame();
+    if (state.streamerLevels.panelOpen) queueStreamerHistogramRefresh(true);
+    ensureStreamerLevelsLiveLoop();
     updateCalibrationOverlayGeometry();
   });
   streamerFrame?.addEventListener("error", () => {
     if (!state.streamerView.directActive) return;
     state.streamerView.directFailedAt = Date.now();
     state.streamerView.directActive = false;
+    state.streamerView.directLoaded = false;
     state.streamerView.directSrc = "";
-    renderFrame("streamer", state.live?.frames?.streamer);
+    ensureStreamerLevelsLiveLoop();
+    renderFrame("streamer", state.streamerLevels.snapshotFrame || state.live?.frames?.streamer);
   });
   if (streamerViewer) {
     streamerViewer.addEventListener("wheel", (event) => {
+      if (event.target.closest(".streamer-levels-panel")) return;
       event.preventDefault();
       zoomStreamerFrame(event);
     }, { passive: false });
     streamerViewer.addEventListener("auxclick", (event) => {
       if (event.button === 1) event.preventDefault();
     });
-    streamerViewer.addEventListener("dblclick", () => {
+    streamerViewer.addEventListener("dblclick", (event) => {
+      if (event.target?.closest(".streamer-levels-panel")) return;
       resetStreamerView();
       applyStreamerView();
       requestStreamerResolutionUpdate();
     });
     streamerViewer.addEventListener("pointerdown", (event) => {
+      // The levels panel sits inside the viewer, but its controls must never initiate image panning.
+      if (event.target.closest(".streamer-levels-panel")) return;
       if (event.button !== 0 && event.button !== 1) return;
       event.preventDefault();
       streamerViewer.setPointerCapture?.(event.pointerId);
@@ -3716,9 +3904,9 @@ window.addEventListener("DOMContentLoaded", () => {
         const rect = planTimeline.getBoundingClientRect();
         const layout = timelineLayout(rect.width || planTimeline.clientWidth || 1, rect.height || planTimeline.clientHeight || 1, count, scene);
         const delta = (event.deltaX || event.deltaY) / Math.max(24, layout.trackWidth || planTimeline.clientWidth || 1);
-        panTimelineTime(delta * layout.visibleTimeRange.duration);
+        panTimelineTime(delta * layout.visibleTimeRange.duration, { deferRender: true });
       } else {
-        zoomTimelineAtEvent(event);
+        zoomTimelineAtEvent(event, { deferRender: true });
       }
     }, { passive: false });
     planTimeline.addEventListener("pointerdown", (event) => {
@@ -3798,14 +3986,65 @@ window.addEventListener("DOMContentLoaded", () => {
   $("startMcp").onclick = () => send({ type: "start_mcp" });
   $("stopMcp").onclick = () => send({ type: "stop_mcp" });
   $("statusBtn").onclick = () => send({ type: "mcp_tool", tool: "runtime_status", arguments: {} });
+  $("streamerOverlayToggle").onchange = (event) => setStreamerOverlay(event.target.checked);
+  $("streamerLevelsToggle").onclick = () => setStreamerLevelsPanelOpen(!state.streamerLevels.panelOpen);
+  $("streamerLevelsClose").onclick = () => setStreamerLevelsPanelOpen(false);
+  $("streamerLevelsAutoOnce").onclick = () => {
+    state.streamerLevels.autoLive = false;
+    updateStreamerLevelsUi();
+    saveStreamerLevels();
+    fitStreamerLevelsToHistogram(true);
+  };
+  $("streamerLevelsAutoLive").onclick = () => {
+    state.streamerLevels.autoLive = !state.streamerLevels.autoLive;
+    updateStreamerLevelsUi();
+    saveStreamerLevels();
+    if (state.streamerLevels.autoLive) fitStreamerLevelsToHistogram(true);
+    ensureStreamerLevelsLiveLoop();
+  };
+  $("streamerLevelsReset").onclick = () => resetStreamerLevels();
+  $("streamerBlackLevel").oninput = (event) => {
+    state.streamerLevels.autoLive = false;
+    state.streamerLevels.black = Number(event.target?.value || 0);
+    clampStreamerLevels();
+    updateStreamerLevelsUi();
+    saveStreamerLevels();
+    renderStreamerProcessedFrame();
+    queueStreamerHistogramRefresh();
+    ensureStreamerLevelsLiveLoop();
+  };
+  $("streamerWhiteLevel").oninput = (event) => {
+    state.streamerLevels.autoLive = false;
+    state.streamerLevels.white = Number(event.target?.value || 255);
+    clampStreamerLevels();
+    updateStreamerLevelsUi();
+    saveStreamerLevels();
+    renderStreamerProcessedFrame();
+    queueStreamerHistogramRefresh();
+    ensureStreamerLevelsLiveLoop();
+  };
   $("cartridgeCalibration").onclick = () => openCalibrationOverlay();
   $("calibrationClose").onclick = () => closeCalibrationOverlay();
+  $("calibrationModeFocus").onclick = () => selectCalibrationMode("focus");
+  $("calibrationModeHoles").onclick = () => selectCalibrationMode("injection_holes");
   $("calibrationAccept").onclick = () => acceptCalibrationStep();
   $("calibrationSave").onclick = () => send({ type: "calibration_save" });
+  $("calibrationHoleSave").onclick = () => send({ type: "calibration_save" });
   $("calibrationMoveTarget").onclick = () => {
     stopAllCalibrationJogs();
     send({ type: "calibration_move_to_target" });
   };
+  $("calibrationHoleSelect").onchange = (event) => {
+    send({ type: "calibration_hole_select", hole_id: event.target?.value || "" });
+  };
+  $("calibrationHoleNew").onclick = () => send({ type: "calibration_hole_new", side: $("calibrationHoleSide")?.value || "left" });
+  $("calibrationHoleDelete").onclick = () => send({ type: "calibration_hole_delete" });
+  $("calibrationHoleCaptureStart").onclick = () => captureCalibrationHoleEndpoint("start");
+  $("calibrationHoleCaptureEnd").onclick = () => captureCalibrationHoleEndpoint("end");
+  $("calibrationHoleId").onchange = () => saveCalibrationHoleFields();
+  $("calibrationHoleSide").onchange = () => saveCalibrationHoleFields();
+  $("calibrationHoleRole").onchange = () => saveCalibrationHoleFields();
+  $("calibrationHoleNotes").onchange = () => saveCalibrationHoleFields();
   for (const button of document.querySelectorAll("[data-calibration-speed]")) {
     button.addEventListener("click", () => {
       setCalibrationSpeed(String(button.getAttribute("data-calibration-speed") || "2"));
@@ -3929,7 +4168,11 @@ window.addEventListener("DOMContentLoaded", () => {
   $("wakeInput").onclick = () => toggleWakeListening();
   $("jumpToBottom").onclick = () => jumpConversationToLatest();
   $("conversation").addEventListener("scroll", () => {
+    const wasAtLatest = state.conversationAtLatest;
     state.conversationAtLatest = isConversationAtLatest();
+    if (state.conversationAtLatest && !wasAtLatest && state.lastRenderedConversationKey === "") {
+      renderConversation();
+    }
     updateJumpToBottomButton();
   });
   $("filtersToggle").onclick = () => toggleFilters();
@@ -3977,6 +4220,9 @@ window.addEventListener("DOMContentLoaded", () => {
     stopTypewriterAnimation();
     render();
   };
+  updateStreamerLevelsUi();
+  updateStreamerOverlayControl(state.live);
+  renderStreamerHistogram(null);
   if (state.matrixSceneCache) renderLiveOnly();
   connect();
   renderFilters();
@@ -5153,11 +5399,14 @@ function renderLive() {
     renderCalibrationFrame(live.frames?.streamer);
   }
   updateTemperatureHistory(live);
+  updateStreamerOverlayControl(live);
   if (isStatePanelVisible()) {
     renderStateGrid(live);
     renderTemperatureChart();
     compactStatePanel();
   }
+  ensureStreamerLevelsLiveLoop();
+  if (state.streamerLevels.panelOpen) queueStreamerHistogramRefresh();
   schedulePlanTimelineRender();
 }
 
@@ -5184,9 +5433,12 @@ function applyLiveFrame(data) {
   const visualizer = String(data?.visualizer || "").trim();
   const frame = data?.frame;
   if (!visualizer || !frame) return;
-  if (visualizer === "streamer" && state.streamerView.directActive) return;
   if (!frameIsFreshForVisualizer(visualizer, frame, data.updated_at)) return;
   rememberFrameFreshness(visualizer, frame, data.updated_at);
+  if (visualizer === "streamer" && state.streamerView.directActive) {
+    cacheStreamerSnapshotFrame(frame);
+    return;
+  }
   const live = state.live && typeof state.live === "object" ? { ...state.live } : {};
   live.frames = { ...(live.frames || {}), [visualizer]: frame };
   live.updated_at = data.updated_at || live.updated_at || new Date().toISOString();
@@ -5195,6 +5447,11 @@ function applyLiveFrame(data) {
   setText("liveStateAdvanced", live.updated_at || state.status?.live?.updated_at || "-");
   renderFrame(visualizer, frame);
   if (visualizer === "streamer") renderCalibrationFrame(frame);
+  if (visualizer === "streamer") {
+    updateStreamerOverlayControl(live);
+    ensureStreamerLevelsLiveLoop();
+    if (state.streamerLevels.panelOpen) queueStreamerHistogramRefresh();
+  }
 }
 
 function applyLiveScene(data) {
@@ -5223,6 +5480,7 @@ function configureDirectStreamer(live) {
     view.directUrl = "";
     view.directSrc = "";
     view.directActive = false;
+    view.directLoaded = false;
     return false;
   }
   if (Date.now() - Number(view.directFailedAt || 0) < 4000) return false;
@@ -5254,6 +5512,7 @@ function refreshDirectStreamerSrc() {
   const url = directStreamerUrlWithOptions(view.directUrl, resolution);
   if (url !== view.directSrc) {
     view.directSrc = url;
+    view.directLoaded = false;
     img.src = url;
     const calibrationImg = $("calibrationStreamerFrame");
     if (calibrationImg) {
@@ -5269,6 +5528,8 @@ function refreshDirectStreamerSrc() {
     meta.textContent = streamerMetaText(meta.dataset.baseText);
   }
   applyStreamerView();
+  ensureStreamerLevelsLiveLoop();
+  if (state.streamerLevels.panelOpen) queueStreamerHistogramRefresh(true);
   return true;
 }
 
@@ -5277,7 +5538,7 @@ function directStreamerUrlWithOptions(baseUrl, resolution) {
   const fullResolution = Boolean(options.full_resolution);
   try {
     const url = new URL(baseUrl, window.location.href);
-    url.searchParams.set("source", "processed");
+    url.searchParams.set("source", "latest");
     url.searchParams.set("fresh", "true");
     url.searchParams.set("fps", "24");
     url.searchParams.set("quality", fullResolution ? "92" : "84");
@@ -5291,7 +5552,7 @@ function directStreamerUrlWithOptions(baseUrl, resolution) {
     return url.toString();
   } catch {
     const separator = String(baseUrl).includes("?") ? "&" : "?";
-    const params = [`source=processed`, `fresh=true`, `fps=24`, `quality=${fullResolution ? 92 : 84}`];
+    const params = [`source=latest`, `fresh=true`, `fps=24`, `quality=${fullResolution ? 92 : 84}`];
     if (!fullResolution) {
       params.push(`max_width=${options.max_width}`, `max_height=${options.max_height}`);
     }
@@ -7139,6 +7400,7 @@ function timelineSemanticTimes(scene = null, timeline = null, range = null) {
   if (state.timeline.semanticTimesCache.key === cacheKey && state.timeline.semanticTimesCache.data) {
     return state.timeline.semanticTimesCache.data;
   }
+  const markers = timelineStaticOverlayData(scene, timeline);
   const times = [];
   const push = (value) => {
     const number = Number(value);
@@ -7152,15 +7414,15 @@ function timelineSemanticTimes(scene = null, timeline = null, range = null) {
     const markerTime = timelineToolExecutionStartTime(event) ?? eventTimeSeconds(event);
     if (activePlanEvents.has(event) && timelineToolIsPlanOrExecution(String(event?.tool || "").toLowerCase())) push(markerTime);
   }
-  for (const marker of timelineStageMarkers(scene)) push(marker.time);
-  for (const marker of timelinePhotoMarkers(scene)) push(marker.time);
-  for (const marker of timelineTargetTemperatureMarkers(scene)) push(marker.time);
+  for (const marker of markers.stage) push(marker.time);
+  for (const marker of markers.photos) push(marker.time);
+  for (const marker of markers.targetTemperature) push(marker.time);
   const telemetryTail = timelineTelemetryTailRange(scene);
   if (telemetryTail) {
     push(telemetryTail.start);
     push(telemetryTail.end);
   }
-  for (const marker of timelineStopMarkers(scene, timeline)) {
+  for (const marker of markers.timelineStops) {
     push(marker.startTime);
     push(marker.endTime);
   }
@@ -7268,7 +7530,7 @@ function panTimelineFrames(deltaFrames) {
   panTimelineTime(deltaFrames * delay);
 }
 
-function panTimelineTime(deltaSeconds) {
+function panTimelineTime(deltaSeconds, options = {}) {
   const scene = state.live?.scene?.result || state.live?.scene;
   const count = timelineFrameCount(scene);
   if (!count) return;
@@ -7279,10 +7541,11 @@ function panTimelineTime(deltaSeconds) {
   const visible = timelineVisibleTimeRange(range);
   const maxOffset = Math.max(0, range.duration - visible.duration);
   state.timeline.timeOffset = clamp((Number(state.timeline.timeOffset) || 0) + Number(deltaSeconds || 0), 0, maxOffset);
-  schedulePlanTimelineRender();
+  if (options.deferRender) queueTimelineWheelRender();
+  else schedulePlanTimelineRender();
 }
 
-function zoomTimelineAtEvent(event) {
+function zoomTimelineAtEvent(event, options = {}) {
   const canvas = $("planTimeline");
   const scene = state.live?.scene?.result || state.live?.scene;
   const count = timelineFrameCount(scene);
@@ -7304,7 +7567,16 @@ function zoomTimelineAtEvent(event) {
   const cursorRatio = clamp((event.clientX - rect.left - oldLayout.left) / oldLayout.trackWidth, 0, 1);
   const maxOffset = Math.max(0, range.duration - visibleDuration);
   state.timeline.timeOffset = clamp(cursorTime - range.start - cursorRatio * visibleDuration, 0, maxOffset);
-  schedulePlanTimelineRender();
+  if (options.deferRender) queueTimelineWheelRender();
+  else schedulePlanTimelineRender();
+}
+
+function queueTimelineWheelRender() {
+  if (state.timeline.wheelRenderTimer !== null) return;
+  state.timeline.wheelRenderTimer = window.setTimeout(() => {
+    state.timeline.wheelRenderTimer = null;
+    schedulePlanTimelineRender();
+  }, 40);
 }
 
 function zoomTimelineButton(factor) {
@@ -7876,17 +8148,29 @@ function timelineOverlayData(scene, timeline, count) {
   if (state.timeline.overlayCache.key === key && state.timeline.overlayCache.data) {
     return state.timeline.overlayCache.data;
   }
-  const range = timelineOverlayTimeRange(scene);
-  const samples = timelineMeasuredTemperatureSamples(scene);
+  const markers = timelineStaticOverlayData(scene, timeline);
+  const range = timelineOverlayTimeRange(scene, markers);
   const data = {
     timeRange: range,
-    temperatureSamples: samples,
+    ...markers,
+  };
+  state.timeline.overlayCache = { key, data };
+  return data;
+}
+
+function timelineStaticOverlayData(scene = null, timeline = null) {
+  const key = timelineDataCacheKey(scene);
+  if (state.timeline.markerCache.key === key && state.timeline.markerCache.data) {
+    return state.timeline.markerCache.data;
+  }
+  const data = {
+    temperatureSamples: timelineMeasuredTemperatureSamples(scene),
     targetTemperature: timelineTargetTemperatureMarkers(scene),
     stage: timelineStageMarkers(scene),
     photos: timelinePhotoMarkers(scene),
     timelineStops: timelineStopMarkers(scene, timeline),
   };
-  state.timeline.overlayCache = { key, data };
+  state.timeline.markerCache = { key, data };
   return data;
 }
 
@@ -7935,13 +8219,14 @@ function timelineDataCacheKey(scene = null) {
   ].join("|");
 }
 
-function timelineOverlayTimeRange(scene = null) {
+function timelineOverlayTimeRange(scene = null, markerData = null) {
   const key = timelineDataCacheKey(scene);
   if (state.timeline.rangeCache.key === key && state.timeline.rangeCache.data) {
     return state.timeline.rangeCache.data;
   }
   const times = [];
-  for (const stop of timelineStopMarkers(scene)) {
+  const markers = markerData || timelineStaticOverlayData(scene, effectiveTimeline(scene));
+  for (const stop of markers.timelineStops) {
     if (Number.isFinite(Number(stop.startTime))) times.push(Number(stop.startTime));
     if (!stop.active && Number.isFinite(Number(stop.endTime))) times.push(Number(stop.endTime));
   }
@@ -7966,7 +8251,7 @@ function timelineOverlayTimeRange(scene = null) {
     const t = eventTime;
     if (Number.isFinite(t)) times.push(t);
   }
-  for (const marker of timelineTargetTemperatureMarkers(scene)) {
+  for (const marker of markers.targetTemperature) {
     if (Number.isFinite(Number(marker.time)) && !timelineTimeIsStopped(marker.time, scene)) {
       times.push(Number(marker.time));
     }
@@ -8525,8 +8810,9 @@ function drawTimelineTemperatureLines(ctx, layout, overlays, hitboxes) {
   const targetEnabled = timelineOverlayEnabled("targetTemperature");
   if (!measuredEnabled && !targetEnabled) return;
   const timeRange = layout.visibleTimeRange || overlays.timeRange;
-  const measured = measuredEnabled ? visibleTimelineTemperatureValues(overlays.temperatureSamples, timeRange, layout) : [];
-  const measuredForRender = measuredEnabled ? simplifyTimelineTemperatureSamplesForRender(measured, layout) : [];
+  const measuredForRender = measuredEnabled
+    ? timelineTemperatureSamplesForRender(overlays.temperatureSamples, timeRange, layout)
+    : [];
   const targets = targetEnabled ? (overlays.targetTemperature || []).filter((marker) => Number.isFinite(Number(marker.value))) : [];
   const visibleTargets = visibleTimelineTimeValues(targets, timeRange);
   const targetValues = targetEnabled ? timelineTargetValuesForRange(targets, timeRange) : [];
@@ -8558,15 +8844,54 @@ function drawTimelineTemperatureLines(ctx, layout, overlays, hitboxes) {
 }
 
 function visibleTimelineTimeValues(items, range) {
-  return (items || [])
-    .filter((item) => Number.isFinite(Number(item.time)) && Number.isFinite(Number(item.value)))
-    .filter((item) => !range?.duration || (item.time >= range.start && item.time <= range.end))
-    .sort((a, b) => Number(a.time) - Number(b.time));
+  const values = items || [];
+  if (!values.length) return [];
+  const start = range?.duration ? timelineTimeLowerBound(values, range.start) : 0;
+  const end = range?.duration ? timelineTimeUpperBound(values, range.end) : values.length;
+  return values.slice(start, end).filter((item) => (
+    Number.isFinite(Number(item.time)) && Number.isFinite(Number(item.value))
+  ));
 }
 
 function visibleTimelineTemperatureValues(items, range, layout) {
-  return visibleTimelineTimeValues(items, range)
-    .filter((item) => !timelineTimeInsideIdleGap(layout, item.time));
+  const values = visibleTimelineTimeValues(items, range);
+  const idleGaps = (layout?.timeWarp?.segments || []).filter((segment) => segment?.idle);
+  if (!idleGaps.length) return values;
+  const visible = [];
+  let gapIndex = 0;
+  for (const item of values) {
+    const time = Number(item.time);
+    while (gapIndex < idleGaps.length && time >= Number(idleGaps[gapIndex].realEnd)) {
+      gapIndex += 1;
+    }
+    const gap = idleGaps[gapIndex];
+    if (!gap || time <= Number(gap.realStart) || time >= Number(gap.realEnd)) visible.push(item);
+  }
+  return visible;
+}
+
+function timelineTimeLowerBound(items, value) {
+  let low = 0;
+  let high = items.length;
+  const target = Number(value);
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(items[middle]?.time) < target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function timelineTimeUpperBound(items, value) {
+  let low = 0;
+  let high = items.length;
+  const target = Number(value);
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Number(items[middle]?.time) <= target) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 function timelineTimeInsideIdleGap(layout, time) {
@@ -8593,9 +8918,7 @@ function timelineTimesCrossIdleGap(layout, start, end) {
 }
 
 function simplifyTimelineTemperatureSamplesForRender(samples, layout) {
-  const sorted = (samples || [])
-    .filter((sample) => Number.isFinite(Number(sample.time)) && Number.isFinite(Number(sample.value)))
-    .sort((a, b) => Number(a.time) - Number(b.time));
+  const sorted = samples || [];
   const maxPoints = Math.max(80, Math.min(
     TIMELINE_TEMPERATURE_RENDER_MAX_POINTS,
     Math.floor(Math.max(1, Number(layout?.trackWidth) || 1) / 3),
@@ -8605,19 +8928,22 @@ function simplifyTimelineTemperatureSamplesForRender(samples, layout) {
   const start = Number(sorted[0].time);
   const end = Number(sorted[sorted.length - 1].time);
   const duration = Math.max(0.001, end - start);
-  const buckets = Array.from({ length: bucketCount }, () => []);
+  const buckets = Array.from({ length: bucketCount }, () => null);
   for (const sample of sorted) {
     const index = clamp(Math.floor(((Number(sample.time) - start) / duration) * bucketCount), 0, bucketCount - 1);
-    buckets[index].push(sample);
+    const bucket = buckets[index];
+    if (!bucket) {
+      buckets[index] = { first: sample, min: sample, max: sample, last: sample };
+      continue;
+    }
+    bucket.last = sample;
+    if (Number(sample.value) < Number(bucket.min.value)) bucket.min = sample;
+    if (Number(sample.value) > Number(bucket.max.value)) bucket.max = sample;
   }
   const simplified = [];
   for (const bucket of buckets) {
-    if (!bucket.length) continue;
-    const first = bucket[0];
-    const min = bucket.reduce((best, item) => Number(item.value) < Number(best.value) ? item : best, first);
-    const max = bucket.reduce((best, item) => Number(item.value) > Number(best.value) ? item : best, first);
-    const last = bucket[bucket.length - 1];
-    for (const item of [first, min, max, last].sort((a, b) => Number(a.time) - Number(b.time))) {
+    if (!bucket) continue;
+    for (const item of [bucket.first, bucket.min, bucket.max, bucket.last].sort((a, b) => Number(a.time) - Number(b.time))) {
       const previous = simplified[simplified.length - 1];
       if (
         previous
@@ -8630,6 +8956,23 @@ function simplifyTimelineTemperatureSamplesForRender(samples, layout) {
     }
   }
   return simplified;
+}
+
+function timelineTemperatureSamplesForRender(samples, range, layout) {
+  const cacheKey = [
+    state.timeline.overlayCache.key,
+    Number(range?.start || 0).toFixed(3),
+    Number(range?.end || 0).toFixed(3),
+    Math.round(Number(layout?.trackWidth) || 0),
+    layout?.timeWarp?.key || "",
+  ].join("|");
+  if (state.timeline.temperatureRenderCache.key === cacheKey) {
+    return state.timeline.temperatureRenderCache.data || [];
+  }
+  const visible = visibleTimelineTemperatureValues(samples, range, layout);
+  const data = simplifyTimelineTemperatureSamplesForRender(visible, layout);
+  state.timeline.temperatureRenderCache = { key: cacheKey, data };
+  return data;
 }
 
 function timelineTargetValuesForRange(markers, range) {
@@ -10297,7 +10640,8 @@ function markTimelineManualPreview(scene = state.live?.scene?.result || state.li
 }
 
 function maybeAutoFollowActiveExecution(scene) {
-  if (!scene?.available || state.timeline.followLive || !timelineActiveExecution(scene)) return;
+  if (!scene?.available || !timelineActiveExecution(scene)) return;
+  if (!state.timeline.followLive) return;
   if (state.timeline.dragging || state.timeline.rangeDrag?.active) return;
   const key = timelineExecutionKey(scene);
   const userPreviewedThisExecution = state.timeline.manualPreviewExecutionKey === key;
@@ -10495,15 +10839,433 @@ function applyStreamerView() {
   clampStreamerView();
   const view = state.streamerView;
   const bounds = streamerImageBounds(img);
-  img.style.left = `${bounds.x}px`;
-  img.style.top = `${bounds.y}px`;
-  img.style.width = `${bounds.width}px`;
-  img.style.height = `${bounds.height}px`;
-  img.style.transform = `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`;
+  const transform = `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`;
+  for (const node of [img, $("streamerCanvas")]) {
+    if (!node) continue;
+    node.style.left = `${bounds.x}px`;
+    node.style.top = `${bounds.y}px`;
+    node.style.width = `${bounds.width}px`;
+    node.style.height = `${bounds.height}px`;
+    node.style.transform = transform;
+  }
   img.classList.toggle("zoomed", view.zoom > 1.01);
   img.closest(".viewer")?.classList.toggle("streamer-zoomed", view.zoom > 1.01);
   const meta = $("streamerMeta");
   if (meta?.dataset.baseText) meta.textContent = streamerMetaText(meta.dataset.baseText);
+  updateStreamerLevelsDisplayMode();
+}
+
+function streamerLevelsHasAdjustment() {
+  const levels = state.streamerLevels;
+  return Number(levels.black) > 0 || Number(levels.white) < 255;
+}
+
+function updateStreamerLevelsUi() {
+  const black = $("streamerBlackLevel");
+  const white = $("streamerWhiteLevel");
+  const blackValue = $("streamerBlackValue");
+  const whiteValue = $("streamerWhiteValue");
+  const autoLive = $("streamerLevelsAutoLive");
+  const toggle = $("streamerLevelsToggle");
+  const panel = $("streamerLevelsPanel");
+  if (black) black.value = String(Math.round(state.streamerLevels.black));
+  if (white) white.value = String(Math.round(state.streamerLevels.white));
+  if (blackValue) blackValue.value = String(Math.round(state.streamerLevels.black));
+  if (blackValue) blackValue.textContent = String(Math.round(state.streamerLevels.black));
+  if (whiteValue) whiteValue.value = String(Math.round(state.streamerLevels.white));
+  if (whiteValue) whiteValue.textContent = String(Math.round(state.streamerLevels.white));
+  if (autoLive) {
+    autoLive.classList.toggle("active", Boolean(state.streamerLevels.autoLive));
+    autoLive.setAttribute("aria-pressed", String(Boolean(state.streamerLevels.autoLive)));
+  }
+  if (toggle) {
+    toggle.classList.toggle("active", Boolean(state.streamerLevels.panelOpen));
+    toggle.setAttribute("aria-expanded", String(Boolean(state.streamerLevels.panelOpen)));
+  }
+  if (panel) panel.hidden = !state.streamerLevels.panelOpen;
+}
+
+function clampStreamerLevels() {
+  const levels = state.streamerLevels;
+  levels.black = clamp(Number(levels.black) || 0, 0, 254);
+  levels.white = clamp(Number(levels.white) || 255, 1, 255);
+  if (levels.white <= levels.black) {
+    if (levels.black >= 254) levels.black = 254;
+    levels.white = Math.min(255, levels.black + 1);
+  }
+}
+
+function setStreamerLevelsPanelOpen(open) {
+  state.streamerLevels.panelOpen = Boolean(open);
+  updateStreamerLevelsUi();
+  saveStreamerLevels();
+  if (state.streamerLevels.panelOpen) {
+    queueStreamerHistogramRefresh(true);
+  }
+  updateStreamerLevelsDisplayMode();
+  ensureStreamerLevelsLiveLoop();
+}
+
+function resetStreamerLevels() {
+  state.streamerLevels.black = 0;
+  state.streamerLevels.white = 255;
+  state.streamerLevels.autoLive = false;
+  updateStreamerLevelsUi();
+  saveStreamerLevels();
+  updateStreamerLevelsDisplayMode();
+  queueStreamerHistogramRefresh(true);
+}
+
+function streamerSnapshotDemanded() {
+  return Boolean(
+    state.streamerView.directActive
+    && (state.streamerLevels.panelOpen || state.streamerLevels.autoLive || streamerLevelsHasAdjustment())
+  );
+}
+
+function syncStreamerSnapshotDemand(force = false) {
+  const enabled = streamerSnapshotDemanded();
+  if (!force && state.streamerLevels.snapshotDemand === enabled) return;
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  state.streamerLevels.snapshotDemand = enabled;
+  send({ type: "set_streamer_snapshot_demand", enabled });
+}
+
+function cacheStreamerSnapshotFrame(frame) {
+  const payload = frame?.result || frame;
+  const base64 = payload?.base64;
+  const mimeType = payload?.mime_type;
+  if (!base64 || !mimeType) return false;
+  state.streamerLevels.snapshotFrame = frame;
+  const key = String(
+    payload?.dashboard_live_sequence
+    || payload?.dashboard_live?.sequence
+    || `${base64.length}:${base64.slice(-32)}`
+  );
+  if (state.streamerLevels.snapshotLoadingKey || key === state.streamerLevels.snapshotSourceKey) return false;
+  const img = state.streamerLevels.snapshotImage || new Image();
+  state.streamerLevels.snapshotImage = img;
+  state.streamerLevels.snapshotLoadingKey = key;
+  img.onload = () => {
+    if (state.streamerLevels.snapshotLoadingKey !== key) return;
+    state.streamerLevels.snapshotLoadingKey = "";
+    state.streamerLevels.snapshotSourceKey = key;
+    if (state.streamerLevels.panelOpen || state.streamerLevels.autoLive) {
+      queueStreamerHistogramRefresh(true);
+    }
+    if (streamerLevelsHasAdjustment()) queueStreamerProcessedFrame();
+  };
+  img.onerror = () => {
+    if (state.streamerLevels.snapshotLoadingKey === key) state.streamerLevels.snapshotLoadingKey = "";
+  };
+  img.src = `data:${mimeType};base64,${base64}`;
+  return true;
+}
+
+function streamerLevelsSourceImage() {
+  if (state.streamerView.directActive) {
+    const snapshot = state.streamerLevels.snapshotImage;
+    return snapshot?.complete && snapshot.naturalWidth && snapshot.naturalHeight ? snapshot : null;
+  }
+  return $("streamerFrame");
+}
+
+function streamerLevelsSourceKey(img = streamerLevelsSourceImage()) {
+  if (!img) return "";
+  const rawSource = img.currentSrc || img.src || "";
+  const source = rawSource.startsWith("data:")
+    ? `${rawSource.length}:${rawSource.slice(-32)}`
+    : rawSource;
+  return [
+    state.streamerView.directActive ? state.streamerLevels.snapshotSourceKey : source,
+    img.naturalWidth || 0,
+    img.naturalHeight || 0,
+  ].join("|");
+}
+
+function ensureStreamerOffscreenCanvas(kind = "source") {
+  const key = kind === "histogram" ? "_histogramCanvas" : "_sourceCanvas";
+  const ctxKey = kind === "histogram" ? "_histogramCtx" : "_sourceCtx";
+  if (!state.streamerLevels[key]) {
+    state.streamerLevels[key] = document.createElement("canvas");
+    state.streamerLevels[ctxKey] = state.streamerLevels[key].getContext("2d", {
+      alpha: false,
+      willReadFrequently: true,
+      desynchronized: true,
+    });
+  }
+  return {
+    canvas: state.streamerLevels[key],
+    ctx: state.streamerLevels[ctxKey],
+  };
+}
+
+function drawStreamerSourceFrame(maxEdge = 2048) {
+  const img = streamerLevelsSourceImage();
+  if (!img || !img.complete || !img.naturalWidth || !img.naturalHeight) return null;
+  const { canvas, ctx } = ensureStreamerOffscreenCanvas("source");
+  if (!ctx) return null;
+  const longestEdge = Math.max(img.naturalWidth, img.naturalHeight, 1);
+  const scale = Math.min(1, maxEdge / longestEdge);
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  try {
+    ctx.drawImage(img, 0, 0, width, height);
+  } catch {
+    return null;
+  }
+  return {
+    canvas,
+    ctx,
+    width,
+    height,
+    key: streamerLevelsSourceKey(img),
+  };
+}
+
+function renderStreamerHistogram(histogram = state.streamerLevels.histogram) {
+  const canvas = $("streamerHistogram");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  const width = canvas.width;
+  const height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#08090a";
+  ctx.fillRect(0, 0, width, height);
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i += 1) {
+    const y = Math.round((height - 18) * (i / 4)) + 6;
+    ctx.beginPath();
+    ctx.moveTo(10, y);
+    ctx.lineTo(width - 10, y);
+    ctx.stroke();
+  }
+  if (!histogram?.bins?.length || !histogram.total) {
+    ctx.fillStyle = "#8f917f";
+    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    ctx.fillText("No frame data yet", 14, height / 2 + 4);
+    return;
+  }
+  const bins = histogram.bins;
+  const maxBin = Math.max(...bins, 1);
+  const innerLeft = 10;
+  const innerTop = 8;
+  const innerWidth = width - 20;
+  const innerHeight = height - 24;
+  ctx.fillStyle = "rgba(255, 214, 10, 0.12)";
+  const blackX = innerLeft + (state.streamerLevels.black / 255) * innerWidth;
+  const whiteX = innerLeft + (state.streamerLevels.white / 255) * innerWidth;
+  ctx.fillRect(innerLeft, innerTop, Math.max(0, blackX - innerLeft), innerHeight);
+  ctx.fillRect(whiteX, innerTop, Math.max(0, innerLeft + innerWidth - whiteX), innerHeight);
+  ctx.beginPath();
+  for (let i = 0; i < bins.length; i += 1) {
+    const x = innerLeft + (i / (bins.length - 1)) * innerWidth;
+    const y = innerTop + innerHeight - (bins[i] / maxBin) * innerHeight;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = "#ffd60a";
+  ctx.lineWidth = 1.7;
+  ctx.stroke();
+  for (const [value, color] of [
+    [state.streamerLevels.black, "#30d158"],
+    [state.streamerLevels.white, "#ff9f0a"],
+  ]) {
+    const x = innerLeft + (value / 255) * innerWidth;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.35;
+    ctx.beginPath();
+    ctx.moveTo(x, innerTop);
+    ctx.lineTo(x, innerTop + innerHeight);
+    ctx.stroke();
+  }
+}
+
+function streamerAutoRangeFromHistogram(histogram = state.streamerLevels.histogram) {
+  if (!histogram?.bins?.length || !histogram.total) return null;
+  const bins = histogram.bins;
+  // The tube lens leaves a true-black background around the useful image.
+  // Excluding bin 0 prevents that background from anchoring the black level.
+  const total = histogram.total - (Number(bins[0]) || 0);
+  if (total <= 0) return null;
+  const lowTarget = total * STREAMER_HISTOGRAM_AUTO_BLACK_PERCENTILE;
+  const highTarget = total * (1 - STREAMER_HISTOGRAM_AUTO_WHITE_PERCENTILE);
+  let cumulative = 0;
+  let black = 1;
+  for (let i = 1; i < bins.length; i += 1) {
+    cumulative += bins[i];
+    if (cumulative >= lowTarget) {
+      black = i;
+      break;
+    }
+  }
+  cumulative = 0;
+  let white = 255;
+  for (let i = bins.length - 1; i >= 1; i -= 1) {
+    cumulative += bins[i];
+    if (cumulative >= highTarget) {
+      white = i;
+      break;
+    }
+  }
+  if (white <= black) white = Math.min(255, black + 1);
+  return { black, white };
+}
+
+function fitStreamerLevelsToHistogram(forceRefresh = false) {
+  if (forceRefresh) refreshStreamerHistogram(true);
+  const range = streamerAutoRangeFromHistogram();
+  if (!range) return false;
+  state.streamerLevels.black = range.black;
+  state.streamerLevels.white = range.white;
+  clampStreamerLevels();
+  updateStreamerLevelsUi();
+  saveStreamerLevels();
+  updateStreamerLevelsDisplayMode();
+  if (streamerLevelsHasAdjustment()) renderStreamerProcessedFrame();
+  return true;
+}
+
+function refreshStreamerHistogram(force = false) {
+  if (!state.streamerLevels.panelOpen && !state.streamerLevels.autoLive) return;
+  const now = performance.now();
+  if (!force && now - Number(state.streamerLevels.histogramAt || 0) < STREAMER_HISTOGRAM_THROTTLE_MS) return;
+  const frame = drawStreamerSourceFrame(STREAMER_HISTOGRAM_SAMPLE_EDGE);
+  if (!frame) {
+    state.streamerLevels.histogram = null;
+    renderStreamerHistogram(null);
+    return;
+  }
+  const { canvas, ctx, width, height, key } = frame;
+  let data;
+  try {
+    data = ctx.getImageData(0, 0, width, height).data;
+  } catch {
+    state.streamerLevels.histogram = null;
+    renderStreamerHistogram(null);
+    return;
+  }
+  const bins = Array.from({ length: STREAMER_HISTOGRAM_BINS }, () => 0);
+  const stride = Math.max(1, Math.floor(Math.max(width, height) / 128));
+  let total = 0;
+  for (let y = 0; y < height; y += stride) {
+    for (let x = 0; x < width; x += stride) {
+      const index = (y * width + x) * 4;
+      const luminance = Math.round(
+        0.2126 * data[index]
+        + 0.7152 * data[index + 1]
+        + 0.0722 * data[index + 2]
+      );
+      bins[luminance] += 1;
+      total += 1;
+    }
+  }
+  state.streamerLevels.histogram = {
+    bins,
+    total,
+    width: canvas.width,
+    height: canvas.height,
+    key,
+  };
+  state.streamerLevels.histogramAt = now;
+  state.streamerLevels.histogramSourceKey = key;
+  renderStreamerHistogram();
+  if (state.streamerLevels.autoLive) {
+    const range = streamerAutoRangeFromHistogram();
+    if (range) {
+      state.streamerLevels.black = range.black;
+      state.streamerLevels.white = range.white;
+      clampStreamerLevels();
+      updateStreamerLevelsUi();
+      saveStreamerLevels();
+      updateStreamerLevelsDisplayMode();
+      renderStreamerProcessedFrame();
+    }
+  }
+}
+
+function queueStreamerHistogramRefresh(force = false) {
+  if (!force && state.streamerLevels.histogramPending) return;
+  state.streamerLevels.histogramPending = true;
+  requestAnimationFrame(() => {
+    state.streamerLevels.histogramPending = false;
+    refreshStreamerHistogram(force);
+  });
+}
+
+function queueStreamerProcessedFrame() {
+  if (state.streamerLevels.renderQueued) return;
+  state.streamerLevels.renderQueued = true;
+  requestAnimationFrame(() => {
+    state.streamerLevels.renderQueued = false;
+    renderStreamerProcessedFrame();
+  });
+}
+
+function updateStreamerLevelsDisplayMode() {
+  const viewer = $("streamerFrame")?.closest(".viewer.streamer");
+  if (!viewer) return;
+  const active = streamerLevelsHasAdjustment();
+  viewer.classList.toggle("levels-active", active);
+  if (!active) {
+    const canvas = $("streamerCanvas");
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+    }
+  }
+  ensureStreamerLevelsLiveLoop();
+}
+
+function renderStreamerProcessedFrame() {
+  if (!streamerLevelsHasAdjustment()) return false;
+  const frame = drawStreamerSourceFrame(2048);
+  const canvas = $("streamerCanvas");
+  if (!frame || !canvas) return false;
+  const ctx = canvas.getContext("2d", {
+    alpha: false,
+    willReadFrequently: true,
+    desynchronized: true,
+  });
+  if (!ctx) return false;
+  clampStreamerLevels();
+  let image;
+  try {
+    image = frame.ctx.getImageData(0, 0, frame.width, frame.height);
+  } catch {
+    return false;
+  }
+  const data = image.data;
+  const black = Number(state.streamerLevels.black) || 0;
+  const white = Number(state.streamerLevels.white) || 255;
+  const scale = 255 / Math.max(1, white - black);
+  const lut = new Uint8ClampedArray(256);
+  for (let i = 0; i < 256; i += 1) {
+    lut[i] = clamp(Math.round((i - black) * scale), 0, 255);
+  }
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = lut[data[i]];
+    data[i + 1] = lut[data[i + 1]];
+    data[i + 2] = lut[data[i + 2]];
+  }
+  if (canvas.width !== frame.width) canvas.width = frame.width;
+  if (canvas.height !== frame.height) canvas.height = frame.height;
+  ctx.putImageData(image, 0, 0);
+  return true;
+}
+
+function ensureStreamerLevelsLiveLoop() {
+  if (state.streamerLevels.liveRaf) {
+    cancelAnimationFrame(state.streamerLevels.liveRaf);
+    state.streamerLevels.liveRaf = null;
+  }
+  syncStreamerSnapshotDemand();
 }
 
 function streamerMetaText(baseText) {
@@ -10584,6 +11346,8 @@ function renderFrame(name, frame) {
     if (name === "streamer") {
       applyStreamerView();
       requestStreamerResolutionUpdate();
+      if (streamerLevelsHasAdjustment()) renderStreamerProcessedFrame();
+      if (state.streamerLevels.panelOpen) queueStreamerHistogramRefresh(true);
     }
   } else {
     if (name === "streamer" && img.getAttribute("src")) {
@@ -10597,6 +11361,11 @@ function renderFrame(name, frame) {
     viewer.classList.remove("has-frame");
     delete meta.dataset.baseText;
     meta.textContent = frame?.error || "waiting";
+    if (name === "streamer") {
+      state.streamerLevels.histogram = null;
+      renderStreamerHistogram(null);
+      updateStreamerLevelsDisplayMode();
+    }
   }
 }
 
@@ -10614,6 +11383,53 @@ function renderCalibrationFrame(frame) {
     shell.classList.remove("has-frame");
   }
   updateCalibrationOverlayGeometry();
+}
+
+function streamerOverlayEnabled(live = state.live) {
+  const status = typeof streamerStatusFromLive === "function" ? streamerStatusFromLive(live) : {};
+  return Boolean(status?.electrode_overlay);
+}
+
+function updateStreamerOverlayControl(live = state.live) {
+  const input = $("streamerOverlayToggle");
+  if (!input) return;
+  const status = typeof streamerStatusFromLive === "function" ? streamerStatusFromLive(live) : {};
+  const source = typeof streamerSourceFromStatus === "function" ? streamerSourceFromStatus(status) : "";
+  const liveEnabled = typeof status?.electrode_overlay === "boolean"
+    ? Boolean(status.electrode_overlay)
+    : null;
+  if (state.streamerLevels.overlayPending && liveEnabled === state.streamerLevels.overlayDesired) {
+    state.streamerLevels.overlayPending = false;
+  }
+  if (!state.streamerLevels.overlayPending && liveEnabled !== null) {
+    state.streamerLevels.overlayDesired = liveEnabled;
+  }
+  const desired = state.streamerLevels.overlayDesired;
+  input.checked = state.streamerLevels.overlayPending && typeof desired === "boolean"
+    ? desired
+    : liveEnabled ?? Boolean(desired);
+  input.disabled = !source;
+  input.title = source
+    ? `Electrode overlay on ${source}`
+    : "Streamer source unavailable";
+}
+
+function setStreamerOverlay(enabled) {
+  const status = typeof streamerStatusFromLive === "function" ? streamerStatusFromLive(state.live) : {};
+  const source = typeof streamerSourceFromStatus === "function" ? streamerSourceFromStatus(status) : "";
+  if (!source) {
+    updateStreamerOverlayControl(state.live);
+    return;
+  }
+  const nextEnabled = Boolean(enabled);
+  state.streamerLevels.overlayDesired = nextEnabled;
+  state.streamerLevels.overlayPending = true;
+  updateStreamerOverlayControl(state.live);
+  saveStreamerLevels();
+  send({
+    type: "set_streamer_overlay",
+    enabled: nextEnabled,
+  });
 }
 
 function updateCalibrationOverlayGeometry() {
@@ -10715,6 +11531,11 @@ function openCalibrationOverlay() {
   send({ type: "calibration_start" });
 }
 
+function selectCalibrationMode(mode) {
+  if (!state.calibration.active && !state.calibration.data?.active) return;
+  send({ type: "calibration_select_mode", mode });
+}
+
 function closeCalibrationOverlay() {
   stopAllCalibrationJogs();
   state.calibration.active = false;
@@ -10737,6 +11558,16 @@ function renderCalibrationOverlay() {
 
   setText("calibrationConfig", data.config_path || "-");
   setText("calibrationStatus", data.error || (data.preparing ? "preparing" : data.status || "active"));
+  const mode = currentCalibrationMode();
+  $("calibrationModeFocus")?.classList.toggle("active", mode === "focus");
+  $("calibrationModeFocus")?.setAttribute("aria-selected", String(mode === "focus"));
+  $("calibrationModeHoles")?.classList.toggle("active", mode === "injection_holes");
+  $("calibrationModeHoles")?.setAttribute("aria-selected", String(mode === "injection_holes"));
+  $("calibrationFocusPanel").hidden = mode !== "focus";
+  $("calibrationHolesPanel").hidden = mode !== "injection_holes";
+  const targetBox = document.querySelector(".calibration-target-box");
+  if (targetBox) targetBox.hidden = mode !== "focus";
+
   const step = data.current_step || {};
   const stepNumber = Number.isFinite(Number(data.guided_index)) ? Number(data.guided_index) + 1 : "-";
   const stepCount = data.step_count || 3;
@@ -10757,6 +11588,7 @@ function renderCalibrationOverlay() {
   setText("calibrationColumnX", formatCalibrationVector(interColumn[0]));
   setText("calibrationColumnY", formatCalibrationVector(interColumn[1]));
   setText("calibrationColumnZ", formatCalibrationVector(interColumn[2]));
+  renderCalibrationHolePanel(data);
 
   const speedKey = String(data.speed_key || state.calibration.speedKey || "2");
   const speedBusy = Boolean(data.preparing || state.calibration.movePending);
@@ -10768,14 +11600,95 @@ function renderCalibrationOverlay() {
     button.disabled = speedBusy;
   }
   const accept = $("calibrationAccept");
-  if (accept) accept.disabled = Boolean(data.workflow_complete);
+  if (accept) accept.disabled = mode !== "focus" || Boolean(data.workflow_complete);
+  const moveTarget = $("calibrationMoveTarget");
+  if (moveTarget) moveTarget.disabled = mode !== "focus";
+  const saveButton = $("calibrationSave");
+  if (saveButton) saveButton.textContent = mode === "injection_holes" ? "Save Focus" : "Save";
   window.requestAnimationFrame(updateCalibrationOverlayGeometry);
+}
+
+function currentCalibrationMode() {
+  return String(state.calibration.data?.mode || "focus");
+}
+
+function renderCalibrationHolePanel(data) {
+  const holes = Array.isArray(data.input_holes) ? data.input_holes : [];
+  const selectedId = String(data.selected_input_hole_id || "");
+  const selected = holes.find((hole) => String(hole?.id || "") === selectedId) || null;
+  const currentElectrode = data.current_electrode || calibrationElectrodePosition();
+  setText("calibrationHoleStepLabel", selected?.id || "No hole selected");
+  setText("calibrationHoleRow", formatElectrodeCoordinate(currentElectrode?.row));
+  setText("calibrationHoleColumn", formatElectrodeCoordinate(currentElectrode?.column));
+  setText("calibrationCartridgeConfig", data.cartridge_path ? compactPath(data.cartridge_path) : "-");
+  setText("calibrationHoleRows", formatElectrodeRange(selected?.electrode_bounds?.row_min, selected?.electrode_bounds?.row_max));
+  setText("calibrationHoleColumns", formatElectrodeRange(selected?.electrode_bounds?.column_min, selected?.electrode_bounds?.column_max));
+  setText("calibrationHoleShape", formatHoleShape(selected?.electrode_bounds));
+
+  const select = $("calibrationHoleSelect");
+  if (select) {
+    const options = holes.map((hole) => ({ value: String(hole?.id || ""), label: String(hole?.id || "(unnamed)") }));
+    const currentValue = String(select.value || "");
+    const desiredValue = selectedId || options[0]?.value || "";
+    if (
+      select.options.length !== options.length
+      || options.some((option, index) => select.options[index]?.value !== option.value || select.options[index]?.text !== option.label)
+    ) {
+      select.innerHTML = "";
+      for (const option of options) {
+        const node = document.createElement("option");
+        node.value = option.value;
+        node.textContent = option.label;
+        select.appendChild(node);
+      }
+    }
+    if (currentValue !== desiredValue) select.value = desiredValue;
+    select.disabled = !options.length;
+  }
+
+  setCalibrationFieldValue("calibrationHoleId", selected?.id || "");
+  setCalibrationFieldValue("calibrationHoleSide", selected?.side || "left");
+  setCalibrationFieldValue("calibrationHoleRole", selected?.role || "manual_injection");
+  setCalibrationFieldValue("calibrationHoleNotes", selected?.notes || "");
+
+  $("calibrationHoleDelete").disabled = !selected;
+  $("calibrationHoleCaptureStart").disabled = !selected;
+  $("calibrationHoleCaptureEnd").disabled = !selected;
+  $("calibrationHoleSave").disabled = !selected;
 }
 
 function formatCalibrationVector(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return "-";
   return Math.abs(number) >= 100 ? number.toFixed(1) : number.toFixed(3);
+}
+
+function formatElectrodeCoordinate(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? String(Math.round(number)) : "-";
+}
+
+function formatElectrodeRange(start, end) {
+  const first = Number(start);
+  const last = Number(end);
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return "-";
+  return first === last ? String(Math.round(first)) : `${Math.round(first)}-${Math.round(last)}`;
+}
+
+function formatHoleShape(bounds) {
+  const rowMin = Number(bounds?.row_min);
+  const rowMax = Number(bounds?.row_max);
+  const colMin = Number(bounds?.column_min);
+  const colMax = Number(bounds?.column_max);
+  if (![rowMin, rowMax, colMin, colMax].every(Number.isFinite)) return "-";
+  return `${Math.round(rowMax - rowMin + 1)}x${Math.round(colMax - colMin + 1)}`;
+}
+
+function setCalibrationFieldValue(id, value) {
+  const input = $(id);
+  if (!input) return;
+  const text = String(value ?? "");
+  if (input.value !== text) input.value = text;
 }
 
 function normalizeStagePosition(position) {
@@ -10794,7 +11707,14 @@ function calibrationPosition() {
     || normalizeStagePosition(currentStagePosition());
 }
 
+function calibrationElectrodePosition() {
+  const scene = state.live?.scene?.result || state.live?.scene;
+  const stage = calibrationPosition();
+  return electrodeFromStage(scene, stage);
+}
+
 function acceptCalibrationStep() {
+  if (currentCalibrationMode() !== "focus") return;
   stopAllCalibrationJogs();
   const position = calibrationPosition();
   if (!position) {
@@ -10809,6 +11729,26 @@ function acceptCalibrationStep() {
   send({ type: "calibration_record", position });
 }
 
+function captureCalibrationHoleEndpoint(endpoint) {
+  stopAllCalibrationJogs();
+  const position = calibrationPosition();
+  send({
+    type: "calibration_hole_capture",
+    endpoint,
+    position,
+  });
+}
+
+function saveCalibrationHoleFields() {
+  send({
+    type: "calibration_hole_update",
+    hole_id: $("calibrationHoleId")?.value || "",
+    side: $("calibrationHoleSide")?.value || "left",
+    role: $("calibrationHoleRole")?.value || "manual_injection",
+    notes: $("calibrationHoleNotes")?.value || "",
+  });
+}
+
 function keyboardEventTargetsEditor(event) {
   return Boolean(event.target?.closest?.("input, textarea, select, [contenteditable='true'], .metric.editing"));
 }
@@ -10816,6 +11756,7 @@ function keyboardEventTargetsEditor(event) {
 function handleCalibrationKeydown(event) {
   if (!state.calibration.active && !state.calibration.data?.active) return;
   if (keyboardEventTargetsEditor(event)) return;
+  const mode = currentCalibrationMode();
   const key = event.key;
   if (key === "Escape") {
     event.preventDefault();
@@ -10839,11 +11780,12 @@ function handleCalibrationKeydown(event) {
   }
   if (key === "Enter") {
     event.preventDefault();
-    acceptCalibrationStep();
+    if (mode === "focus") acceptCalibrationStep();
     return;
   }
   if (key.toLowerCase() === "m") {
     event.preventDefault();
+    if (mode !== "focus") return;
     stopAllCalibrationJogs();
     send({ type: "calibration_move_to_target" });
     return;

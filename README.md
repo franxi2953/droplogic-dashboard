@@ -26,7 +26,7 @@ It is intentionally separate from the `droplogic` Python package: DropLogic rema
 
 ## What It Provides
 
-- **Main Control**: large live streamer, matrix visualizer, temperature chart, and BoxMini state panels.
+- **Main Control**: large live streamer with source, overlay, histogram, and display-level controls; matrix visualizer; temperature chart; and BoxMini state panels with per-priority command queues.
 - **Agent Chat**: a Codex/OpenAI-compatible control loop with thinking summaries, tool calls, retries, cancellation, copy buttons, and run history.
 - **Local Audio Input**: browser microphone capture sent to a local speech-to-text model before text is placed into the agent prompt.
 - **Context Analysis**: per-request token charts, context breakdown histograms, compaction events, retry diagnostics, and tool-output size badges.
@@ -112,6 +112,16 @@ Live polling is split by cadence so state refreshes, matrix scene snapshots, and
 Large live matrix scenes are compacted before broadcast. When a plan timeline is heavy, Dashboard sends sampled compact frames around the first frames, final frames, and current execution focus; the full run record remains on disk.
 
 Live frame and scene payloads carry dashboard sequence metadata. The browser keeps the newest payload per channel, resets freshness on live WebSocket reconnect, and ignores older matrix scenes from stale sessions. Backend scene-file fallback also rejects stale `dashboard_scene.json` snapshots after the greater of 10 seconds or six live poll intervals.
+
+The Streamer state card switches between microscope and camera sources. The streamer panel can toggle the electrode overlay and apply persistent, browser-local black/white display levels manually, once from the current histogram, or continuously with **Auto live**. Level adjustments affect only the browser display; **Download** still saves the raw camera frame. When a direct stream is available, Dashboard requests snapshot frames only while histogram or level processing needs them.
+
+The BoxMini state grid also shows pending commands from compact `runtime_status` data, split into `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW` queues.
+
+## Cartridge Calibration
+
+**Cartridge Calibration** starts MCP, opens a full-resolution streamer view, and provides two modes. **Focus** records the matrix origin, row endpoint, and column endpoint in the DropLogic config selected by `DROPLOGIC_CONFIG` (or the default DropLogic `config.json`) and applies the resulting mapping to the running system. **Injection Holes** creates, renames, selects, and deletes cartridge input holes; captures each selected region's start and end from the current calibrated stage position; and edits its side, role, and notes.
+
+Saving injection holes writes `cartridge.default.json` in the first matching pinned BoxMini context root, normally `DropLogic/droplogic/mcp/context/boxmini/`. Focus calibration must be valid before stage positions can be converted to electrode coordinates for hole capture.
 
 ## AI Provider
 
@@ -212,6 +222,8 @@ runs/<run_id>/
 ```
 
 `events.jsonl` is the source of truth for the UI. Agent prose is treated as narration; hardware state should be refreshed through MCP tools before acting.
+
+Recorded runs are loaded into a responsive conversation view. While the user is reading history, newly streamed agent text preserves the exact scroll offset; conversation-only events do not rerender unrelated dashboard panels, and **Jump to latest** resumes live following.
 
 Timeline plan/execution overlays focus on the active plan window. A successful `clear_droplet_state(reset_executor=true)` that leaves an empty plan is treated as a boundary for later plan and execution markers.
 

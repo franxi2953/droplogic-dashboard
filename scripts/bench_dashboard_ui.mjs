@@ -178,10 +178,15 @@ function fakeWebSocketScript(fixture) {
     static CLOSING = 2;
     static CLOSED = 3;
 
-    constructor() {
+    constructor(url) {
       this.readyState = FixtureWebSocket.CONNECTING;
       this.sent = [];
-      window.__DROPOLOGIC_BENCHMARK_SOCKET = this;
+      this.isLiveSocket = new URL(url, window.location.href).pathname === "/live";
+      if (this.isLiveSocket) {
+        window.__DROPOLOGIC_BENCHMARK_LIVE_SOCKET = this;
+      } else {
+        window.__DROPOLOGIC_BENCHMARK_CONTROL_SOCKET = this;
+      }
       setTimeout(() => {
         this.readyState = FixtureWebSocket.OPEN;
         this.onopen?.({ type: "open" });
@@ -194,6 +199,10 @@ function fakeWebSocketScript(fixture) {
         message = JSON.parse(raw);
       } catch {}
       this.sent.push(message);
+      if (this.isLiveSocket) {
+        if (message.type === "get_live") this.emitLive();
+        return;
+      }
       if (message.type === "get_status") {
         this.emit({ type: "status", status: fixture.status });
       } else if (message.type === "list_runs") {
@@ -239,7 +248,7 @@ function fakeWebSocketScript(fixture) {
         },
         temperature_history: fixture.temperatureHistory,
       });
-      this.emitLive();
+      window.__DROPOLOGIC_BENCHMARK_LIVE_SOCKET?.emitLive();
     }
 
     emitLive() {
@@ -248,6 +257,19 @@ function fakeWebSocketScript(fixture) {
         live: {
           updated_at: fixture.lastTs,
           scene: fixture.scene,
+          runtime: {
+            system: {
+              queue_summary: {
+                pending_commands: 10,
+                queues: {
+                  CRITICAL: { pending_commands: 1, worker_alive: true, interval_ms: 1 },
+                  HIGH: { pending_commands: 2, worker_alive: true, interval_ms: 10 },
+                  MEDIUM: { pending_commands: 3, worker_alive: true, interval_ms: 100 },
+                  LOW: { pending_commands: 4, worker_alive: true, interval_ms: 1000 },
+                },
+              },
+            },
+          },
           state: {
             result: {
               ok: true,
@@ -272,8 +294,20 @@ function fakeWebSocketScript(fixture) {
   };
   FixtureWebSocket.OPEN = FixtureWebSocket.OPEN;
   window.WebSocket = FixtureWebSocket;
-  window.__DROPOLOGIC_BENCHMARK_LOAD_RUN = () => window.__DROPOLOGIC_BENCHMARK_SOCKET?.emitRunLoaded();
-  window.__DROPOLOGIC_BENCHMARK_EMIT_LIVE = () => window.__DROPOLOGIC_BENCHMARK_SOCKET?.emitLive();
+  window.__DROPOLOGIC_BENCHMARK_LOAD_RUN = () => window.__DROPOLOGIC_BENCHMARK_CONTROL_SOCKET?.emitRunLoaded();
+  window.__DROPOLOGIC_BENCHMARK_EMIT_LIVE = () => window.__DROPOLOGIC_BENCHMARK_LIVE_SOCKET?.emitLive();
+  window.__DROPOLOGIC_BENCHMARK_EMIT_CONVERSATION_EVENT = () => {
+    window.__DROPOLOGIC_BENCHMARK_CONTROL_SOCKET?.emit({
+      type: "event",
+      event: {
+        ts: fixture.lastTs,
+        t: Date.now() / 1000,
+        type: "agent_thinking",
+        text: "Streaming benchmark update. ".repeat(40),
+        round: 999,
+      },
+    });
+  };
 }
 
 async function installPageInstrumentation(page) {
@@ -374,6 +408,8 @@ async function installPageInstrumentation(page) {
           timeline_overlay_hitboxes: window.__droplogicDebug?.state?.timelineOverlayHitboxes?.length ?? null,
           event_count: window.__droplogicDebug?.state?.events?.length ?? null,
           temperature_samples: window.__droplogicDebug?.state?.temperatureSamples?.length ?? null,
+          queue_card: document.querySelector('.state-card[data-kind="queues"]')?.innerText?.trim() || "",
+          conversation_anchor: window.__DROPOLOGIC_BENCHMARK_CONVERSATION_ANCHOR || null,
         };
       },
     };
@@ -402,6 +438,13 @@ async function installPageInstrumentation(page) {
       "timelineOverlayData",
       "timelineOverlayTimeRange",
       "drawTimelineTemperatureLines",
+      "drawTimelineMeasuredTemperatureLine",
+      "drawTimelineTargetTemperatureLine",
+      "timelineTemperatureSamplesForRender",
+      "visibleTimelineTemperatureValues",
+      "simplifyTimelineTemperatureSamplesForRender",
+      "timelineTemperatureDomain",
+      "timelineTargetValuesForRange",
       "drawTimelineOverlays",
       "drawTimelineRuler",
       "drawTimelineEvents",
@@ -484,8 +527,42 @@ async function main() {
     await installPageInstrumentation(page);
     timings.push(await timed("load_run_fixture", async () => {
       await page.evaluate(() => window.__DROPOLOGIC_BENCHMARK_LOAD_RUN?.());
-      await page.waitForFunction(() => window.__droplogicDebug?.state?.events?.length > 0, null, { timeout: 10000 });
+      await page.waitForFunction(
+        (expectedEventCount) => window.__droplogicDebug?.state?.events?.length === expectedEventCount,
+        fixture.events.length,
+        { timeout: 30000 },
+      );
       await afterNextPaint(page);
+    }));
+    timings.push(await timed("conversation_wheel_16", async () => {
+      await wheelOn(page, "#conversation", 16);
+      await afterNextPaint(page);
+    }));
+    timings.push(await timed("conversation_anchor_during_stream", async () => {
+      const before = await page.evaluate(() => {
+        const list = document.querySelector("#conversation");
+        if (!list) return null;
+        list.scrollTop = Math.min(
+          Math.max(80, Math.round(list.scrollHeight * 0.35)),
+          Math.max(0, list.scrollHeight - list.clientHeight),
+        );
+        window.__droplogicDebug.state.conversationAtLatest = false;
+        return list.scrollTop;
+      });
+      await page.evaluate(() => window.__DROPOLOGIC_BENCHMARK_EMIT_CONVERSATION_EVENT?.());
+      await page.waitForTimeout(140);
+      await afterNextPaint(page);
+      const after = await page.evaluate(() => document.querySelector("#conversation")?.scrollTop ?? null);
+      await page.evaluate(({ beforeScrollTop, afterScrollTop }) => {
+        window.__DROPOLOGIC_BENCHMARK_CONVERSATION_ANCHOR = {
+          before_scroll_top: beforeScrollTop,
+          after_scroll_top: afterScrollTop,
+          delta_px: Math.round((afterScrollTop ?? 0) - (beforeScrollTop ?? 0)),
+        };
+      }, { beforeScrollTop: before, afterScrollTop: after });
+      if (before !== null && after !== null && Math.abs(after - before) > 1) {
+        throw new Error(`Conversation reading anchor moved by ${after - before}px`);
+      }
     }));
     timings.push(await timed("open_timeline_tab", async () => {
       await page.click('[data-bottom-tab="timeline"]');
