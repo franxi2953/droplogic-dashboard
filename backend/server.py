@@ -92,6 +92,7 @@ GOAL_COMPLETE_TOOL = "dashboard_complete_goal"
 DEFAULT_AGENT_FRAME_DELAY_SECONDS = 1.0
 DEFAULT_AGENT_EXECUTION_WAIT_SECONDS = 30.0
 DEFAULT_AGENT_PLANNING_WAIT_SECONDS = 15.0
+DASHBOARD_PLANNING_TIMEOUT_SECONDS = 135.0
 DASHBOARD_USER_TOOL_DEFAULT_TIMEOUT_SECONDS = 45.0
 FRAME_DELAY_AGENT_TOOLS = {"start_plan", "execute_segment_to_breakpoint"}
 MCP_STATEFUL_EXECUTION_TOOLS = {
@@ -163,10 +164,13 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             "max_width": 720,
             "max_height": 460,
         }
+        self._streamer_snapshot_clients: set[Any] = set()
         self.calibration: DashboardCalibrationSession | None = None
         self._poll_task: asyncio.Task | None = None
         self._stream_task: asyncio.Task | None = None
         self._agent_task: asyncio.Task | None = None
+        self._dashboard_tasks: set[asyncio.Task[Any]] = set()
+        self._dashboard_planning_lock = asyncio.Lock()
         self._agent_queue: list[dict[str, Any]] = []
         self._direct_stream_available = False
         self._scene_task: asyncio.Task | None = None
@@ -1290,6 +1294,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     await websocket.send(json.dumps({"type": "event", "event": event}))
         finally:
             self.clients.discard(websocket)
+            self._streamer_snapshot_clients.discard(websocket)
             self._client_send_locks.pop(websocket, None)
 
     async def handle_live_ws(self, websocket: Any) -> None:
@@ -1308,8 +1313,40 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             self.live_clients.discard(websocket)
             self._client_send_locks.pop(websocket, None)
 
-    async def handle_message(self, websocket: Any, message: dict[str, Any]) -> None:
+    async def run_background_dashboard_message(self, websocket: Any, message: dict[str, Any]) -> None:
+        try:
+            async with self._dashboard_planning_lock:
+                await self.handle_message(websocket, message, background=True)
+        except Exception as exc:
+            msg_type = str(message.get("type") or "")
+            result_type = (
+                "matrix_waypoint_plan_result"
+                if msg_type == "matrix_plan_waypoint_paths"
+                else "matrix_selection_plan_result"
+            )
+            await self.record("ui_error", level="error", message=str(exc))
+            await self.safe_send(
+                websocket,
+                {
+                    "type": result_type,
+                    "droplet_id": message.get("droplet_id"),
+                    "result": {"ok": False, "error": str(exc)},
+                }
+            )
+
+    async def handle_message(
+        self,
+        websocket: Any,
+        message: dict[str, Any],
+        *,
+        background: bool = False,
+    ) -> None:
         msg_type = message.get("type")
+        if msg_type in {"matrix_plan_waypoint_paths", "matrix_plan_selection_move"} and not background:
+            task = asyncio.create_task(self.run_background_dashboard_message(websocket, message))
+            self._dashboard_tasks.add(task)
+            task.add_done_callback(self._dashboard_tasks.discard)
+            return
         if msg_type == "get_status":
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             return
@@ -2224,17 +2261,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     )
                     break
 
-                plan_result = mark_failed_mcp_payload(
-                    await self.safe_tool(
-                        "plan_move",
-                        {
-                            "mode": mode,
-                            "remove_duplicate_frames": False,
-                            "planning_timeout": 120.0,
-                            "background": True,
-                        },
-                    )
-                )
+                plan_result = await self.plan_dashboard_move(mode)
                 plan_payload = compact_tool_payload(plan_result)
                 plan_ok = mcp_tool_call_succeeded(plan_result)
                 step.update(
@@ -2264,15 +2291,13 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 waypoint_count=len(waypoints),
                 error=result.get("error"),
             )
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "matrix_waypoint_plan_result",
-                        "droplet_id": droplet_id,
-                        "result": result,
-                    },
-                    ensure_ascii=True,
-                )
+            await self.safe_send(
+                websocket,
+                {
+                    "type": "matrix_waypoint_plan_result",
+                    "droplet_id": droplet_id,
+                    "result": result,
+                }
             )
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
@@ -2332,17 +2357,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     }
                 )
             else:
-                plan_result = mark_failed_mcp_payload(
-                    await self.safe_tool(
-                        "plan_move",
-                        {
-                            "mode": mode,
-                            "remove_duplicate_frames": False,
-                            "planning_timeout": 120.0,
-                            "background": True,
-                        },
-                    )
-                )
+                plan_result = await self.plan_dashboard_move(mode)
                 plan_payload = compact_tool_payload(plan_result)
                 plan_ok = mcp_tool_call_succeeded(plan_result)
                 result["plan_result"] = plan_payload
@@ -2363,14 +2378,12 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 target_count=len(targets),
                 error=result.get("error"),
             )
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "matrix_selection_plan_result",
-                        "result": result,
-                    },
-                    ensure_ascii=True,
-                )
+            await self.safe_send(
+                websocket,
+                {
+                    "type": "matrix_selection_plan_result",
+                    "result": result,
+                }
             )
             if self.mcp.running:
                 live = await self.collect_live_snapshot(include_state=True)
@@ -2419,6 +2432,13 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     "max_height": max_height,
                 }
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
+            return
+
+        if msg_type == "set_streamer_snapshot_demand":
+            if message.get("enabled"):
+                self._streamer_snapshot_clients.add(websocket)
+            else:
+                self._streamer_snapshot_clients.discard(websocket)
             return
 
         if msg_type == "set_streamer_overlay":
@@ -3546,6 +3566,79 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             started_at=started_at,
             return_reason=return_reason,
         )
+
+    async def plan_dashboard_move(self, mode: str) -> Any:
+        result = mark_failed_mcp_payload(
+            await self.safe_tool(
+                "plan_move",
+                {
+                    "mode": mode,
+                    "remove_duplicate_frames": False,
+                    "planning_timeout": 120.0,
+                    "background": True,
+                },
+            )
+        )
+        payload = compact_tool_payload(result)
+        if not mcp_tool_call_succeeded(result) or not isinstance(payload, dict):
+            return result
+        if payload.get("completed") is True and not payload.get("error"):
+            return result
+        if payload.get("completed") is True:
+            return {
+                "ok": False,
+                "isError": True,
+                "error": str(payload["error"]),
+                "planning_job": payload,
+            }
+        if payload.get("running") is False:
+            return {
+                "ok": False,
+                "isError": True,
+                "error": str(payload.get("error") or "Background planning stopped before completion."),
+                "planning_job": payload,
+            }
+        if payload.get("running") is not True and payload.get("completed") is not False:
+            return result
+
+        deadline = time.monotonic() + DASHBOARD_PLANNING_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            wait_seconds = parse_optional_float(payload.get("recommended_wait_seconds"))
+            wait_seconds = DEFAULT_AGENT_PLANNING_WAIT_SECONDS if wait_seconds is None else wait_seconds
+            await asyncio.sleep(min(max(0.05, wait_seconds), max(0.05, deadline - time.monotonic())))
+            result = mark_failed_mcp_payload(
+                await self.safe_tool(
+                    "planning_job_status",
+                    {},
+                    timeout_seconds=30.0,
+                )
+            )
+            payload = compact_tool_payload(result)
+            if not mcp_tool_call_succeeded(result):
+                return result
+            if isinstance(payload, dict) and payload.get("completed") is True:
+                if payload.get("error"):
+                    return {
+                        "ok": False,
+                        "isError": True,
+                        "error": str(payload["error"]),
+                        "planning_job": payload,
+                    }
+                return result
+            if isinstance(payload, dict) and payload.get("running") is False:
+                return {
+                    "ok": False,
+                    "isError": True,
+                    "error": str(payload.get("error") or "Background planning stopped before completion."),
+                    "planning_job": payload,
+                }
+
+        return {
+            "ok": False,
+            "isError": True,
+            "running": True,
+            "error": "Timed out waiting for background planning to complete.",
+        }
 
     async def call_agent_execution_wait_status(self, call_arguments: dict[str, Any]) -> Any:
         requested_wait = parse_optional_float(call_arguments.get("wait_seconds"))

@@ -122,8 +122,7 @@ const state = {
   streamerLevels: {
     panelOpen: false,
     overlayPending: false,
-    // The microscope streamer normally starts with the electrode overlay enabled.
-    overlayDesired: true,
+    overlayDesired: null,
     black: 0,
     white: 255,
     autoLive: false,
@@ -133,6 +132,11 @@ const state = {
     histogramSourceKey: "",
     renderQueued: false,
     liveRaf: null,
+    snapshotDemand: null,
+    snapshotFrame: null,
+    snapshotImage: null,
+    snapshotLoadingKey: "",
+    snapshotSourceKey: "",
   },
   matrixPaths: {
     collapsed: true,
@@ -3299,6 +3303,8 @@ function connect() {
     state.wsLastHeartbeatAt = 0;
     appendEvent({ ts: new Date().toISOString(), type: "ui_connected" });
     send({ type: "get_status" });
+    state.streamerLevels.snapshotDemand = null;
+    syncStreamerSnapshotDemand(true);
     state.streamerView.lastRequestKey = "";
     requestStreamerResolutionUpdate();
     connectLive();
@@ -3523,8 +3529,10 @@ function connect() {
         clearPendingMetricEdit();
       }
     } else if (data.type === "streamer_overlay_result") {
-      state.streamerLevels.overlayPending = false;
       if (data.result?.ok === false || data.result?.error) {
+        state.streamerLevels.overlayPending = false;
+        state.streamerLevels.overlayDesired = streamerOverlayEnabled(state.live);
+        saveStreamerLevels();
         appendEvent({
           ts: new Date().toISOString(),
           type: "ui_error",
@@ -3628,7 +3636,7 @@ window.addEventListener("DOMContentLoaded", () => {
     state.streamerView.directLoaded = false;
     state.streamerView.directSrc = "";
     ensureStreamerLevelsLiveLoop();
-    renderFrame("streamer", state.live?.frames?.streamer);
+    renderFrame("streamer", state.streamerLevels.snapshotFrame || state.live?.frames?.streamer);
   });
   if (streamerViewer) {
     streamerViewer.addEventListener("wheel", (event) => {
@@ -5425,9 +5433,12 @@ function applyLiveFrame(data) {
   const visualizer = String(data?.visualizer || "").trim();
   const frame = data?.frame;
   if (!visualizer || !frame) return;
-  if (visualizer === "streamer" && state.streamerView.directActive && state.streamerView.directLoaded) return;
   if (!frameIsFreshForVisualizer(visualizer, frame, data.updated_at)) return;
   rememberFrameFreshness(visualizer, frame, data.updated_at);
+  if (visualizer === "streamer" && state.streamerView.directActive) {
+    cacheStreamerSnapshotFrame(frame);
+    return;
+  }
   const live = state.live && typeof state.live === "object" ? { ...state.live } : {};
   live.frames = { ...(live.frames || {}), [visualizer]: frame };
   live.updated_at = data.updated_at || live.updated_at || new Date().toISOString();
@@ -10849,13 +10860,6 @@ function streamerLevelsHasAdjustment() {
   return Number(levels.black) > 0 || Number(levels.white) < 255;
 }
 
-function streamerLevelsNeedsLoop() {
-  return Boolean(
-    state.streamerView.directActive
-    && (state.streamerLevels.panelOpen || state.streamerLevels.autoLive || streamerLevelsHasAdjustment())
-  );
-}
-
 function updateStreamerLevelsUi() {
   const black = $("streamerBlackLevel");
   const white = $("streamerWhiteLevel");
@@ -10912,13 +10916,70 @@ function resetStreamerLevels() {
   queueStreamerHistogramRefresh(true);
 }
 
-function streamerLevelsSourceKey(img = $("streamerFrame")) {
+function streamerSnapshotDemanded() {
+  return Boolean(
+    state.streamerView.directActive
+    && (state.streamerLevels.panelOpen || state.streamerLevels.autoLive || streamerLevelsHasAdjustment())
+  );
+}
+
+function syncStreamerSnapshotDemand(force = false) {
+  const enabled = streamerSnapshotDemanded();
+  if (!force && state.streamerLevels.snapshotDemand === enabled) return;
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  state.streamerLevels.snapshotDemand = enabled;
+  send({ type: "set_streamer_snapshot_demand", enabled });
+}
+
+function cacheStreamerSnapshotFrame(frame) {
+  const payload = frame?.result || frame;
+  const base64 = payload?.base64;
+  const mimeType = payload?.mime_type;
+  if (!base64 || !mimeType) return false;
+  state.streamerLevels.snapshotFrame = frame;
+  const key = String(
+    payload?.dashboard_live_sequence
+    || payload?.dashboard_live?.sequence
+    || `${base64.length}:${base64.slice(-32)}`
+  );
+  if (state.streamerLevels.snapshotLoadingKey || key === state.streamerLevels.snapshotSourceKey) return false;
+  const img = state.streamerLevels.snapshotImage || new Image();
+  state.streamerLevels.snapshotImage = img;
+  state.streamerLevels.snapshotLoadingKey = key;
+  img.onload = () => {
+    if (state.streamerLevels.snapshotLoadingKey !== key) return;
+    state.streamerLevels.snapshotLoadingKey = "";
+    state.streamerLevels.snapshotSourceKey = key;
+    if (state.streamerLevels.panelOpen || state.streamerLevels.autoLive) {
+      queueStreamerHistogramRefresh(true);
+    }
+    if (streamerLevelsHasAdjustment()) queueStreamerProcessedFrame();
+  };
+  img.onerror = () => {
+    if (state.streamerLevels.snapshotLoadingKey === key) state.streamerLevels.snapshotLoadingKey = "";
+  };
+  img.src = `data:${mimeType};base64,${base64}`;
+  return true;
+}
+
+function streamerLevelsSourceImage() {
+  if (state.streamerView.directActive) {
+    const snapshot = state.streamerLevels.snapshotImage;
+    return snapshot?.complete && snapshot.naturalWidth && snapshot.naturalHeight ? snapshot : null;
+  }
+  return $("streamerFrame");
+}
+
+function streamerLevelsSourceKey(img = streamerLevelsSourceImage()) {
   if (!img) return "";
+  const rawSource = img.currentSrc || img.src || "";
+  const source = rawSource.startsWith("data:")
+    ? `${rawSource.length}:${rawSource.slice(-32)}`
+    : rawSource;
   return [
-    img.currentSrc || img.src || "",
+    state.streamerView.directActive ? state.streamerLevels.snapshotSourceKey : source,
     img.naturalWidth || 0,
     img.naturalHeight || 0,
-    state.streamerView.directActive ? "direct" : "snapshot",
   ].join("|");
 }
 
@@ -10940,7 +11001,7 @@ function ensureStreamerOffscreenCanvas(kind = "source") {
 }
 
 function drawStreamerSourceFrame(maxEdge = 2048) {
-  const img = $("streamerFrame");
+  const img = streamerLevelsSourceImage();
   if (!img || !img.complete || !img.naturalWidth || !img.naturalHeight) return null;
   const { canvas, ctx } = ensureStreamerOffscreenCanvas("source");
   if (!ctx) return null;
@@ -10952,7 +11013,11 @@ function drawStreamerSourceFrame(maxEdge = 2048) {
   if (canvas.height !== height) canvas.height = height;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  ctx.drawImage(img, 0, 0, width, height);
+  try {
+    ctx.drawImage(img, 0, 0, width, height);
+  } catch {
+    return null;
+  }
   return {
     canvas,
     ctx,
@@ -11078,7 +11143,14 @@ function refreshStreamerHistogram(force = false) {
     return;
   }
   const { canvas, ctx, width, height, key } = frame;
-  const data = ctx.getImageData(0, 0, width, height).data;
+  let data;
+  try {
+    data = ctx.getImageData(0, 0, width, height).data;
+  } catch {
+    state.streamerLevels.histogram = null;
+    renderStreamerHistogram(null);
+    return;
+  }
   const bins = Array.from({ length: STREAMER_HISTOGRAM_BINS }, () => 0);
   const stride = Math.max(1, Math.floor(Math.max(width, height) / 128));
   let total = 0;
@@ -11124,7 +11196,15 @@ function queueStreamerHistogramRefresh(force = false) {
   requestAnimationFrame(() => {
     state.streamerLevels.histogramPending = false;
     refreshStreamerHistogram(force);
-    if (streamerLevelsHasAdjustment()) renderStreamerProcessedFrame();
+  });
+}
+
+function queueStreamerProcessedFrame() {
+  if (state.streamerLevels.renderQueued) return;
+  state.streamerLevels.renderQueued = true;
+  requestAnimationFrame(() => {
+    state.streamerLevels.renderQueued = false;
+    renderStreamerProcessedFrame();
   });
 }
 
@@ -11155,7 +11235,12 @@ function renderStreamerProcessedFrame() {
   });
   if (!ctx) return false;
   clampStreamerLevels();
-  const image = frame.ctx.getImageData(0, 0, frame.width, frame.height);
+  let image;
+  try {
+    image = frame.ctx.getImageData(0, 0, frame.width, frame.height);
+  } catch {
+    return false;
+  }
   const data = image.data;
   const black = Number(state.streamerLevels.black) || 0;
   const white = Number(state.streamerLevels.white) || 255;
@@ -11176,22 +11261,11 @@ function renderStreamerProcessedFrame() {
 }
 
 function ensureStreamerLevelsLiveLoop() {
-  if (!streamerLevelsNeedsLoop()) {
-    if (state.streamerLevels.liveRaf) {
-      cancelAnimationFrame(state.streamerLevels.liveRaf);
-      state.streamerLevels.liveRaf = null;
-    }
-    return;
-  }
-  if (state.streamerLevels.liveRaf) return;
-  const tick = () => {
+  if (state.streamerLevels.liveRaf) {
+    cancelAnimationFrame(state.streamerLevels.liveRaf);
     state.streamerLevels.liveRaf = null;
-    if (!streamerLevelsNeedsLoop()) return;
-    queueStreamerHistogramRefresh();
-    if (streamerLevelsHasAdjustment()) renderStreamerProcessedFrame();
-    state.streamerLevels.liveRaf = requestAnimationFrame(tick);
-  };
-  state.streamerLevels.liveRaf = requestAnimationFrame(tick);
+  }
+  syncStreamerSnapshotDemand();
 }
 
 function streamerMetaText(baseText) {
@@ -11321,11 +11395,19 @@ function updateStreamerOverlayControl(live = state.live) {
   if (!input) return;
   const status = typeof streamerStatusFromLive === "function" ? streamerStatusFromLive(live) : {};
   const source = typeof streamerSourceFromStatus === "function" ? streamerSourceFromStatus(status) : "";
-  if (state.streamerLevels.overlayPending && typeof status?.electrode_overlay === "boolean") {
+  const liveEnabled = typeof status?.electrode_overlay === "boolean"
+    ? Boolean(status.electrode_overlay)
+    : null;
+  if (state.streamerLevels.overlayPending && liveEnabled === state.streamerLevels.overlayDesired) {
     state.streamerLevels.overlayPending = false;
   }
+  if (!state.streamerLevels.overlayPending && liveEnabled !== null) {
+    state.streamerLevels.overlayDesired = liveEnabled;
+  }
   const desired = state.streamerLevels.overlayDesired;
-  input.checked = typeof desired === "boolean" ? desired : streamerOverlayEnabled(live);
+  input.checked = state.streamerLevels.overlayPending && typeof desired === "boolean"
+    ? desired
+    : liveEnabled ?? Boolean(desired);
   input.disabled = !source;
   input.title = source
     ? `Electrode overlay on ${source}`

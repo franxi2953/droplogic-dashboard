@@ -277,6 +277,7 @@ class DashboardCalibrationSession:
         self.previous_motion_params: dict[str, float] | None = None
         self.mode = "focus"
         self.selected_hole_id = self._first_input_hole_id()
+        self._uncaptured_input_holes: set[str] = set()
 
     @property
     def rows(self) -> int:
@@ -446,7 +447,9 @@ class DashboardCalibrationSession:
             index += 1
             hole = default_input_hole(side, index=index)
         holes.append(hole)
-        self.selected_hole_id = str(hole["id"])
+        hole_id = str(hole["id"])
+        self._uncaptured_input_holes.add(hole_id)
+        self.selected_hole_id = hole_id
         self.status_message = f"Created {hole['id']}"
         return self.state()
 
@@ -455,6 +458,7 @@ class DashboardCalibrationSession:
         if selected is None:
             return self.state(error="No input hole selected.")
         holes = self.input_holes()
+        self._uncaptured_input_holes.discard(str(selected.get("id") or ""))
         holes[:] = [hole for hole in holes if hole is not selected]
         self.selected_hole_id = self._first_input_hole_id()
         self.status_message = "Deleted selected hole"
@@ -481,8 +485,12 @@ class DashboardCalibrationSession:
                     continue
                 if str(hole.get("id") or "").strip() == clean_id:
                     return self.state(error=f"Input hole id {clean_id!r} already exists.")
+            previous_id = str(selected.get("id") or "")
             selected["id"] = clean_id
             self.selected_hole_id = clean_id
+            if previous_id in self._uncaptured_input_holes:
+                self._uncaptured_input_holes.discard(previous_id)
+                self._uncaptured_input_holes.add(clean_id)
         if side is not None:
             selected["side"] = str(side).strip().lower() or "left"
         if role is not None:
@@ -499,7 +507,10 @@ class DashboardCalibrationSession:
         electrode = self.stage_position_to_electrode(position)
         if electrode is None:
             return self.state(error="Could not convert stage position to an electrode coordinate.")
-        bounds = self.input_hole_bounds(selected)
+        uncaptured_holes = getattr(self, "_uncaptured_input_holes", set())
+        selected_id = str(selected.get("id") or "")
+        first_capture = selected_id in uncaptured_holes
+        bounds = None if first_capture else self.input_hole_bounds(selected)
         if bounds is None:
             bounds = {
                 "row_min": int(electrode["row"]),
@@ -518,6 +529,8 @@ class DashboardCalibrationSession:
             bounds["column_max"] = point_col
         else:
             return self.state(error=f"Unsupported endpoint {endpoint!r}.")
+        if first_capture:
+            uncaptured_holes.discard(selected_id)
         normalized = {
             "row_min": min(bounds["row_min"], bounds["row_max"]),
             "row_max": max(bounds["row_min"], bounds["row_max"]),

@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.modules.setdefault("httpx", types.ModuleType("httpx"))
 from backend.live_snapshot import (
@@ -17,6 +18,33 @@ from backend.live_snapshot import (
 
 class FakeLiveSnapshot(LiveSnapshotMixin):
     pass
+
+
+class StreamerSnapshotLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_stream_skips_unrequested_snapshots(self) -> None:
+        class RunningOnce:
+            checks = 0
+
+            @property
+            def running(self) -> bool:
+                self.checks += 1
+                return self.checks == 1
+
+        async def fail_collect() -> dict[str, object]:
+            raise AssertionError("snapshot should not be captured")
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        app = FakeLiveSnapshot()
+        app.mcp = RunningOnce()
+        app.config = SimpleNamespace(live_state_interval_seconds=1.0)
+        app._direct_stream_available = True
+        app._streamer_snapshot_clients = set()
+        app.collect_streamer_frame = fail_collect
+
+        with patch("backend.live_snapshot.asyncio.sleep", new=no_sleep):
+            await app.streamer_frame_loop()
 
 
 class LiveSceneMergeTests(unittest.TestCase):
