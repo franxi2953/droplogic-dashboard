@@ -236,6 +236,7 @@ class ContextCompactionPolicyTests(unittest.TestCase):
                 "agent-guide/08-reservoir-extraction.md",
                 "agent-guide/09-execution-view-modes-diagnostics.md",
             ],
+            max_chars=40_000,
         )
 
         self.assertGreater(len(metadata), 0)

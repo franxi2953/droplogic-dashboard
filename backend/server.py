@@ -34,6 +34,7 @@ if __package__ in {None, ""}:
         goal_completion_missing_terms,
         goal_status_from_events,
         latest_goal_completion_blocker,
+        melting_goal_completion_blocker,
     )
     from backend.live_snapshot import LiveSnapshotMixin
     from backend.mcp_client import McpStdioClient
@@ -66,6 +67,7 @@ else:
         goal_completion_missing_terms,
         goal_status_from_events,
         latest_goal_completion_blocker,
+        melting_goal_completion_blocker,
     )
     from .live_snapshot import LiveSnapshotMixin
     from .mcp_client import McpStdioClient
@@ -89,6 +91,7 @@ else:
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 GOAL_COMPLETE_TOOL = "dashboard_complete_goal"
+GUIDE_CONTEXT_TOOL = "select_guide_context"
 DEFAULT_AGENT_FRAME_DELAY_SECONDS = 1.0
 DEFAULT_AGENT_EXECUTION_WAIT_SECONDS = 30.0
 DEFAULT_AGENT_PLANNING_WAIT_SECONDS = 15.0
@@ -139,6 +142,16 @@ FRONTEND_OMITTED_EVENT_TYPES = {
     "live_scene_error",
     "live_stream_error",
 }
+
+
+def exception_diagnostic(exc: BaseException) -> str:
+    """Return a useful local error string even for exceptions with an empty str()."""
+    detail = str(exc).strip()
+    if not detail:
+        detail = repr(exc).strip()
+    if not detail:
+        detail = "no exception detail was provided"
+    return f"{type(exc).__name__}: {detail}"
 
 
 class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
@@ -573,7 +586,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         shards = self.available_guide_shards()
         if not shards:
             return {"paths": [], "reason": "no guide shards available", "catalog_count": 0}
-        selector_prompt = prompt
+        selector_prompt = (
+            f"{prompt}\n\n"
+            f"The selected detailed guide files must fit within {GUIDE_EXPANSION_CHAR_LIMIT} total characters. "
+            "Use the catalog char counts and select the smallest complete set for the next turn."
+        )
         if goal.get("status") == "active" and goal.get("objective"):
             selector_prompt = f"{prompt}\n\nActive goal:\n{goal.get('objective')}"
         try:
@@ -1277,6 +1294,22 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
 
     async def handle_ws(self, websocket: Any) -> None:
         self.clients.add(websocket)
+        message_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        async def process_messages() -> None:
+            while True:
+                message = await message_queue.get()
+                if message is None:
+                    return
+                try:
+                    await self.handle_message(websocket, message)
+                except Exception as exc:
+                    if websocket_closed_ok(exc):
+                        return
+                    event = await self.record("ui_error", level="error", message=str(exc))
+                    await self.safe_send(websocket, {"type": "event", "event": event})
+
+        message_task = asyncio.create_task(process_messages())
         try:
             await websocket.send(json.dumps({"type": "status", "status": self.status()}))
             await self.safe_send(websocket, self.run_loaded_payload())
@@ -1286,15 +1319,25 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             async for raw in websocket:
                 try:
                     message = json.loads(raw)
-                    await self.handle_message(websocket, message)
+                    if message.get("type") == "get_status":
+                        await self.safe_send(websocket, {"type": "status", "status": self.status()})
+                    else:
+                        await message_queue.put(message)
                 except Exception as exc:
                     if websocket_closed_ok(exc):
                         break
                     event = await self.record("ui_error", level="error", message=str(exc))
-                    await websocket.send(json.dumps({"type": "event", "event": event}))
+                    await self.safe_send(websocket, {"type": "event", "event": event})
         finally:
+            await message_queue.put(None)
+            if not message_task.done():
+                message_task.cancel()
+            try:
+                await message_task
+            except asyncio.CancelledError:
+                pass
             self.clients.discard(websocket)
-            self._streamer_snapshot_clients.discard(websocket)
+            getattr(self, "_streamer_snapshot_clients", set()).discard(websocket)
             self._client_send_locks.pop(websocket, None)
 
     async def handle_live_ws(self, websocket: Any) -> None:
@@ -3061,6 +3104,361 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             }
         ]
 
+    @staticmethod
+    def required_guide_context_paths(tool: str, arguments: dict[str, Any]) -> list[str]:
+        """Return detailed guides that must be loaded before specialized MCP actions."""
+        if tool == "start_melting_curve_capture":
+            return [
+                "agent-guide/10-imaging-light-vision.md",
+                "agent-guide/11-temperature.md",
+            ]
+        if tool in {"temperature_hold", "start_temperature_routine"}:
+            return ["agent-guide/11-temperature.md"]
+        if tool in {"capture_droplet_images", "inspect_droplet_images"}:
+            return ["agent-guide/10-imaging-light-vision.md"]
+        if tool == "set_execution_view_mode" and arguments.get("mode") == "whole_chip_camera":
+            return ["agent-guide/09-execution-view-modes-diagnostics.md"]
+        if (
+            tool == "execute_segment_to_breakpoint"
+            and arguments.get("execution_view_mode") == "whole_chip_camera"
+        ):
+            return ["agent-guide/09-execution-view-modes-diagnostics.md"]
+        return []
+
+    def guide_context_guard_result(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        guide_context_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        required = self.required_guide_context_paths(tool, arguments)
+        loaded = set(guide_context_state.get("paths") or [])
+        missing = [path for path in required if path not in loaded]
+        if not missing:
+            return None
+        return {
+            "ok": False,
+            "isError": True,
+            "error": (
+                "Required detailed guide context is not loaded for this specialized operation. "
+                "Call select_guide_context with the missing paths, then continue on the next reasoning turn."
+            ),
+            "tool": tool,
+            "required_guide_paths": required,
+            "loaded_guide_paths": list(guide_context_state.get("paths") or []),
+            "missing_guide_paths": missing,
+        }
+
+    def melting_capture_workflow_required(self, prompt: str = "") -> bool:
+        goal = self.goal_status()
+        text = "\n".join([str(prompt or ""), str(goal.get("objective") or "")]).lower()
+        return "melting" in text and any(
+            marker in text for marker in ("brightfield", "fam", "image", "imaging", "capture")
+        )
+
+    def melting_capture_workflow_guard_result(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        prompt: str = "",
+    ) -> dict[str, Any] | None:
+        """Prevent temperature-only or visualizer-only substitutes for image-based melting."""
+        if not self.melting_capture_workflow_required(prompt):
+            return None
+        if tool in {"temperature_hold", "start_temperature_routine"}:
+            return {
+                "ok": False,
+                "isError": True,
+                "error": (
+                    "This melting objective requires real per-step microscope images. "
+                    "A temperature-only routine cannot satisfy it; start the integrated melting capture workflow."
+                ),
+                "tool": tool,
+                "required_tool": "start_melting_curve_capture",
+            }
+        if tool == "plan_activation_frame" and arguments.get("event_type") == "temperature_checkpoint":
+            return {
+                "ok": False,
+                "isError": True,
+                "error": (
+                    "Temperature checkpoint plan frames are not physical temperature or microscope measurements. "
+                    "Use the integrated melting capture workflow instead."
+                ),
+                "tool": tool,
+                "required_tool": "start_melting_curve_capture",
+            }
+        return None
+
+    async def ensure_required_guide_context(
+        self,
+        guide_context_state: dict[str, Any],
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        trigger_round: int | None,
+    ) -> dict[str, Any] | None:
+        """Load deterministic per-tool guide requirements before an MCP call."""
+        required = self.required_guide_context_paths(tool, arguments)
+        loaded = set(guide_context_state.get("paths") or [])
+        missing = [path for path in required if path not in loaded]
+        if not missing:
+            return None
+
+        previous = list(guide_context_state.get("paths") or [])
+        reason = f"Required guide context for {tool}."
+        try:
+            raw_result = await self.call_agent_mcp_tool(
+                GUIDE_CONTEXT_TOOL,
+                {"paths": required, "reason": reason},
+            )
+            result = compact_tool_payload(mark_failed_mcp_payload(raw_result))
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc), "isError": True}
+
+        if not isinstance(result, dict) or not result.get("ok"):
+            error = result.get("error") if isinstance(result, dict) else "Invalid MCP guide-selection result."
+            await self.record(
+                "guide_context_selection_failed",
+                level="warning",
+                internal=True,
+                source="tool_requirement",
+                trigger_tool=tool,
+                trigger_round=trigger_round,
+                required_paths=required,
+                missing_paths=missing,
+                selector_error=error,
+                fallback_paths=previous,
+            )
+            return {
+                "ok": False,
+                "isError": True,
+                "error": f"Unable to load required guide context for {tool}: {error}",
+                "tool": tool,
+                "required_guide_paths": required,
+                "loaded_guide_paths": previous,
+                "missing_guide_paths": missing,
+            }
+
+        selected = result.get("selected_paths")
+        if not isinstance(selected, list) or not all(isinstance(path, str) for path in selected):
+            return {
+                "ok": False,
+                "isError": True,
+                "error": f"MCP returned no usable guide selection for required tool {tool}.",
+                "tool": tool,
+                "required_guide_paths": required,
+                "loaded_guide_paths": previous,
+                "missing_guide_paths": missing,
+            }
+
+        _, guide_metadata = self.load_turn_guide_expansions(selected)
+        capacity_error = self.guide_selection_capacity_result(result, guide_metadata)
+        if capacity_error is not None:
+            await self.record(
+                "guide_context_selection_failed",
+                level="warning",
+                internal=True,
+                source="tool_requirement",
+                trigger_tool=tool,
+                trigger_round=trigger_round,
+                required_paths=required,
+                missing_paths=missing,
+                selected_paths=selected,
+                selector_error=capacity_error["error"],
+                omitted_guide_paths=capacity_error["omitted_guide_paths"],
+                fallback_paths=previous,
+            )
+            return capacity_error
+
+        effective_paths = self.effective_guide_paths(guide_metadata)
+        missing_effective = [path for path in required if path not in effective_paths]
+        if missing_effective:
+            return {
+                "ok": False,
+                "isError": True,
+                "error": f"Required guides for {tool} were not included in the next-turn context.",
+                "tool": tool,
+                "required_guide_paths": required,
+                "loaded_guide_paths": effective_paths,
+                "missing_guide_paths": missing_effective,
+            }
+
+        guide_context_state["paths"] = effective_paths
+        guide_context_state["reason"] = str(result.get("reason") or reason)
+        guide_context_state["revision"] = int(result.get("revision") or guide_context_state.get("revision", 0) + 1)
+        event_type = "guide_context_selected" if not previous else "guide_context_changed"
+        await self.record(
+            event_type,
+            internal=True,
+            source="tool_requirement",
+            trigger_tool=tool,
+            trigger_round=trigger_round,
+            required_paths=required,
+            missing_paths=missing,
+            selected_paths=selected,
+            effective_paths=effective_paths,
+            previous_paths=previous,
+            reason=guide_context_state["reason"],
+            revision=guide_context_state["revision"],
+            **guide_metadata,
+        )
+        return None
+
+    @staticmethod
+    def effective_guide_paths(guide_metadata: dict[str, Any]) -> list[str]:
+        """Return only guide shards that were actually included in the model context."""
+        paths: list[str] = []
+        for item in guide_metadata.get("files") or []:
+            if not isinstance(item, dict) or item.get("omitted"):
+                continue
+            path = str(item.get("path") or "").strip()
+            if path and path not in paths:
+                paths.append(path)
+        return paths
+
+    @classmethod
+    def guide_selection_capacity_result(
+        cls,
+        result: dict[str, Any],
+        guide_metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reject a selection that cannot be delivered in full to the next model turn."""
+        omitted = [
+            str(item.get("path") or "")
+            for item in guide_metadata.get("files") or []
+            if isinstance(item, dict) and item.get("omitted")
+        ]
+        if not omitted:
+            return None
+        return {
+            "ok": False,
+            "isError": True,
+            "error": (
+                "Guide selection exceeds the next-turn expansion capacity. None of the selection was applied. "
+                "Choose a smaller set of one to five detailed shards that includes the guides needed next."
+            ),
+            "selected_paths": list(result.get("selected_paths") or []),
+            "omitted_guide_paths": omitted,
+            "effective_guide_paths": cls.effective_guide_paths(guide_metadata),
+            "required_tool": GUIDE_CONTEXT_TOOL,
+        }
+
+    async def refresh_agent_guide_context(
+        self,
+        guide_context_state: dict[str, Any],
+        prompt: str,
+        *,
+        trigger_tool: str | None,
+        trigger_round: int | None,
+        on_retry: Any,
+        on_context_compacted: Any,
+    ) -> bool:
+        """Run the guide-selector model out of band and apply its MCP context update."""
+        events = self.recorder.events_for_run(self.recorder.run_id)
+        goal = self.goal_status()
+        selection = await self.select_turn_guide_shards(
+            prompt,
+            goal,
+            events,
+            on_retry,
+            on_context_compacted,
+        )
+        requested_paths = list(selection.get("paths") or [])
+        if not requested_paths:
+            await self.record(
+                "guide_context_selection_failed",
+                level="warning",
+                internal=True,
+                trigger_tool=trigger_tool,
+                trigger_round=trigger_round,
+                selector_reason=selection.get("reason"),
+                selector_error=selection.get("error") or "Guide selector returned no detailed guide paths.",
+                fallback_paths=list(guide_context_state.get("paths") or []),
+            )
+            return False
+
+        try:
+            await self.ensure_mcp_started_for_tool(via="guide_selector", tool=GUIDE_CONTEXT_TOOL)
+            raw_result = await self.call_agent_mcp_tool(
+                GUIDE_CONTEXT_TOOL,
+                {
+                    "paths": requested_paths,
+                    "reason": str(selection.get("reason") or "Automatic next-turn guide selection."),
+                },
+            )
+            result = compact_tool_payload(mark_failed_mcp_payload(raw_result))
+        except Exception as exc:
+            result = {"ok": False, "error": str(exc), "isError": True}
+
+        if not isinstance(result, dict) or not result.get("ok"):
+            await self.record(
+                "guide_context_selection_failed",
+                level="warning",
+                internal=True,
+                trigger_tool=trigger_tool,
+                trigger_round=trigger_round,
+                selected_paths=requested_paths,
+                selector_reason=selection.get("reason"),
+                selector_error=(result or {}).get("error") if isinstance(result, dict) else "Invalid MCP selection result.",
+                fallback_paths=list(guide_context_state.get("paths") or []),
+            )
+            return False
+
+        selected = result.get("selected_paths")
+        if not isinstance(selected, list) or not all(isinstance(path, str) for path in selected):
+            await self.record(
+                "guide_context_selection_failed",
+                level="warning",
+                internal=True,
+                trigger_tool=trigger_tool,
+                trigger_round=trigger_round,
+                selected_paths=requested_paths,
+                selector_reason=selection.get("reason"),
+                selector_error="MCP returned no usable selected_paths.",
+                fallback_paths=list(guide_context_state.get("paths") or []),
+            )
+            return False
+
+        _, guide_metadata = self.load_turn_guide_expansions(selected)
+        capacity_error = self.guide_selection_capacity_result(result, guide_metadata)
+        if capacity_error is not None:
+            await self.record(
+                "guide_context_selection_failed",
+                level="warning",
+                internal=True,
+                trigger_tool=trigger_tool,
+                trigger_round=trigger_round,
+                selected_paths=selected,
+                selector_reason=selection.get("reason"),
+                selector_error=capacity_error["error"],
+                omitted_guide_paths=capacity_error["omitted_guide_paths"],
+                fallback_paths=list(guide_context_state.get("paths") or []),
+            )
+            return False
+
+        effective_paths = self.effective_guide_paths(guide_metadata)
+        previous = list(guide_context_state.get("paths") or [])
+        guide_context_state["paths"] = effective_paths
+        guide_context_state["reason"] = str(result.get("reason") or selection.get("reason") or "")
+        guide_context_state["revision"] = int(result.get("revision") or guide_context_state.get("revision", 0) + 1)
+        event_type = "guide_context_selected" if not previous else "guide_context_changed"
+        await self.record(
+            event_type,
+            internal=True,
+            source="separate_guide_selector",
+            trigger_tool=trigger_tool,
+            trigger_round=trigger_round,
+            selected_paths=selected,
+            effective_paths=effective_paths,
+            previous_paths=previous,
+            reason=guide_context_state["reason"],
+            revision=guide_context_state["revision"],
+            selector_reason=selection.get("reason"),
+            catalog_count=selection.get("catalog_count"),
+            **guide_metadata,
+        )
+        return True
+
     async def complete_goal_from_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         goal = self.goal_status()
         if goal.get("status") != "active" or not goal.get("objective"):
@@ -3069,8 +3467,10 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         evidence = str(arguments.get("evidence") or "").strip()
         if not summary:
             return {"ok": False, "error": "summary is required.", "isError": True}
-        blocker = latest_goal_completion_blocker(
-            self.recorder.events_for_run(self.recorder.run_id)
+        events = self.recorder.events_for_run(self.recorder.run_id)
+        blocker = latest_goal_completion_blocker(events) or melting_goal_completion_blocker(
+            str(goal.get("objective") or ""),
+            events,
         )
         missing_terms = goal_completion_missing_terms(
             str(goal.get("objective") or ""),
@@ -3238,8 +3638,71 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             tools_result = await self.mcp.list_tools()
             tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
             tools = filter_agent_tools(tools)
+            guide_context_state: dict[str, Any] = {
+                "paths": [],
+                "reason": "",
+                "revision": 0,
+                "last_request_paths": [],
+                "active_round": None,
+            }
 
             async def logged_tool_call(tool: str, arguments: dict[str, Any]) -> Any:
+                if tool == GUIDE_CONTEXT_TOOL:
+                    call_event = await self.record(
+                        "mcp_tool_call",
+                        tool=tool,
+                        arguments=arguments,
+                        via="agent",
+                    )
+                    try:
+                        await self.ensure_mcp_started_for_tool(via="agent", tool=tool)
+                        raw_result = await self.call_agent_mcp_tool(tool, arguments)
+                        raw_result = mark_failed_mcp_payload(raw_result)
+                        result = compact_tool_payload(raw_result)
+                        if not isinstance(result, dict):
+                            result = {"ok": False, "error": "MCP returned an invalid guide selection payload.", "isError": True}
+                        selected = result.get("selected_paths") if result.get("ok") else None
+                        if isinstance(selected, list) and all(isinstance(path, str) for path in selected):
+                            _, guide_metadata = self.load_turn_guide_expansions(selected)
+                            capacity_error = self.guide_selection_capacity_result(result, guide_metadata)
+                            if capacity_error is not None:
+                                result = capacity_error
+                            else:
+                                effective_paths = self.effective_guide_paths(guide_metadata)
+                                previous = list(guide_context_state["paths"])
+                                guide_context_state["paths"] = effective_paths
+                                guide_context_state["reason"] = str(result.get("reason") or "")
+                                guide_context_state["revision"] = int(
+                                    result.get("revision") or guide_context_state["revision"] + 1
+                                )
+                                await self.record(
+                                    "guide_context_changed",
+                                    selected_paths=selected,
+                                    effective_paths=effective_paths,
+                                    previous_paths=previous,
+                                    reason=guide_context_state["reason"],
+                                    revision=guide_context_state["revision"],
+                                    call_event_id=call_event.get("t"),
+                                )
+                        context_update = result.get("context_update")
+                        if isinstance(context_update, dict) and "files" in context_update:
+                            result = dict(result)
+                            result["context_update"] = {
+                                key: value for key, value in context_update.items() if key != "files"
+                            }
+                    except Exception as exc:
+                        result = {"ok": False, "error": str(exc), "isError": True}
+                    await self.record(
+                        "mcp_tool_result",
+                        tool=tool,
+                        ok=bool(result.get("ok")),
+                        result=result,
+                        call_event_id=call_event.get("t"),
+                        via="agent",
+                        **tool_context_metrics(result),
+                    )
+                    return result
+
                 if tool == GOAL_COMPLETE_TOOL:
                     call_event = await self.record(
                         "dashboard_tool_call",
@@ -3274,29 +3737,46 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     if mcp_auto_started and tool in MCP_STATEFUL_EXECUTION_TOOLS:
                         result = self.mcp_runtime_restarted_result(tool, via="agent")
                     else:
-                        guard_result = await self.mcp_health_guard_result(
+                        melting_workflow_guard = self.melting_capture_workflow_guard_result(
                             tool,
-                            via="agent",
-                            arguments=call_arguments,
+                            call_arguments,
+                            prompt,
                         )
-                        if guard_result is not None:
-                            result = guard_result
+                        if melting_workflow_guard is not None:
+                            result = melting_workflow_guard
                         else:
-                            if tool == "move_stage":
-                                await self.broadcast_stage_motion_start(
-                                    call_arguments,
-                                    source="agent",
-                                    call_event_id=call_event.get("t"),
-                                )
-                                stage_motion_invoked = True
-                            if tool == "verify_droplets":
-                                result = await self.call_verify_droplets_observed(
-                                    call_arguments,
-                                    source="agent",
-                                    call_event_id=call_event.get("t"),
-                                )
+                            guide_requirement_result = await self.ensure_required_guide_context(
+                                guide_context_state,
+                                tool,
+                                call_arguments,
+                                trigger_round=guide_context_state.get("active_round"),
+                            )
+                            if guide_requirement_result is not None:
+                                result = guide_requirement_result
                             else:
-                                result = await self.call_agent_mcp_tool(tool, call_arguments)
+                                health_guard_result = await self.mcp_health_guard_result(
+                                    tool,
+                                    via="agent",
+                                    arguments=call_arguments,
+                                )
+                                if health_guard_result is not None:
+                                    result = health_guard_result
+                                else:
+                                    if tool == "move_stage":
+                                        await self.broadcast_stage_motion_start(
+                                            call_arguments,
+                                            source="agent",
+                                            call_event_id=call_event.get("t"),
+                                        )
+                                        stage_motion_invoked = True
+                                    if tool == "verify_droplets":
+                                        result = await self.call_verify_droplets_observed(
+                                            call_arguments,
+                                            source="agent",
+                                            call_event_id=call_event.get("t"),
+                                        )
+                                    else:
+                                        result = await self.call_agent_mcp_tool(tool, call_arguments)
                     tool_total_seconds = time.monotonic() - tool_started
                     result = mark_failed_mcp_payload(result)
                     if tool == "move_stage" and stage_motion_invoked:
@@ -3341,6 +3821,14 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                         call_event_id=call_event.get("t"),
                         via="agent",
                     )
+                    await self.refresh_agent_guide_context(
+                        guide_context_state,
+                        prompt,
+                        trigger_tool=tool,
+                        trigger_round=guide_context_state.get("active_round"),
+                        on_retry=logged_provider_retry,
+                        on_context_compacted=logged_context_compaction,
+                    )
                     return model_result
                 except asyncio.CancelledError:
                     raise
@@ -3361,6 +3849,14 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                         call_event_id=call_event.get("t"),
                         via="agent",
                     )
+                    await self.refresh_agent_guide_context(
+                        guide_context_state,
+                        prompt,
+                        trigger_tool=tool,
+                        trigger_round=guide_context_state.get("active_round"),
+                        on_retry=logged_provider_retry,
+                        on_context_compacted=logged_context_compaction,
+                    )
                     return {"error": str(exc), "isError": True}
 
             async def logged_reasoning(text: str, round_index: int) -> None:
@@ -3370,7 +3866,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 await self.record("agent_message", text=text, round=round_index)
 
             async def logged_model_response(metrics: dict[str, Any]) -> None:
+                guide_context_state["active_round"] = metrics.get("round")
                 metrics["ai_profile"] = self.ai.status().get("profile")
+                metrics["guide_paths"] = list(guide_context_state["last_request_paths"])
+                metrics["guide_context_revision"] = guide_context_state["revision"]
+                metrics["guide_context_source"] = "separate_guide_selector"
                 await self.record("agent_model_response", **metrics)
 
             async def logged_provider_retry(details: dict[str, Any]) -> None:
@@ -3403,27 +3903,13 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
 
             goal = self.goal_status()
             pinned_context, pinned_context_metadata = self.load_pinned_context()
-            guide_selection = await self.select_turn_guide_shards(
+            await self.refresh_agent_guide_context(
+                guide_context_state,
                 prompt,
-                goal,
-                model_context.events,
-                logged_provider_retry,
-                logged_context_compaction,
-            )
-            guide_context, guide_metadata = self.load_turn_guide_expansions(guide_selection.get("paths") or [])
-            if guide_context:
-                pinned_context = f"{pinned_context}\n\n{guide_context}" if pinned_context else guide_context
-            await self.record(
-                "guide_context_selected",
-                message=(
-                    "Turn-scoped detailed guide shards selected before the agent call. "
-                    "These guide expansions are not retained across future turns."
-                ),
-                selected_paths=guide_selection.get("paths") or [],
-                selector_reason=guide_selection.get("reason"),
-                selector_error=guide_selection.get("error"),
-                catalog_count=guide_selection.get("catalog_count"),
-                **guide_metadata,
+                trigger_tool=None,
+                trigger_round=None,
+                on_retry=logged_provider_retry,
+                on_context_compacted=logged_context_compaction,
             )
             goal_context = self.goal_pinned_context(goal)
             if goal_context:
@@ -3441,12 +3927,36 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 **pinned_context_metadata,
             )
 
+            def current_pinned_context() -> str:
+                active_guide_context, active_guide_metadata = self.load_turn_guide_expansions(guide_context_state["paths"])
+                guide_context_state["paths"] = self.effective_guide_paths(active_guide_metadata)
+                guide_context_state["last_request_paths"] = list(guide_context_state["paths"])
+                if not active_guide_context:
+                    return pinned_context
+                context = f"{pinned_context}\n\n{active_guide_context}" if pinned_context else active_guide_context
+                return context
+
+            active_profile = self.ai.status().get("profile")
+            profile_id = str(
+                active_profile.get("id") if isinstance(active_profile, dict) else self.config.ai.active_profile or "responses"
+            )
+            response_context_path = (
+                self.recorder.run_dir
+                / "artifacts"
+                / "model_context"
+                / "responses"
+                / f"{safe_filename(profile_id)}.json"
+            )
             response = await self.ai.ask_with_tools(
                 prompt,
                 model_context.events,
                 tools,
                 logged_tool_call,
-                pinned_context=pinned_context,
+                pinned_context=current_pinned_context,
+                response_session_key=f"{self.recorder.run_id}:{profile_id}",
+                response_session_path=response_context_path,
+                response_session_profile_id=profile_id,
+                response_context_max_chars=self.config.ai.max_context_chars,
                 on_reasoning=logged_reasoning,
                 on_text=logged_text,
                 on_model_response=logged_model_response,
@@ -3454,6 +3964,16 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 max_tool_output_chars=self.config.ai.max_tool_output_chars,
                 on_context_compacted=logged_context_compaction,
             )
+            response_context = response.get("response_context")
+            if isinstance(response_context, dict) and response_context.get("enabled"):
+                context_event_type = "response_context_reset" if response_context.get("reset_reason") else "response_context_updated"
+                await self.record(
+                    context_event_type,
+                    internal=True,
+                    level="warning" if response_context.get("reset_reason") else "info",
+                    artifact_path=str(response_context_path.relative_to(self.recorder.run_dir)),
+                    **response_context,
+                )
             text = str(response.get("text", ""))
             recent_events = self.recorder.events_for_run(self.recorder.run_id, limit=20)
             already_emitted = any(
@@ -3473,9 +3993,17 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         except Exception as exc:
             if websocket_closed_ok(exc):
                 return
-            event = await self.record("agent_response", level="error", error=str(exc))
-            await self.record("agent_finished", level="error", message=str(exc))
-            await self.safe_send(websocket, {"type": "agent_result", "event": event, "text": str(exc)})
+            diagnostic = exception_diagnostic(exc)
+            message = f"Agent failed before completing the request: {diagnostic}"
+            event = await self.record(
+                "agent_response",
+                level="error",
+                error=message,
+                error_type=type(exc).__name__,
+                error_repr=repr(exc),
+            )
+            await self.record("agent_finished", level="error", message=message)
+            await self.safe_send(websocket, {"type": "agent_result", "event": event, "text": message})
         finally:
             if self._agent_task is current_task:
                 self._agent_task = None
@@ -3902,6 +4430,44 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if call_arguments.get("planning_timeout") is None:
                 call_arguments["planning_timeout"] = 120.0
                 overrides["planning_timeout"] = 120.0
+        if tool == "capture_droplet_images" and call_arguments.get("capture_source") != "pause_streamer":
+            requested_source = call_arguments.get("capture_source")
+            call_arguments["capture_source"] = "pause_streamer"
+            overrides["capture_source"] = {
+                "from": requested_source,
+                "to": "pause_streamer",
+                "reason": "Persisted microscope images acquire directly to avoid live-stream camera-handle contention.",
+            }
+        if tool == "start_melting_curve_capture" and self.melting_capture_workflow_required(prompt):
+            if call_arguments.get("capture_mode") != "droplets":
+                requested_mode = call_arguments.get("capture_mode")
+                call_arguments["capture_mode"] = "droplets"
+                overrides["capture_mode"] = {
+                    "from": requested_mode,
+                    "to": "droplets",
+                    "reason": "Per-step Brightfield and FAM evidence requires microscope droplet capture.",
+                }
+            channels = call_arguments.get("channels")
+            channel_names = {
+                str(channel.get("channel") if isinstance(channel, dict) else channel).strip().lower()
+                for channel in channels
+            } if isinstance(channels, list) else set()
+            required_channels = {"brightfield", "fam"}
+            if not required_channels.issubset(channel_names):
+                call_arguments["channels"] = ["Brightfield", "FAM"]
+                overrides["channels"] = {
+                    "from": channels,
+                    "to": ["Brightfield", "FAM"],
+                    "reason": "The melting objective requires both microscope channels at every temperature step.",
+                }
+            if call_arguments.get("capture_source") != "pause_streamer":
+                requested_source = call_arguments.get("capture_source")
+                call_arguments["capture_source"] = "pause_streamer"
+                overrides["capture_source"] = {
+                    "from": requested_source,
+                    "to": "pause_streamer",
+                    "reason": "Direct microscope capture avoids contention with the live streamer camera handle.",
+                }
         if tool == "execution_status_summary":
             for key, reason in {
                 "include_visualizers": "Use visualizer_status only when visualizer metadata is specifically needed.",

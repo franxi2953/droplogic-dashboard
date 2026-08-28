@@ -114,7 +114,21 @@ class McpStdioClient:
         if self._session is None:
             raise RuntimeError("MCP server is not running.")
         async with self._exclusive_call_lock:
-            result = await self._session.list_tools()
+            try:
+                result = await self._session.list_tools()
+            except Exception as first_error:
+                # A just-reconnected stdio channel can reject one catalog request while
+                # remaining usable. Retry once on the same session; never restart MCP
+                # here because it may own live hardware state.
+                await asyncio.sleep(0.1)
+                try:
+                    result = await self._session.list_tools()
+                except Exception as retry_error:
+                    raise RuntimeError(
+                        "MCP tool catalog request failed twice; the MCP connection may be stale. "
+                        f"first={type(first_error).__name__}({first_error!r}), "
+                        f"retry={type(retry_error).__name__}({retry_error!r})"
+                    ) from retry_error
         return mcp_result_to_json(result)
 
 

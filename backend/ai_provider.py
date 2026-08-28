@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import re
 import json
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -30,11 +33,167 @@ RECENT_INPUT_TOOL_RESULT_WINDOW = 8
 MAX_ACTIVE_TOOL_OUTPUT_CHARS = 2_500
 MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS = 6_000
 MIN_ACTIVE_TOOL_OUTPUT_CHARS = 500
+RESPONSE_CONTEXT_SCHEMA_VERSION = 1
+MAX_RESPONSE_CONTEXT_CHARS = 100_000
+MIN_RESPONSE_CONTEXT_CHARS = 20_000
+DASHBOARD_CONTEXT_PREFIX = "Curated dashboard event log JSON for model context:\n"
+DASHBOARD_AGENT_INSTRUCTIONS = (
+    "You are the DropLogic Dashboard agent controlling BoxMini through MCP tools. "
+    "When the user asks for an action, call the appropriate MCP tools and execute it; "
+    "do not merely propose steps. Use the event log to avoid repeating completed work. "
+    "For hardware actions, proceed carefully, report errors, and do not claim success "
+    "unless the tool result confirms it. Keep user-facing narration brief, but use the "
+    "available tool calls to make real progress. Continue tool-use until the requested "
+    "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
+    "Do not query status after every action; when fresh live state is needed, prefer "
+    "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
+    "If execute_segment_to_breakpoint starts a background wait, call "
+    "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
+    "repeated immediate status calls. If background planning is running, call "
+    "planning_job_status once and wait for its returned result instead of polling in a tight loop."
+)
+
+
+@dataclass
+class ResponseContextSession:
+    """Opaque Responses items that must round-trip across dashboard prompts."""
+
+    profile_id: str
+    model: str
+    items: list[dict[str, Any]]
+    path: Path | None = None
+    revision: int = 0
+    last_response_id: str | None = None
+    loaded_from_disk: bool = False
+
+
+def response_context_char_limit(max_context_chars: int | None) -> int:
+    """Reserve room for current state, guides, instructions, and tool schemas."""
+
+    try:
+        configured = int(max_context_chars or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    available = configured - 150_000 if configured else MAX_RESPONSE_CONTEXT_CHARS
+    return max(MIN_RESPONSE_CONTEXT_CHARS, min(MAX_RESPONSE_CONTEXT_CHARS, available))
+
+
+def is_dashboard_context_input(item: dict[str, Any]) -> bool:
+    return (
+        item.get("role") == "user"
+        and isinstance(item.get("content"), str)
+        and item["content"].startswith(DASHBOARD_CONTEXT_PREFIX)
+    )
+
+
+def dashboard_user_request(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if not isinstance(content, str):
+        return ""
+    marker = "\n\nUser request:\n"
+    _, separator, request = content.partition(marker)
+    return request.strip() if separator else ""
+
+
+def response_context_items(
+    input_list: list[dict[str, Any]],
+    data: dict[str, Any],
+    retain_dashboard_user_requests: bool = False,
+) -> list[dict[str, Any]]:
+    """Keep provider output/tool pairs, but replace prior bulky dashboard snapshots.
+
+    A fresh authoritative event/state snapshot is supplied with each user prompt. The
+    retained output items carry the encrypted reasoning, assistant phase, and tool-call
+    identity needed by the Responses API for continuity.
+    """
+
+    items = []
+    for item in input_list:
+        if not isinstance(item, dict):
+            continue
+        if is_dashboard_context_input(item):
+            if retain_dashboard_user_requests:
+                request = dashboard_user_request(item)
+                if request:
+                    items.append({"role": "user", "content": request})
+            continue
+        items.append(item)
+    items.extend(item for item in data.get("output", []) or [] if isinstance(item, dict))
+    return deepcopy(items)
+
+
+def load_response_context_session(
+    path: Path | None,
+    profile_id: str,
+    model: str,
+) -> ResponseContextSession:
+    session = ResponseContextSession(profile_id=profile_id, model=model, items=[], path=path)
+    if path is None or not path.exists():
+        return session
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return session
+    if not isinstance(payload, dict):
+        return session
+    if payload.get("schema_version") != RESPONSE_CONTEXT_SCHEMA_VERSION:
+        return session
+    if str(payload.get("profile_id") or "") != profile_id or str(payload.get("model") or "") != model:
+        return session
+    stored_items = payload.get("items")
+    if not isinstance(stored_items, list) or not all(isinstance(item, dict) for item in stored_items):
+        return session
+    session.items = stored_items
+    session.revision = int(payload.get("revision") or 0)
+    response_id = payload.get("last_response_id")
+    session.last_response_id = str(response_id) if response_id else None
+    session.loaded_from_disk = True
+    return session
+
+
+def save_response_context_session(session: ResponseContextSession) -> str | None:
+    if session.path is None:
+        return None
+    payload = {
+        "schema_version": RESPONSE_CONTEXT_SCHEMA_VERSION,
+        "profile_id": session.profile_id,
+        "model": session.model,
+        "revision": session.revision,
+        "last_response_id": session.last_response_id,
+        "items": session.items,
+    }
+    try:
+        session.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = session.path.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(payload, ensure_ascii=True, separators=(",", ":")), encoding="utf-8")
+        temporary_path.replace(session.path)
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return None
 
 
 class AiProvider:
     def __init__(self, config: AiConfig):
         self.config = config
+        self._response_context_sessions: dict[str, ResponseContextSession] = {}
+
+    def response_context_session(
+        self,
+        session_key: str | None,
+        session_path: str | Path | None,
+        profile_id: str | None,
+    ) -> ResponseContextSession | None:
+        if not session_key:
+            return None
+        expected_profile_id = str(profile_id or self.config.active_profile or self.config.model or "responses")
+        expected_model = str(self.config.model or "")
+        cached = self._response_context_sessions.get(session_key)
+        if cached and cached.profile_id == expected_profile_id and cached.model == expected_model:
+            return cached
+        path = Path(session_path) if session_path else None
+        session = load_response_context_session(path, expected_profile_id, expected_model)
+        self._response_context_sessions[session_key] = session
+        return session
 
     @property
     def configured(self) -> bool:
@@ -50,6 +209,10 @@ class AiProvider:
             "wire_api": self.config.wire_api,
             "reasoning_effort": self.config.reasoning_effort,
             "reasoning_summary": self.config.reasoning_summary,
+            "reasoning_context": self.config.reasoning_context,
+            "context_compaction_strategy": context_compaction_strategy(self.config),
+            "native_response_compaction_enabled": bool(self.config.native_response_compaction_enabled),
+            "native_response_compaction_threshold": self.config.native_response_compaction_threshold,
             "has_api_key": bool(self.config.api_key),
             "active_profile": self.config.active_profile,
             "profile": active_ai_profile_public(self.config),
@@ -123,7 +286,8 @@ class AiProvider:
                 }
             ],
         }
-        if self.config.reasoning_effort or self.config.reasoning_summary:
+        apply_response_context_options(payload, self.config)
+        if self.config.reasoning_effort or self.config.reasoning_summary or self.config.reasoning_context:
             apply_reasoning_options(payload, self.config)
         data = await self._post_response(payload, on_retry_compact=retry_payload_compactor(payload))
         return {
@@ -178,6 +342,7 @@ class AiProvider:
             apply_chat_options(chat_payload, self.config)
             data = await self._post_chat_completion(chat_payload, on_retry_compact=retry_payload_compactor(chat_payload))
             return sanitize_run_name(extract_chat_response_text(data))
+        apply_response_context_options(payload, self.config)
         data = await self._post_response(payload, on_retry_compact=retry_payload_compactor(payload))
         return sanitize_run_name(extract_response_text(data))
 
@@ -273,6 +438,7 @@ class AiProvider:
             if len(text) > max_chars:
                 text = f"{text[: max_chars - 200].rstrip()}\n\n[AI memory truncated to configured limit.]"
             return text
+        apply_response_context_options(payload, self.config)
         data = await self._post_response(
             payload,
             on_retry=on_retry,
@@ -351,6 +517,7 @@ class AiProvider:
                 "instructions": instructions,
                 "input": [{"role": "user", "content": content}],
             }
+            apply_response_context_options(payload, self.config)
             data = await self._post_response(
                 payload,
                 on_retry=on_retry,
@@ -367,6 +534,10 @@ class AiProvider:
         tools: list[dict[str, Any]],
         call_tool: Callable[[str, dict[str, Any]], Awaitable[Any]],
         pinned_context: str | None = None,
+        response_session_key: str | None = None,
+        response_session_path: str | Path | None = None,
+        response_session_profile_id: str | None = None,
+        response_context_max_chars: int | None = None,
         on_reasoning: Callable[[str, int], Awaitable[None]] | None = None,
         on_text: Callable[[str, int], Awaitable[None]] | None = None,
         on_model_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -411,32 +582,57 @@ class AiProvider:
             )
 
         context = json.dumps(events, ensure_ascii=True, default=str)
-        instructions = (
-            "You are the DropLogic Dashboard agent controlling BoxMini through MCP tools. "
-            "When the user asks for an action, call the appropriate MCP tools and execute it; "
-            "do not merely propose steps. Use the event log to avoid repeating completed work. "
-            "For hardware actions, proceed carefully, report errors, and do not claim success "
-            "unless the tool result confirms it. Keep user-facing narration brief, but use the "
-            "available tool calls to make real progress. Continue tool-use until the requested "
-            "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
-            "Do not query status after every action; when fresh live state is needed, prefer "
-            "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
-            "If execute_segment_to_breakpoint starts a background wait, call "
-            "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
-            "repeated immediate status calls. If background planning is running, call "
-            "planning_job_status once and wait for its returned result instead of polling in a tight loop."
-        )
+        instructions = DASHBOARD_AGENT_INSTRUCTIONS
         effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
         response_tools = mcp_tools_to_response_tools(tools)
-        input_list: list[dict[str, Any]] = [
-            {
-                "role": "user",
-                "content": (
-                    f"Curated dashboard event log JSON for model context:\n{context}\n\n"
-                    f"User request:\n{prompt}"
-                ),
-            }
-        ]
+        context_input = {
+            "role": "user",
+            "content": (
+                f"Curated dashboard event log JSON for model context:\n{context}\n\n"
+                f"User request:\n{prompt}"
+            ),
+        }
+        response_session = self.response_context_session(
+            response_session_key,
+            response_session_path,
+            response_session_profile_id,
+        )
+        response_context_limit = response_context_char_limit(response_context_max_chars)
+        response_context_meta: dict[str, Any] = {
+            "enabled": response_session is not None,
+            "profile_id": response_session.profile_id if response_session else None,
+            "reasoning_context": self.config.reasoning_context,
+            "retains_prior_user_requests": self.config.reasoning_context != "all_turns",
+            "loaded_from_disk": bool(response_session and response_session.loaded_from_disk),
+            "prior_item_count": len(response_session.items) if response_session else 0,
+            "prior_chars": encoded_json_length(response_session.items) if response_session else 0,
+            "previous_response_id": response_session.last_response_id if response_session else None,
+            "max_chars": response_context_limit,
+            "reused": bool(response_session and response_session.items),
+            "reset_reason": None,
+            "compaction_strategy": context_compaction_strategy(self.config),
+            "native_compaction_threshold": (
+                self.config.native_response_compaction_threshold
+                if context_compaction_strategy(self.config) == "dashboard+native_responses"
+                else None
+            ),
+            "preflight_compacted_tool_history": 0,
+            "preflight_compacted_tool_outputs": 0,
+        }
+        input_list: list[dict[str, Any]] = deepcopy(response_session.items) if response_session else []
+        if response_session and response_context_meta["prior_chars"] > response_context_limit:
+            input_list = []
+            response_session.items = []
+            response_context_meta["reused"] = False
+            response_context_meta["reset_reason"] = "response_context_budget_exceeded_before_request"
+        elif input_list:
+            response_context_meta["preflight_compacted_tool_history"] = compact_consumed_tool_history(input_list)
+            response_context_meta["preflight_compacted_tool_outputs"] = await compact_consumed_tool_outputs(
+                input_list,
+                max_chars=max_tool_output_chars,
+                on_context_compacted=on_context_compacted,
+            )
+        input_list.append(context_input)
         payload = {
             "model": self.config.model,
             "instructions": effective_instructions,
@@ -444,7 +640,8 @@ class AiProvider:
             "tools": response_tools,
             "tool_choice": "auto",
         }
-        if self.config.reasoning_effort or self.config.reasoning_summary:
+        apply_response_context_options(payload, self.config)
+        if self.config.reasoning_effort or self.config.reasoning_summary or self.config.reasoning_context:
             apply_reasoning_options(payload, self.config)
 
         request_started = time.monotonic()
@@ -457,14 +654,14 @@ class AiProvider:
             ),
         )
         if on_model_response is not None:
-            await on_model_response(
-                model_response_metrics(
-                    data,
-                    round_index=0,
-                    elapsed_seconds=time.monotonic() - request_started,
-                    payload=payload,
-                )
+            metrics = model_response_metrics(
+                data,
+                round_index=0,
+                elapsed_seconds=time.monotonic() - request_started,
+                payload=payload,
             )
+            metrics["response_context"] = dict(response_context_meta)
+            await on_model_response(metrics)
         all_reasoning: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         round_index = 0
@@ -516,13 +713,15 @@ class AiProvider:
                 max_chars=max_tool_output_chars,
                 on_context_compacted=on_context_compacted,
             )
+            effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
             followup = {
                 "model": self.config.model,
                 "instructions": effective_instructions,
                 "input": input_list,
                 "tools": response_tools,
             }
-            if self.config.reasoning_effort or self.config.reasoning_summary:
+            apply_response_context_options(followup, self.config)
+            if self.config.reasoning_effort or self.config.reasoning_summary or self.config.reasoning_context:
                 apply_reasoning_options(followup, self.config)
             round_index += 1
             request_started = time.monotonic()
@@ -567,12 +766,33 @@ class AiProvider:
         elif not text:
             text = "The model returned no user-facing text."
 
+        if response_session is not None:
+            response_session.items = response_context_items(
+                input_list,
+                data,
+                retain_dashboard_user_requests=bool(response_context_meta["retains_prior_user_requests"]),
+            )
+            response_session.revision += 1
+            response_id = data.get("id")
+            response_session.last_response_id = str(response_id) if response_id else None
+            response_context_meta["final_item_count"] = len(response_session.items)
+            response_context_meta["final_chars"] = encoded_json_length(response_session.items)
+            if response_context_meta["final_chars"] > response_context_limit:
+                response_session.items = []
+                response_context_meta["final_item_count"] = 0
+                response_context_meta["final_chars"] = 0
+                response_context_meta["reset_reason"] = "response_context_budget_exceeded_after_request"
+            response_context_meta["revision"] = response_session.revision
+            response_context_meta["last_response_id"] = response_session.last_response_id
+            response_context_meta["persistence_error"] = save_response_context_session(response_session)
+
         return {
             "text": text,
             "reasoning": all_reasoning,
             "tool_calls": tool_calls,
             "pending_tool_calls": pending_calls,
             "stopped_reason": stopped_reason,
+            "response_context": response_context_meta,
             "raw": data,
         }
 
@@ -592,21 +812,7 @@ class AiProvider:
         on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         context = json.dumps(events, ensure_ascii=True, default=str)
-        instructions = (
-            "You are the DropLogic Dashboard agent controlling BoxMini through MCP tools. "
-            "When the user asks for an action, call the appropriate MCP tools and execute it; "
-            "do not merely propose steps. Use the event log to avoid repeating completed work. "
-            "For hardware actions, proceed carefully, report errors, and do not claim success "
-            "unless the tool result confirms it. Keep user-facing narration brief, but use the "
-            "available tool calls to make real progress. Continue tool-use until the requested "
-            "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
-            "Do not query status after every action; when fresh live state is needed, prefer "
-            "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
-            "If execute_segment_to_breakpoint starts a background wait, call "
-            "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
-            "repeated immediate status calls. If background planning is running, call "
-            "planning_job_status once and wait for its returned result instead of polling in a tight loop."
-        )
+        instructions = DASHBOARD_AGENT_INSTRUCTIONS
         effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": effective_instructions},
@@ -681,6 +887,10 @@ class AiProvider:
                 max_chars=max_tool_output_chars,
                 on_context_compacted=on_context_compacted,
             )
+            messages[0] = {
+                "role": "system",
+                "content": instructions_with_pinned_context(instructions, pinned_context),
+            }
             followup = {
                 "model": self.config.model,
                 "messages": messages,
@@ -748,21 +958,7 @@ class AiProvider:
         on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
         context = json.dumps(events, ensure_ascii=True, default=str)
-        instructions = (
-            "You are the DropLogic Dashboard agent controlling BoxMini through MCP tools. "
-            "When the user asks for an action, call the appropriate MCP tools and execute it; "
-            "do not merely propose steps. Use the event log to avoid repeating completed work. "
-            "For hardware actions, proceed carefully, report errors, and do not claim success "
-            "unless the tool result confirms it. Keep user-facing narration brief, but use the "
-            "available tool calls to make real progress. Continue tool-use until the requested "
-            "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
-            "Do not query status after every action; when fresh live state is needed, prefer "
-            "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
-            "If execute_segment_to_breakpoint starts a background wait, call "
-            "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
-            "repeated immediate status calls. If background planning is running, call "
-            "planning_job_status once and wait for its returned result instead of polling in a tight loop."
-        )
+        instructions = DASHBOARD_AGENT_INSTRUCTIONS
         effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
         messages: list[dict[str, Any]] = [
             {
@@ -842,6 +1038,7 @@ class AiProvider:
                 max_chars=max_tool_output_chars,
                 on_context_compacted=on_context_compacted,
             )
+            effective_instructions = instructions_with_pinned_context(instructions, pinned_context)
             followup = {
                 "model": self.config.model,
                 "system": effective_instructions,
@@ -1096,6 +1293,8 @@ def apply_reasoning_options(payload: dict[str, Any], config: AiConfig) -> None:
         payload["reasoning"]["effort"] = config.reasoning_effort
     if config.reasoning_summary:
         payload["reasoning"]["summary"] = config.reasoning_summary
+    if config.reasoning_context:
+        payload["reasoning"]["context"] = config.reasoning_context
     payload["include"] = unique_list(
         [
             *payload.get("include", []),
@@ -1538,20 +1737,56 @@ async def emit_response_text(
     await on_text(text, round_index)
 
 
-def format_pinned_context(pinned_context: str | None) -> str:
+def format_pinned_context(pinned_context: str | Callable[[], str] | None) -> str:
+    if callable(pinned_context):
+        pinned_context = pinned_context()
     text = (pinned_context or "").strip()
     if not text:
         return ""
     return (
-        "Pinned BoxMini operating context. This is authoritative and is resent on every "
-        "agent turn; do not treat the compacted event log as replacing it. Any "
-        "`Turn-Scoped Detailed Guide Expansions` section applies only to this model "
-        "turn and must be re-selected on future turns.\n"
+        "Pinned BoxMini operating context. This is authoritative and is resent before every "
+        "model reasoning turn; do not treat the compacted event log as replacing it. The "
+        "`Turn-Scoped Detailed Guide Expansions` section is the current detailed guide set "
+        "and may be replaced by the dashboard guide-context tool.\n"
         f"{text}\n\n"
     )
 
 
-def instructions_with_pinned_context(instructions: str, pinned_context: str | None) -> str:
+def context_compaction_strategy(config: AiConfig) -> str:
+    """Return the effective context strategy for comparable run metrics."""
+
+    if uses_chat_completions(config) or uses_anthropic_messages(config):
+        return "dashboard"
+    if bool(getattr(config, "native_response_compaction_enabled", False)):
+        return "dashboard+native_responses"
+    return "dashboard"
+
+
+def apply_response_context_options(payload: dict[str, Any], config: AiConfig) -> None:
+    """Opt into OpenAI Responses server-side compaction when explicitly enabled."""
+
+    if uses_chat_completions(config) or uses_anthropic_messages(config):
+        return
+    if not bool(getattr(config, "native_response_compaction_enabled", False)):
+        return
+    threshold = max(1, int(getattr(config, "native_response_compaction_threshold", 200_000) or 0))
+    payload["context_management"] = [{"type": "compaction", "compact_threshold": threshold}]
+
+
+def payload_context_compaction_strategy(payload: dict[str, Any] | None) -> str:
+    if isinstance(payload, dict) and isinstance(payload.get("context_management"), list):
+        if any(
+            isinstance(item, dict) and item.get("type") == "compaction"
+            for item in payload["context_management"]
+        ):
+            return "dashboard+native_responses"
+    return "dashboard"
+
+
+def instructions_with_pinned_context(
+    instructions: str,
+    pinned_context: str | Callable[[], str] | None,
+) -> str:
     pinned = format_pinned_context(pinned_context).strip()
     if not pinned:
         return instructions
@@ -1581,8 +1816,10 @@ def model_response_metrics(
         "reasoning_tokens": (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
         if isinstance(usage.get("output_tokens_details"), dict)
         else None,
+        **reasoning_summary_metrics(data),
         "total_tokens": usage.get("total_tokens"),
         "retry_attempts": data.get("_cockpit_retry_attempts"),
+        "context_compaction_strategy": payload_context_compaction_strategy(payload),
     }
     if payload is not None:
         request_chars = encoded_json_length(payload)
@@ -1621,6 +1858,7 @@ def chat_model_response_metrics(
         else None,
         "total_tokens": usage.get("total_tokens"),
         "retry_attempts": data.get("_cockpit_retry_attempts"),
+        "context_compaction_strategy": payload_context_compaction_strategy(payload),
     }
     if payload is not None:
         request_chars = encoded_json_length(payload)
@@ -1665,6 +1903,7 @@ def anthropic_model_response_metrics(
         )
         or None,
         "retry_attempts": data.get("_cockpit_retry_attempts"),
+        "context_compaction_strategy": payload_context_compaction_strategy(payload),
     }
     if payload is not None:
         request_chars = encoded_json_length(payload)
@@ -2248,6 +2487,29 @@ def extract_reasoning_summary(data: dict[str, Any]) -> list[str]:
                     if text:
                         summaries.append(str(text))
     return summaries
+
+
+def reasoning_summary_metrics(data: dict[str, Any]) -> dict[str, Any]:
+    """Expose whether the provider sent a usable reasoning summary at all."""
+
+    summaries = [summary.strip() for summary in extract_reasoning_summary(data) if summary.strip()]
+    heading_only = bool(summaries) and all(is_heading_only_reasoning_summary(summary) for summary in summaries)
+    return {
+        "reasoning_summary_item_count": len(summaries),
+        "reasoning_summary_chars": sum(len(summary) for summary in summaries),
+        "reasoning_summary_heading_only": heading_only,
+    }
+
+
+def is_heading_only_reasoning_summary(summary: str) -> bool:
+    lines = [line.strip() for line in summary.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(
+        line.startswith("#")
+        or re.fullmatch(r"\*\*[^*\n]+\*\*", line) is not None
+        for line in lines
+    )
 
 
 def mcp_tools_to_response_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

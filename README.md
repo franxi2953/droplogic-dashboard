@@ -136,6 +136,23 @@ Both files are ignored by git. The config file stores profile ids, labels, RKAPI
 
 Profiles may use different RKAPI wire formats. Codex-style profiles can use `wire_api: "responses"`; Claude profiles currently use `wire_api: "anthropic_messages"` so Dashboard can read returned `thinking`, `text`, and `tool_use` blocks.
 
+All providers share the Dashboard context policy: deterministic event compaction, persistent
+context checkpoints, pinned operating context, bounded tool outputs, and retry-time payload
+compaction. Responses profiles can additionally opt into OpenAI server-side compaction with:
+
+```json
+{
+  "ai": {
+    "native_response_compaction_enabled": false,
+    "native_response_compaction_threshold": 200000
+  }
+}
+```
+
+This option is disabled by default so model comparisons remain provider-neutral. It is ignored
+for Chat Completions and Anthropic profiles. The active strategy is exposed in status and model
+response metrics as `dashboard` or `dashboard+native_responses`.
+
 The browser receives only public profile metadata such as label/model/configured status. It never receives API keys.
 
 Minimal shape:

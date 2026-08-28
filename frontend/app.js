@@ -1976,7 +1976,7 @@ function summarize(event) {
   if (event.type === "agent_steer") return event.prompt || "";
   if (event.type === "agent_response" || event.type === "agent_message") return event.text || event.error || "";
   if (event.type === "agent_started") return event.message || "Thinking";
-  if (event.type === "agent_finished") return event.message || "Done";
+  if (event.type === "agent_finished") return event.message || (event.level === "error" ? "Agent failed" : "Done");
   if (event.type === "agent_thinking") return event.text || "";
   if (event.type === "context_compacted") return contextCompactionSummary(event);
   if (event.type === "context_ai_summary") return contextAiSummaryTitle(event);
@@ -2036,6 +2036,9 @@ function formatAiState(ai) {
   const provider = ai.provider || hostFromUrl(ai.base_url) || "provider";
   const parts = [provider, ai.model].filter(Boolean);
   if (ai.reasoning_effort) parts.push(`reasoning ${ai.reasoning_effort}`);
+  if (ai.reasoning_summary) parts.push(`summary ${ai.reasoning_summary}`);
+  if (ai.reasoning_context) parts.push(`context ${ai.reasoning_context}`);
+  if (ai.context_compaction_strategy) parts.push(`compaction ${ai.context_compaction_strategy}`);
   return parts.join(" / ");
 }
 
@@ -2177,6 +2180,8 @@ function aiProfileLabel(profile) {
 function aiProfileTitle(profile) {
   const parts = [profile.provider || hostFromUrl(profile.base_url), profile.model].filter(Boolean);
   if (profile.reasoning_effort) parts.push(`reasoning ${profile.reasoning_effort}`);
+  if (profile.reasoning_summary) parts.push(`summary ${profile.reasoning_summary}`);
+  if (profile.reasoning_context) parts.push(`context ${profile.reasoning_context}`);
   if (profile.configured === false) parts.push("missing API key or model config");
   return parts.join(" / ") || "AI model profile";
 }
@@ -2203,7 +2208,7 @@ function conversationText(event) {
   if (event.type === "agent_steer") return event.prompt || "";
   if (event.type === "agent_response" || event.type === "agent_message") return cleanAgentResponseText(event.text || event.error || "");
   if (event.type === "agent_started") return event.message || "Thinking";
-  if (event.type === "agent_finished") return event.message || "Done";
+  if (event.type === "agent_finished") return event.message || (event.level === "error" ? "Agent failed" : "Done");
   if (event.type === "agent_thinking") return event.text || "";
   if (event.type === "context_compacted") return contextCompactionText(event);
   if (event.type === "context_ai_summary") return contextAiSummaryText(event);
@@ -2665,6 +2670,7 @@ function tokenSamples() {
         toolCalls: Number(event.tool_call_count || 0),
         retryAttempts: Number(event.retry_attempts || 0),
         contextBreakdown: Array.isArray(event.context_breakdown) ? event.context_breakdown : null,
+        guidePaths: Array.isArray(event.guide_paths) ? event.guide_paths : [],
         estimated: event.input_tokens === undefined || event.input_tokens === null,
         ts: event.ts || "",
       };
@@ -2995,6 +3001,9 @@ function drawTokenTooltip(ctx, canvas, point, width, height) {
     `call ${sample.index + 1}${sample.round !== undefined ? ` / round ${sample.round}` : ""}`,
     ...point.values.map((item) => `${item.label}: ${formatTokenCount(item.value)} tk${sample.estimated && item.id === "request" ? "~" : ""}`),
     `output: ${formatTokenCount(sample.outputTokens)} tk${sample.images ? ` / ${sample.images} img` : ""}`,
+    ...(sample.guidePaths.length
+      ? sample.guidePaths.map((path) => `guide: ${String(path).split("/").pop()}`)
+      : ["guides: none"]),
   ];
   const anchorY = point.values.find((item) => item.id === "request")?.y ?? point.values[0]?.y ?? height / 2;
   for (const item of point.values) {
