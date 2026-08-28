@@ -1,16 +1,237 @@
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
 import json
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 sys.modules.setdefault("httpx", types.SimpleNamespace(Response=object))
 
-from backend.ai_provider import compact_consumed_tool_history, compact_payload_for_retry
+from backend.ai_provider import (
+    AiProvider,
+    ResponseContextSession,
+    compact_consumed_tool_history,
+    compact_payload_for_retry,
+    load_response_context_session,
+    model_response_metrics,
+    response_context_items,
+    save_response_context_session,
+    apply_response_context_options,
+    context_compaction_strategy,
+)
+from backend.config import AiConfig
 
 
 class RetryPayloadCompactionTests(unittest.TestCase):
+    def test_native_response_compaction_is_transport_specific(self) -> None:
+        responses_config = AiConfig(
+            wire_api="responses",
+            native_response_compaction_enabled=True,
+            native_response_compaction_threshold=180_000,
+        )
+        responses_payload = {}
+        apply_response_context_options(responses_payload, responses_config)
+        self.assertEqual(
+            responses_payload["context_management"],
+            [{"type": "compaction", "compact_threshold": 180_000}],
+        )
+        self.assertEqual(context_compaction_strategy(responses_config), "dashboard+native_responses")
+
+        claude_config = AiConfig(
+            wire_api="anthropic_messages",
+            native_response_compaction_enabled=True,
+        )
+        claude_payload = {}
+        apply_response_context_options(claude_payload, claude_config)
+        self.assertNotIn("context_management", claude_payload)
+        self.assertEqual(context_compaction_strategy(claude_config), "dashboard")
+
+    def test_response_context_round_trips_reasoning_and_assistant_phase(self) -> None:
+        input_list = [
+            {
+                "role": "user",
+                "content": "Curated dashboard event log JSON for model context:\nold snapshot",
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_old",
+                "encrypted_content": "opaque-reasoning",
+                "summary": [{"type": "summary_text", "text": "**Old plan**"}],
+            },
+            {"type": "function_call", "call_id": "call_1", "name": "status", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "{\"ok\": true}"},
+        ]
+        final_response = {
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Status confirmed."}],
+                }
+            ]
+        }
+
+        items = response_context_items(input_list, final_response)
+
+        self.assertEqual([item["type"] for item in items], ["reasoning", "function_call", "function_call_output", "message"])
+        self.assertEqual(items[0]["encrypted_content"], "opaque-reasoning")
+        self.assertEqual(items[-1]["phase"], "final_answer")
+
+    def test_current_turn_context_keeps_prior_user_request_without_event_log(self) -> None:
+        items = response_context_items(
+            [
+                {
+                    "role": "user",
+                    "content": (
+                        "Curated dashboard event log JSON for model context:\n"
+                        "[large current state]\n\nUser request:\nRemember LANTERN-72 exactly."
+                    ),
+                }
+            ],
+            {"output": [{"type": "reasoning", "encrypted_content": "opaque"}]},
+            retain_dashboard_user_requests=True,
+        )
+
+        self.assertEqual(items[0], {"role": "user", "content": "Remember LANTERN-72 exactly."})
+        self.assertNotIn("large current state", items[0]["content"])
+        self.assertEqual(items[1]["encrypted_content"], "opaque")
+
+    def test_response_metrics_identify_heading_only_reasoning_summary(self) -> None:
+        metrics = model_response_metrics(
+            {
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [
+                            {"type": "summary_text", "text": "## Planning"},
+                            {"type": "summary_text", "text": "**Execution**"},
+                        ],
+                    }
+                ]
+            },
+            round_index=0,
+            elapsed_seconds=0.1,
+        )
+
+        self.assertEqual(metrics["reasoning_summary_item_count"], 2)
+        self.assertEqual(metrics["reasoning_summary_chars"], len("## Planning**Execution**"))
+        self.assertTrue(metrics["reasoning_summary_heading_only"])
+
+    def test_response_context_persistence_is_bound_to_profile_and_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "responses" / "codex.json"
+            session = ResponseContextSession(
+                profile_id="codex-5-6-terra",
+                model="gpt-5.6-terra",
+                items=[{"type": "reasoning", "encrypted_content": "opaque"}],
+                path=path,
+                revision=3,
+                last_response_id="resp_previous",
+            )
+
+            self.assertIsNone(save_response_context_session(session))
+            restored = load_response_context_session(path, "codex-5-6-terra", "gpt-5.6-terra")
+            wrong_model = load_response_context_session(path, "codex-5-6-terra", "gpt-5.5")
+
+        self.assertTrue(restored.loaded_from_disk)
+        self.assertEqual(restored.revision, 3)
+        self.assertEqual(restored.last_response_id, "resp_previous")
+        self.assertEqual(restored.items[0]["encrypted_content"], "opaque")
+        self.assertFalse(wrong_model.loaded_from_disk)
+        self.assertEqual(wrong_model.items, [])
+
+    def test_response_context_replays_opaque_items_on_the_next_dashboard_prompt(self) -> None:
+        async def exercise() -> tuple[list[dict], str | None]:
+            config = AiConfig(
+                base_url="https://example.invalid/v1",
+                model="gpt-5.6-terra",
+                api_key="test-key",
+                reasoning_effort="xhigh",
+                reasoning_summary="auto",
+                reasoning_context="all_turns",
+            )
+            provider = AiProvider(config)
+            requests: list[dict] = []
+            responses = [
+                {
+                    "id": "resp_first_tool_call",
+                    "output": [
+                        {"type": "reasoning", "encrypted_content": "opaque-first", "summary": []},
+                        {"type": "function_call", "call_id": "call_1", "name": "status", "arguments": "{}"},
+                    ]
+                },
+                {
+                    "id": "resp_first_complete",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "First complete."}],
+                        }
+                    ]
+                },
+                {
+                    "id": "resp_second_complete",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "Second complete."}],
+                        }
+                    ]
+                },
+            ]
+
+            async def fake_post(payload: dict, **_: object) -> dict:
+                requests.append(deepcopy(payload))
+                return responses.pop(0)
+
+            async def call_tool(_: str, __: dict) -> dict:
+                return {"ok": True}
+
+            provider._post_response = fake_post  # type: ignore[method-assign]
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "responses.json"
+                common = {
+                    "events": [{"type": "state", "value": "old"}],
+                    "tools": [{"name": "status", "inputSchema": {"type": "object", "properties": {}}}],
+                    "call_tool": call_tool,
+                    "response_session_key": "run-1:codex-5-6-terra",
+                    "response_session_path": path,
+                    "response_session_profile_id": "codex-5-6-terra",
+                    "response_context_max_chars": 300_000,
+                }
+                await provider.ask_with_tools(prompt="first", **common)
+                await provider.ask_with_tools(prompt="second", **common)
+                session = provider.response_context_session(
+                    common["response_session_key"],
+                    common["response_session_path"],
+                    common["response_session_profile_id"],
+                )
+                return requests, session.last_response_id if session else None
+
+        requests, last_response_id = asyncio.run(exercise())
+
+        self.assertEqual(len(requests), 3)
+        self.assertEqual(requests[0]["reasoning"]["context"], "all_turns")
+        replayed = requests[2]["input"]
+        self.assertEqual(
+            [item.get("type") or item.get("role") for item in replayed],
+            ["reasoning", "function_call", "function_call_output", "message", "user"],
+        )
+        self.assertEqual(replayed[0]["encrypted_content"], "opaque-first")
+        self.assertEqual(replayed[3]["phase"], "final_answer")
+        self.assertIn("User request:\nsecond", replayed[-1]["content"])
+        self.assertNotIn("User request:\nfirst", replayed[-1]["content"])
+        self.assertEqual(last_response_id, "resp_second_complete")
+
     def test_anthropic_messages_payload_returns_all_expected_detail_keys(self) -> None:
         payload = {
             "model": "claude-opus-4-8",

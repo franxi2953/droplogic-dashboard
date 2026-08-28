@@ -44,6 +44,69 @@ def latest_goal_completion_blocker(events: list[dict[str, Any]]) -> str:
     return ""
 
 
+def melting_goal_completion_blocker(objective: str, events: list[dict[str, Any]]) -> str:
+    """Require terminal thermal evidence before completing a melting objective."""
+    if "melting" not in str(objective or "").lower():
+        return ""
+
+    completed_capture = [
+        event
+        for event in events
+        if event.get("type") == "melting_curve_capture_finished"
+        and bool(event.get("ok"))
+        and bool(event.get("completed"))
+    ]
+    for event in reversed(completed_capture):
+        requested = int(event.get("requested_steps") or 0)
+        completed = int(event.get("completed_steps") or 0)
+        if requested and completed < requested:
+            return "Melting capture ended before all requested temperature steps completed."
+        photos = [
+            item
+            for item in events
+            if item.get("type") == "melting_curve_capture_photo"
+            and item.get("routine_id") == event.get("routine_id")
+        ]
+        if requested and len(photos) < requested:
+            return "Melting capture completed without a recorded image checkpoint for every temperature step."
+        return ""
+
+    for event in reversed(events):
+        tool = str(event.get("tool") or "")
+        if event.get("type") == "mcp_tool_call" and tool in {
+            "cancel_melting_curve_capture",
+            "cancel_temperature_routine",
+        }:
+            return f"{tool} was called before the melting objective completed."
+        if event.get("type") != "mcp_tool_result":
+            continue
+        if tool == "start_melting_curve_capture" and event.get("ok") is False:
+            return "start_melting_curve_capture failed; a melting objective cannot be completed without a successful capture run."
+        if tool in {"melting_curve_capture_status", "temperature_routine_status"}:
+            status = terminal_temperature_status(event.get("result"))
+            if status and status.get("completed") is False and status.get("running") is False:
+                return "The temperature routine ended without completing the melting schedule."
+
+    return "Melting objective has no completed temperature-and-image capture evidence."
+
+
+def terminal_temperature_status(result: Any) -> dict[str, Any] | None:
+    """Extract a terminal routine status from MCP result envelopes."""
+    payload = compact_tool_payload(result)
+    candidates = [payload]
+    while candidates:
+        candidate = candidates.pop()
+        if not isinstance(candidate, dict):
+            continue
+        if "completed" in candidate and "running" in candidate:
+            return candidate
+        for key in ("result", "structuredContent"):
+            nested = candidate.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+    return None
+
+
 def goal_completion_relevant_tool(tool: str) -> bool:
     name = str(tool or "")
     return (

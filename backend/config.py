@@ -61,6 +61,7 @@ class AiProfile:
     wire_api: str = "responses"
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
+    reasoning_context: str | None = None
     api_key: str | None = None
     api_key_id: str | None = None
     api_key_env: str | None = None
@@ -75,6 +76,7 @@ class AiConfig:
     wire_api: str = "responses"
     reasoning_effort: str | None = None
     reasoning_summary: str | None = "auto"
+    reasoning_context: str | None = None
     api_key: str | None = None
     ai_config_file: str = "backend/ai_config.local.json"
     ai_auth_file: str = "backend/ai_auth.local.json"
@@ -90,6 +92,10 @@ class AiConfig:
     ai_context_summary_enabled: bool = True
     ai_context_summary_trigger_chars: int = 120_000
     ai_context_summary_max_chars: int = 12_000
+    # Keep the dashboard compaction policy provider-neutral. Native Responses
+    # compaction is an explicit opt-in because compatible gateways may reject it.
+    native_response_compaction_enabled: bool = False
+    native_response_compaction_threshold: int = 200_000
     pinned_context_files: list[str] = field(
         default_factory=lambda: ["agent-guide.md", "cockpit-mode.md", "cartridge.default.json"]
     )
@@ -178,6 +184,7 @@ def load_config(path: str | None = None) -> CockpitConfig:
             wire_api=str(ai_raw.get("wire_api", "responses")),
             reasoning_effort=ai_raw.get("reasoning_effort"),
             reasoning_summary=ai_raw.get("reasoning_summary", "auto"),
+            reasoning_context=ai_raw.get("reasoning_context"),
             api_key=ai_raw.get("api_key"),
             ai_config_file=str(ai_raw.get("ai_config_file", "backend/ai_config.local.json")),
             ai_auth_file=str(ai_raw.get("ai_auth_file", "backend/ai_auth.local.json")),
@@ -195,6 +202,8 @@ def load_config(path: str | None = None) -> CockpitConfig:
             ai_context_summary_enabled=bool(ai_raw.get("ai_context_summary_enabled", True)),
             ai_context_summary_trigger_chars=int(ai_raw.get("ai_context_summary_trigger_chars", 120_000)),
             ai_context_summary_max_chars=int(ai_raw.get("ai_context_summary_max_chars", 12_000)),
+            native_response_compaction_enabled=bool(ai_raw.get("native_response_compaction_enabled", False)),
+            native_response_compaction_threshold=int(ai_raw.get("native_response_compaction_threshold", 200_000)),
             pinned_context_files=[
                 str(item)
                 for item in ai_raw.get(
@@ -248,6 +257,7 @@ def parse_ai_profile(raw: dict[str, Any]) -> AiProfile:
         wire_api=str(raw.get("wire_api", "responses")),
         reasoning_effort=raw.get("reasoning_effort"),
         reasoning_summary=raw.get("reasoning_summary"),
+        reasoning_context=raw.get("reasoning_context"),
         api_key=raw.get("api_key"),
         api_key_id=raw.get("api_key_id") or raw.get("key_id"),
         api_key_env=raw.get("api_key_env"),
@@ -269,6 +279,13 @@ def apply_dashboard_ai_files(ai: AiConfig) -> None:
         ai.wire_api = str(raw_config.get("wire_api", ai.wire_api))
         ai.reasoning_effort = raw_config.get("reasoning_effort", ai.reasoning_effort)
         ai.reasoning_summary = raw_config.get("reasoning_summary", ai.reasoning_summary)
+        ai.reasoning_context = raw_config.get("reasoning_context", ai.reasoning_context)
+        ai.native_response_compaction_enabled = bool(
+            raw_config.get("native_response_compaction_enabled", ai.native_response_compaction_enabled)
+        )
+        ai.native_response_compaction_threshold = int(
+            raw_config.get("native_response_compaction_threshold", ai.native_response_compaction_threshold)
+        )
         ai.active_profile = raw_config.get("active_profile") or raw_config.get("active_profile_id") or ai.active_profile
         if isinstance(raw_config.get("profiles"), list):
             ai.profiles = [
@@ -308,6 +325,7 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     cfg.ai.wire_api = os.environ.get("COCKPIT_AI_WIRE_API", cfg.ai.wire_api)
     cfg.ai.reasoning_effort = os.environ.get("COCKPIT_AI_REASONING_EFFORT", cfg.ai.reasoning_effort)
     cfg.ai.reasoning_summary = os.environ.get("COCKPIT_AI_REASONING_SUMMARY", cfg.ai.reasoning_summary)
+    cfg.ai.reasoning_context = os.environ.get("COCKPIT_AI_REASONING_CONTEXT", cfg.ai.reasoning_context)
     cfg.ai.ai_config_file = os.environ.get("DASHBOARD_AI_CONFIG", cfg.ai.ai_config_file)
     cfg.ai.ai_auth_file = os.environ.get("DASHBOARD_AI_AUTH", cfg.ai.ai_auth_file)
     cfg.ai.active_profile = os.environ.get("COCKPIT_AI_PROFILE", cfg.ai.active_profile)
@@ -337,6 +355,16 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     )
     cfg.ai.ai_context_summary_max_chars = int(
         os.environ.get("COCKPIT_AI_CONTEXT_SUMMARY_MAX_CHARS", cfg.ai.ai_context_summary_max_chars)
+    )
+    cfg.ai.native_response_compaction_enabled = parse_bool(
+        os.environ.get("COCKPIT_AI_NATIVE_RESPONSE_COMPACTION_ENABLED"),
+        cfg.ai.native_response_compaction_enabled,
+    )
+    cfg.ai.native_response_compaction_threshold = int(
+        os.environ.get(
+            "COCKPIT_AI_NATIVE_RESPONSE_COMPACTION_THRESHOLD",
+            cfg.ai.native_response_compaction_threshold,
+        )
     )
     pinned_context_files = os.environ.get("COCKPIT_AI_PINNED_CONTEXT_FILES")
     if pinned_context_files:
@@ -426,6 +454,7 @@ def finalize_ai_profiles(ai: AiConfig) -> None:
                 wire_api=ai.wire_api,
                 reasoning_effort=ai.reasoning_effort,
                 reasoning_summary=ai.reasoning_summary,
+                reasoning_context=ai.reasoning_context,
                 api_key=ai.api_key,
             )
         )
@@ -481,6 +510,7 @@ def resolve_ai_profile(profile: AiProfile, fallback: AiConfig) -> None:
     fill_profile_field(profile, "wire_api", fallback.wire_api)
     fill_profile_field(profile, "reasoning_effort", fallback.reasoning_effort)
     fill_profile_field(profile, "reasoning_summary", fallback.reasoning_summary)
+    fill_profile_field(profile, "reasoning_context", fallback.reasoning_context)
     if profile.api_key_env and not profile.api_key:
         profile.api_key = os.environ.get(profile.api_key_env)
     if profile.base_url:
@@ -512,6 +542,7 @@ def select_ai_profile(
     ai.wire_api = profile.wire_api
     ai.reasoning_effort = profile.reasoning_effort
     ai.reasoning_summary = profile.reasoning_summary
+    ai.reasoning_context = profile.reasoning_context
     ai.api_key = profile.api_key
     return ai_profile_public(profile, active=True)
 
@@ -543,6 +574,7 @@ def active_ai_profile_public(ai: AiConfig) -> dict[str, Any]:
         "wire_api": ai.wire_api,
         "reasoning_effort": ai.reasoning_effort,
         "reasoning_summary": ai.reasoning_summary,
+        "reasoning_context": ai.reasoning_context,
         "configured": bool(ai.enabled and ai.api_key and ai.base_url and ai.model),
         "active": True,
         "has_api_key": bool(ai.api_key),
@@ -559,6 +591,7 @@ def ai_profile_public(profile: AiProfile, active: bool = False) -> dict[str, Any
         "wire_api": profile.wire_api,
         "reasoning_effort": profile.reasoning_effort,
         "reasoning_summary": profile.reasoning_summary,
+        "reasoning_context": profile.reasoning_context,
         "api_key_id": profile.api_key_id,
         "configured": ai_profile_configured(profile),
         "active": active,

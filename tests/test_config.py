@@ -10,6 +10,115 @@ from backend.config import load_config
 
 
 class CockpitConfigTests(unittest.TestCase):
+    def test_example_model_catalog_contains_comparable_xhigh_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_AI_CONFIG": str(Path(temp_dir) / "missing-ai.json"),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-auth.json"),
+                },
+                clear=False,
+            ):
+                config = load_config("config.example.json")
+
+        self.assertEqual(
+            [profile.model for profile in config.ai.profiles],
+            ["claude-opus-5", "claude-opus-4-8", "gpt-5.6-terra", "gpt-5.6-sol"],
+        )
+        self.assertTrue(all(profile.reasoning_effort == "xhigh" for profile in config.ai.profiles))
+        self.assertEqual(
+            [profile.wire_api for profile in config.ai.profiles],
+            ["anthropic_messages", "anthropic_messages", "responses", "responses"],
+        )
+
+    def test_native_response_compaction_defaults_are_explicitly_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_AI_CONFIG": str(Path(temp_dir) / "missing-ai.json"),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-auth.json"),
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertFalse(config.ai.native_response_compaction_enabled)
+        self.assertEqual(config.ai.native_response_compaction_threshold, 200_000)
+
+
+    def test_native_response_compaction_can_be_enabled_from_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps({
+                    "ai": {
+                        "native_response_compaction_enabled": True,
+                        "native_response_compaction_threshold": 180000,
+                    }
+                }),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_AI_CONFIG": str(Path(temp_dir) / "missing-ai.json"),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-auth.json"),
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertTrue(config.ai.native_response_compaction_enabled)
+        self.assertEqual(config.ai.native_response_compaction_threshold, 180_000)
+
+
+    def test_profile_reasoning_context_is_selected_with_the_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            ai_config_path = Path(temp_dir) / "ai.json"
+            ai_config_path.write_text(
+                json.dumps(
+                    {
+                        "active_profile": "codex-5-6-terra",
+                        "profiles": [
+                            {
+                                "id": "codex-5-5",
+                                "label": "Codex 5.5",
+                                "base_url": "https://example.invalid/v1",
+                                "model": "gpt-5.5",
+                                "reasoning_context": "current_turn",
+                            },
+                            {
+                                "id": "codex-5-6-terra",
+                                "label": "Codex 5.6 Terra",
+                                "base_url": "https://example.invalid/v1",
+                                "model": "gpt-5.6-terra",
+                                "reasoning_context": "all_turns",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_AI_CONFIG": str(ai_config_path),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-ai-auth.json"),
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertEqual(config.ai.active_profile, "codex-5-6-terra")
+        self.assertEqual(config.ai.reasoning_context, "all_turns")
+
     def test_scene_interval_config_controls_dashboard_scene_publisher_env(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"

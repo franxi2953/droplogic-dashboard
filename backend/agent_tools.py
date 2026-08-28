@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-DASHBOARD_INTERNAL_TOOLS = {"dashboard_scene"}
+DASHBOARD_INTERNAL_TOOLS = {"dashboard_scene", "select_guide_context"}
 
 
 def filter_agent_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
