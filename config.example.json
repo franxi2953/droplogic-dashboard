@@ -71,8 +71,7 @@
         "api_key_id": "codex"
       }
     ],
-    "ai_config_file": "backend/ai_config.local.json",
-    "ai_auth_file": "backend/ai_auth.local.json",
+    "ai_config_file": "backend/apis.local.json",
     "max_context_chars": 300000,
     "target_context_chars": 40000,
     "recent_event_target": 80,

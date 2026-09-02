@@ -271,7 +271,11 @@ class AiProvider:
             }
             apply_chat_options(payload, self.config)
             data = await self._post_chat_completion(payload, on_retry_compact=retry_payload_compactor(payload))
-            return {"text": extract_chat_response_text(data), "reasoning": [], "raw": data}
+            return {
+                "text": extract_chat_response_text(data),
+                "reasoning": extract_chat_reasoning(data),
+                "raw": data,
+            }
 
         payload = {
             "model": self.config.model,
@@ -855,7 +859,11 @@ class AiProvider:
         tool_calls: list[dict[str, Any]] = []
         pending_calls: list[dict[str, Any]] = []
         emitted_texts: set[str] = set()
+        emitted_reasoning: set[str] = set()
         round_index = 0
+        reasoning = extract_chat_reasoning(data)
+        all_reasoning.extend(reasoning)
+        await emit_chat_reasoning(data, round_index, emitted_reasoning, on_reasoning)
         await emit_chat_response_text(data, round_index, emitted_texts, on_text)
 
         while True:
@@ -919,6 +927,9 @@ class AiProvider:
                 metrics["compacted_prior_tool_outputs"] = compacted_tools
                 metrics["compacted_prior_tool_history"] = compacted_tool_history
                 await on_model_response(metrics)
+            reasoning = extract_chat_reasoning(data)
+            all_reasoning.extend(reasoning)
+            await emit_chat_reasoning(data, round_index, emitted_reasoning, on_reasoning)
             await emit_chat_response_text(data, round_index, emitted_texts, on_text)
 
         text = extract_chat_response_text(data)
@@ -1306,6 +1317,12 @@ def apply_reasoning_options(payload: dict[str, Any], config: AiConfig) -> None:
 def apply_chat_options(payload: dict[str, Any], config: AiConfig) -> None:
     if config.reasoning_effort:
         payload["reasoning_effort"] = config.reasoning_effort
+    chat_template_kwargs = getattr(config, "chat_template_kwargs", None)
+    if isinstance(chat_template_kwargs, dict) and chat_template_kwargs:
+        # vLLM/SGLang accept these as extra OpenAI-compatible body fields.
+        # Keep them explicit in configuration because the key names are
+        # model/template-specific (for example Qwen3.6 preserve_thinking).
+        payload["chat_template_kwargs"] = deepcopy(chat_template_kwargs)
 
 
 def apply_anthropic_options(payload: dict[str, Any], config: AiConfig) -> None:
@@ -1843,6 +1860,16 @@ def chat_model_response_metrics(
 ) -> dict[str, Any]:
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     calls = extract_chat_tool_calls(data)
+    reasoning = extract_chat_reasoning(data)
+    completion_details = usage.get("completion_tokens_details")
+    output_details = usage.get("output_tokens_details")
+    reasoning_tokens = None
+    for details in (completion_details, output_details):
+        if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), (int, float)):
+            reasoning_tokens = details["reasoning_tokens"]
+            break
+    if reasoning_tokens is None and isinstance(usage.get("reasoning_tokens"), (int, float)):
+        reasoning_tokens = usage["reasoning_tokens"]
     metrics = {
         "round": round_index,
         "elapsed_seconds": round(elapsed_seconds, 3),
@@ -1851,11 +1878,14 @@ def chat_model_response_metrics(
         "tool_calls": [call["name"] for call in calls],
         "tool_call_count": len(calls),
         "has_text": bool(extract_chat_response_text(data)),
+        "has_reasoning": bool(reasoning),
+        "reasoning_summary_item_count": len(reasoning),
+        "reasoning_summary_chars": sum(len(item) for item in reasoning),
+        "reasoning_summary_heading_only": bool(reasoning)
+        and all(is_heading_only_reasoning_summary(item) for item in reasoning),
         "input_tokens": usage.get("prompt_tokens") or usage.get("input_tokens"),
         "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
-        "reasoning_tokens": (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-        if isinstance(usage.get("completion_tokens_details"), dict)
-        else None,
+        "reasoning_tokens": reasoning_tokens,
         "total_tokens": usage.get("total_tokens"),
         "retry_attempts": data.get("_cockpit_retry_attempts"),
         "context_compaction_strategy": payload_context_compaction_strategy(payload),
@@ -2606,6 +2636,78 @@ def extract_chat_response_text(data: dict[str, Any]) -> str:
     return "\n".join(texts).strip()
 
 
+def _chat_reasoning_fragments(value: Any) -> list[str]:
+    """Normalize reasoning fields emitted by OpenAI-compatible chat servers.
+
+    vLLM and several local runtimes use ``reasoning_content`` while other
+    gateways expose ``reasoning`` or ``thinking``.  These values may be a
+    string, a list of content blocks, or a summary object.  Keep this parser
+    deliberately narrow so metadata (token counts, signatures, etc.) is not
+    shown as model thinking.
+    """
+
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        fragments: list[str] = []
+        for item in value:
+            fragments.extend(_chat_reasoning_fragments(item))
+        return fragments
+    if not isinstance(value, dict):
+        return []
+
+    fragments: list[str] = []
+    for key in ("text", "thinking", "reasoning_content", "reasoning", "summary", "content"):
+        if key in value:
+            fragments.extend(_chat_reasoning_fragments(value[key]))
+    return fragments
+
+
+def extract_chat_reasoning(data: dict[str, Any]) -> list[str]:
+    """Return ordered, de-duplicated thinking text from a chat completion."""
+
+    fragments: list[str] = []
+    for choice in data.get("choices", []) or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        for key in ("reasoning_content", "reasoning", "thinking"):
+            fragments.extend(_chat_reasoning_fragments(message.get(key)))
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                block_type = str(block.get("type") or "").lower()
+                if block_type in {"reasoning", "thinking", "summary", "summary_text", "reasoning_summary"}:
+                    fragments.extend(_chat_reasoning_fragments(block))
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for fragment in fragments:
+        text = str(fragment).strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+async def emit_chat_reasoning(
+    data: dict[str, Any],
+    round_index: int,
+    emitted_reasoning: set[str],
+    on_reasoning: Callable[[str, int], Awaitable[None]] | None,
+) -> None:
+    if on_reasoning is None:
+        return
+    for item in extract_chat_reasoning(data):
+        text = item.strip()
+        if not text or text in emitted_reasoning:
+            continue
+        emitted_reasoning.add(text)
+        await on_reasoning(text, round_index)
+
+
 async def emit_chat_response_text(
     data: dict[str, Any],
     round_index: int,
@@ -2659,6 +2761,14 @@ def chat_assistant_message(data: dict[str, Any]) -> dict[str, Any]:
     tool_calls = message.get("tool_calls")
     if isinstance(tool_calls, list) and tool_calls:
         assistant["tool_calls"] = tool_calls
+    # Local reasoning models (notably gpt-oss/Qwen served by vLLM) require
+    # their reasoning channel to be replayed with the assistant tool-call
+    # message on the next request.  Preserve only fields that were actually
+    # returned so ordinary OpenAI Chat Completions remain unchanged.
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = message.get(key)
+        if value not in (None, "", []):
+            assistant[key] = value
     return assistant
 
 

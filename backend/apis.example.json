@@ -1,0 +1,33 @@
+{
+  "enabled": true,
+  "active_profile": "dgx-qwen36",
+  "api_keys": {
+    "dgx": "EMPTY"
+  },
+  "profiles": [
+    {
+      "id": "dgx-qwen36",
+      "label": "DGX Qwen3.6 NVFP4 executor",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "provider_name": "dgx",
+      "wire_api": "chat_completions",
+      "reasoning_effort": "high",
+      "chat_template_kwargs": {
+        "enable_thinking": true,
+        "preserve_thinking": true
+      },
+      "api_key_id": "dgx"
+    },
+    {
+      "id": "dgx-gpt-oss-120b",
+      "label": "DGX gpt-oss-120b planner",
+      "base_url": "http://127.0.0.1:8001/v1",
+      "model": "openai/gpt-oss-120b",
+      "provider_name": "dgx",
+      "wire_api": "chat_completions",
+      "reasoning_effort": "high",
+      "api_key_id": "dgx"
+    }
+  ]
+}

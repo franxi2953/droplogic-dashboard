@@ -21,12 +21,157 @@ from backend.ai_provider import (
     response_context_items,
     save_response_context_session,
     apply_response_context_options,
+    chat_assistant_message,
+    chat_model_response_metrics,
     context_compaction_strategy,
+    extract_chat_reasoning,
 )
 from backend.config import AiConfig
 
 
 class RetryPayloadCompactionTests(unittest.TestCase):
+    def test_chat_reasoning_normalizes_local_runtime_fields(self) -> None:
+        data = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "Check the stage state first.",
+                        "content": [
+                            {"type": "reasoning", "text": "Then validate the requested range."},
+                            {"type": "text", "text": "I can do that."},
+                        ],
+                    }
+                }
+            ]
+        }
+
+        self.assertEqual(
+            extract_chat_reasoning(data),
+            ["Check the stage state first.", "Then validate the requested range."],
+        )
+        assistant = chat_assistant_message(data)
+        self.assertEqual(assistant["reasoning_content"], "Check the stage state first.")
+        metrics = chat_model_response_metrics(data, round_index=0, elapsed_seconds=0.1)
+        self.assertTrue(metrics["has_reasoning"])
+        self.assertEqual(metrics["reasoning_summary_item_count"], 2)
+
+    def test_chat_metrics_accept_reasoning_token_usage_variants(self) -> None:
+        metrics = chat_model_response_metrics(
+            {
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 8,
+                    "completion_tokens_details": {"reasoning_tokens": 5},
+                    "total_tokens": 18,
+                },
+            },
+            round_index=0,
+            elapsed_seconds=0.1,
+        )
+        self.assertEqual(metrics["reasoning_tokens"], 5)
+
+    def test_chat_tool_loop_emits_and_replays_reasoning_content(self) -> None:
+        async def exercise() -> tuple[dict, list[dict], list[tuple[str, int]]]:
+            config = AiConfig(
+                base_url="https://example.invalid/v1",
+                model="openai/gpt-oss-120b",
+                api_key="test-key",
+                wire_api="chat_completions",
+                reasoning_effort="high",
+                chat_template_kwargs={"enable_thinking": True, "preserve_thinking": True},
+            )
+            provider = AiProvider(config)
+            requests: list[dict] = []
+            responses = [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "reasoning_content": "Inspect the stage before moving it.",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_status",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "runtime_status",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                },
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "reasoning_content": "The status is safe; report completion.",
+                                "content": "Stage status is safe.",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+            ]
+
+            async def fake_post(payload: dict, **_: object) -> dict:
+                requests.append(deepcopy(payload))
+                return responses.pop(0)
+
+            async def call_tool(_: str, __: dict) -> dict:
+                return {"ok": True, "stage": "idle"}
+
+            thinking: list[tuple[str, int]] = []
+
+            async def on_reasoning(text: str, round_index: int) -> None:
+                thinking.append((text, round_index))
+
+            provider._post_chat_completion = fake_post  # type: ignore[method-assign]
+            result = await provider.ask_with_tools(
+                prompt="Check the stage",
+                events=[],
+                tools=[
+                    {
+                        "name": "runtime_status",
+                        "description": "Read runtime status",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+                call_tool=call_tool,
+                on_reasoning=on_reasoning,
+            )
+            return result, requests, thinking
+
+        result, requests, thinking = asyncio.run(exercise())
+
+        self.assertEqual(result["text"], "Stage status is safe.")
+        self.assertEqual(
+            result["reasoning"],
+            ["Inspect the stage before moving it.", "The status is safe; report completion."],
+        )
+        self.assertEqual(
+            thinking,
+            [
+                ("Inspect the stage before moving it.", 0),
+                ("The status is safe; report completion.", 1),
+            ],
+        )
+        assistant = requests[1]["messages"][2]
+        self.assertEqual(
+            requests[0]["chat_template_kwargs"],
+            {"enable_thinking": True, "preserve_thinking": True},
+        )
+        self.assertEqual(assistant["reasoning_content"], "Inspect the stage before moving it.")
+        self.assertEqual(assistant["tool_calls"][0]["id"], "call_status")
+        self.assertEqual(requests[1]["messages"][3]["role"], "tool")
+
     def test_native_response_compaction_is_transport_specific(self) -> None:
         responses_config = AiConfig(
             wire_api="responses",

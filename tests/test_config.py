@@ -119,6 +119,94 @@ class CockpitConfigTests(unittest.TestCase):
         self.assertEqual(config.ai.active_profile, "codex-5-6-terra")
         self.assertEqual(config.ai.reasoning_context, "all_turns")
 
+    def test_profile_chat_template_kwargs_are_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            ai_config_path = Path(temp_dir) / "ai.json"
+            ai_config_path.write_text(
+                json.dumps(
+                    {
+                        "active_profile": "dgx-qwen",
+                        "profiles": [
+                            {
+                                "id": "dgx-qwen",
+                                "label": "DGX Qwen",
+                                "base_url": "http://dgx.local:8000/v1",
+                                "model": "Qwen/Qwen3.6-35B-A3B",
+                                "wire_api": "chat_completions",
+                                "chat_template_kwargs": {
+                                    "enable_thinking": True,
+                                    "preserve_thinking": True,
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_AI_CONFIG": str(ai_config_path),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-ai-auth.json"),
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertEqual(config.ai.wire_api, "chat_completions")
+        self.assertEqual(
+            config.ai.chat_template_kwargs,
+            {"enable_thinking": True, "preserve_thinking": True},
+        )
+
+    def test_unified_apis_file_is_single_source_for_profiles_and_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            apis_path = Path(temp_dir) / "apis.json"
+            apis_path.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "active_profile": "dgx",
+                        "api_keys": {"dgx": "EMPTY"},
+                        "profiles": [
+                            {
+                                "id": "dgx",
+                                "label": "DGX local",
+                                "base_url": "http://127.0.0.1:8000/v1",
+                                "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+                                "provider_name": "dgx",
+                                "wire_api": "chat_completions",
+                                "chat_template_kwargs": {"enable_thinking": True},
+                                "api_key_id": "dgx",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_APIS_FILE": str(apis_path),
+                    "DASHBOARD_AI_CONFIG": str(Path(temp_dir) / "missing-legacy.json"),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-auth.json"),
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertEqual(config.ai.active_profile, "dgx")
+        self.assertEqual(config.ai.model, "nvidia/Qwen3.6-35B-A3B-NVFP4")
+        self.assertEqual(config.ai.api_key, "EMPTY")
+        self.assertEqual(config.ai.wire_api, "chat_completions")
+        self.assertEqual(config.ai.chat_template_kwargs, {"enable_thinking": True})
+
     def test_scene_interval_config_controls_dashboard_scene_publisher_env(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"

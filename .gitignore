@@ -5,6 +5,7 @@ __pycache__/
 .env
 backend/ai_config.local.json
 backend/ai_auth.local.json
+backend/apis.local.json
 backend/*.local.json
 node_modules/
 .pytest_cache/

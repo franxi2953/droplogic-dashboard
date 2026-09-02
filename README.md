@@ -125,16 +125,89 @@ Saving injection holes writes `cartridge.default.json` in the first matching pin
 
 ## AI Provider
 
-The backend reads model profiles from private Dashboard files:
+The backend reads model profiles and local API credentials from one private Dashboard file:
 
 ```text
-backend/ai_config.local.json
-backend/ai_auth.local.json
+backend/apis.local.json
 ```
 
-Both files are ignored by git. The config file stores profile ids, labels, RKAPI URLs, model names, reasoning settings, and `api_key_id` references. The auth file stores the matching API keys.
+The file is ignored by git. Copy `backend/apis.example.json` to
+`backend/apis.local.json` and edit the endpoint, model, wire API, reasoning
+settings, and `api_keys` in that one file. Existing installations using
+`ai_config.local.json` plus `ai_auth.local.json` remain supported as a fallback.
 
 Profiles may use different RKAPI wire formats. Codex-style profiles can use `wire_api: "responses"`; Claude profiles currently use `wire_api: "anthropic_messages"` so Dashboard can read returned `thinking`, `text`, and `tool_use` blocks.
+
+### DGX local OpenAI-compatible endpoint
+
+For a vLLM/SGLang server on the DGX, use the Chat Completions adapter. The
+Dashboard accepts the standard `tool_calls` shape and normalizes local
+reasoning fields (`reasoning_content`, `reasoning`, and `thinking`) into the
+same `agent_thinking` events used by Codex and Claude. When a model returns a
+reasoning channel, it is replayed in the next assistant message so Qwen/gpt-oss
+can continue a tool-use turn without losing its reasoning state.
+
+Put profiles like these in `backend/apis.local.json`:
+
+```json
+{
+  "active_profile": "dgx-qwen36",
+  "api_keys": {
+    "dgx": "EMPTY"
+  },
+  "profiles": [
+    {
+      "id": "dgx-qwen36",
+      "label": "DGX Qwen3.6 NVFP4 executor",
+      "base_url": "http://DGX_HOST:8000/v1",
+      "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "provider_name": "dgx",
+      "wire_api": "chat_completions",
+      "reasoning_effort": "high",
+      "chat_template_kwargs": {
+        "enable_thinking": true,
+        "preserve_thinking": true
+      },
+      "api_key_id": "dgx"
+    },
+    {
+      "id": "dgx-gpt-oss-120b",
+      "label": "DGX gpt-oss-120b planner",
+      "base_url": "http://DGX_HOST:8001/v1",
+      "model": "openai/gpt-oss-120b",
+      "provider_name": "dgx",
+      "wire_api": "chat_completions",
+      "reasoning_effort": "high",
+      "api_key_id": "dgx"
+    }
+  ]
+}
+```
+
+For a local vLLM server with no authentication, keep the `EMPTY` placeholder
+shown above; the Dashboard requires a non-empty key so the provider is
+considered configured.
+
+NVIDIA publishes a DGX Spark vLLM command for this NVFP4 checkpoint. The
+important compatibility flags are `--quantization modelopt`, `--kv-cache-dtype
+fp8`, `--reasoning-parser qwen3`, `--tool-call-parser qwen3_xml`, and
+`--enable-auto-tool-choice`; use the complete command from the [NVIDIA model
+card](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) rather than guessing
+parser names. Its default maximum context is 262K, but start with 32K or 64K
+and raise it only after measuring free unified memory.
+
+For `gpt-oss-120b`, follow the [official OpenAI vLLM guide](https://developers.openai.com/cookbook/articles/gpt-oss/run-vllm)
+and verify the DGX Spark ARM64/CUDA build before making it a resident second
+server. OpenAI's published vLLM wheel is a special `0.10.1+gptoss` build with a
+CUDA 12.8 nightly dependency; it is not evidence that the same wheel is
+compatible with every DGX Spark image.
+
+The two profiles are independently selectable and make A/B evaluation easy.
+Calling one profile a "planner" does not automatically create a planner /
+executor pipeline: that requires an orchestrator which passes a structured
+plan to the executor. Until that is benchmarked, run the same MCP scenarios
+against each profile and compare tool-call validity, recovery after tool
+errors, unsafe-action rate, and end-to-end completion, not just token speed.
 
 All providers share the Dashboard context policy: deterministic event compaction, persistent
 context checkpoints, pinned operating context, bounded tool outputs, and retry-time payload
@@ -155,7 +228,7 @@ response metrics as `dashboard` or `dashboard+native_responses`.
 
 The browser receives only public profile metadata such as label/model/configured status. It never receives API keys.
 
-Minimal shape:
+Minimal shape of `backend/apis.local.json`:
 
 ```json
 {
@@ -170,17 +243,16 @@ Minimal shape:
       "reasoning_effort": "xhigh",
       "api_key_id": "codex"
     }
-  ]
-}
-```
-
-```json
-{
+  ],
   "api_keys": {
     "codex": "..."
   }
 }
 ```
+
+Set `DASHBOARD_APIS_FILE` when the file lives outside the repository. The
+older `DASHBOARD_AI_CONFIG` and `DASHBOARD_AI_AUTH` variables remain available
+for compatibility.
 
 ## Local Speech Input
 

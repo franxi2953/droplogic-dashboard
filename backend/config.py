@@ -62,6 +62,9 @@ class AiProfile:
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
     reasoning_context: str | None = None
+    # Extra OpenAI-compatible request fields used by local runtimes. Qwen3.6
+    # uses chat_template_kwargs to enable and preserve its thinking channel.
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     api_key: str | None = None
     api_key_id: str | None = None
     api_key_env: str | None = None
@@ -77,8 +80,10 @@ class AiConfig:
     reasoning_effort: str | None = None
     reasoning_summary: str | None = "auto"
     reasoning_context: str | None = None
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     api_key: str | None = None
-    ai_config_file: str = "backend/ai_config.local.json"
+    # Single local source of truth for model endpoints, profiles, and keys.
+    ai_config_file: str = "backend/apis.local.json"
     ai_auth_file: str = "backend/ai_auth.local.json"
     active_profile: str | None = None
     profiles: list[AiProfile] = field(default_factory=list)
@@ -185,8 +190,13 @@ def load_config(path: str | None = None) -> CockpitConfig:
             reasoning_effort=ai_raw.get("reasoning_effort"),
             reasoning_summary=ai_raw.get("reasoning_summary", "auto"),
             reasoning_context=ai_raw.get("reasoning_context"),
+            chat_template_kwargs=(
+                dict(ai_raw["chat_template_kwargs"])
+                if isinstance(ai_raw.get("chat_template_kwargs"), dict)
+                else {}
+            ),
             api_key=ai_raw.get("api_key"),
-            ai_config_file=str(ai_raw.get("ai_config_file", "backend/ai_config.local.json")),
+            ai_config_file=str(ai_raw.get("ai_config_file", "backend/apis.local.json")),
             ai_auth_file=str(ai_raw.get("ai_auth_file", "backend/ai_auth.local.json")),
             active_profile=ai_raw.get("active_profile") or ai_raw.get("active_profile_id"),
             profiles=[
@@ -258,6 +268,11 @@ def parse_ai_profile(raw: dict[str, Any]) -> AiProfile:
         reasoning_effort=raw.get("reasoning_effort"),
         reasoning_summary=raw.get("reasoning_summary"),
         reasoning_context=raw.get("reasoning_context"),
+        chat_template_kwargs=(
+            dict(raw["chat_template_kwargs"])
+            if isinstance(raw.get("chat_template_kwargs"), dict)
+            else {}
+        ),
         api_key=raw.get("api_key"),
         api_key_id=raw.get("api_key_id") or raw.get("key_id"),
         api_key_env=raw.get("api_key_env"),
@@ -265,11 +280,21 @@ def parse_ai_profile(raw: dict[str, Any]) -> AiProfile:
 
 
 def apply_dashboard_ai_files(ai: AiConfig) -> None:
+    explicit_config_path = os.environ.get("DASHBOARD_APIS_FILE") or os.environ.get("DASHBOARD_AI_CONFIG")
     config_path = resolve_dashboard_path(
-        os.environ.get("DASHBOARD_AI_CONFIG", ai.ai_config_file),
-        default_filename="ai_config.local.json",
+        explicit_config_path or ai.ai_config_file,
+        default_filename="apis.local.json",
     )
     raw_config = load_json(config_path)
+    # Keep existing installations working while the unified APIs file becomes
+    # the canonical configuration.
+    if not raw_config and not explicit_config_path and config_path.name == "apis.local.json":
+        raw_config = load_json(
+            resolve_dashboard_path(
+                "backend/ai_config.local.json",
+                default_filename="ai_config.local.json",
+            )
+        )
     if raw_config:
         if "enabled" in raw_config:
             ai.enabled = bool(raw_config["enabled"])
@@ -280,6 +305,9 @@ def apply_dashboard_ai_files(ai: AiConfig) -> None:
         ai.reasoning_effort = raw_config.get("reasoning_effort", ai.reasoning_effort)
         ai.reasoning_summary = raw_config.get("reasoning_summary", ai.reasoning_summary)
         ai.reasoning_context = raw_config.get("reasoning_context", ai.reasoning_context)
+        ai.api_key = raw_config.get("api_key", ai.api_key)
+        if isinstance(raw_config.get("chat_template_kwargs"), dict):
+            ai.chat_template_kwargs = dict(raw_config["chat_template_kwargs"])
         ai.native_response_compaction_enabled = bool(
             raw_config.get("native_response_compaction_enabled", ai.native_response_compaction_enabled)
         )
@@ -293,6 +321,10 @@ def apply_dashboard_ai_files(ai: AiConfig) -> None:
                 for item in raw_config["profiles"]
                 if isinstance(item, dict)
             ]
+
+        inline_keys = raw_config.get("api_keys")
+        if isinstance(inline_keys, dict):
+            apply_ai_auth(ai, {"api_keys": inline_keys})
 
     auth = load_json(
         resolve_dashboard_path(
@@ -326,7 +358,18 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     cfg.ai.reasoning_effort = os.environ.get("COCKPIT_AI_REASONING_EFFORT", cfg.ai.reasoning_effort)
     cfg.ai.reasoning_summary = os.environ.get("COCKPIT_AI_REASONING_SUMMARY", cfg.ai.reasoning_summary)
     cfg.ai.reasoning_context = os.environ.get("COCKPIT_AI_REASONING_CONTEXT", cfg.ai.reasoning_context)
-    cfg.ai.ai_config_file = os.environ.get("DASHBOARD_AI_CONFIG", cfg.ai.ai_config_file)
+    chat_template_kwargs_json = os.environ.get("COCKPIT_AI_CHAT_TEMPLATE_KWARGS_JSON")
+    if chat_template_kwargs_json:
+        try:
+            parsed_chat_template_kwargs = json.loads(chat_template_kwargs_json)
+            if isinstance(parsed_chat_template_kwargs, dict):
+                cfg.ai.chat_template_kwargs = parsed_chat_template_kwargs
+        except json.JSONDecodeError:
+            pass
+    cfg.ai.ai_config_file = os.environ.get(
+        "DASHBOARD_APIS_FILE",
+        os.environ.get("DASHBOARD_AI_CONFIG", cfg.ai.ai_config_file),
+    )
     cfg.ai.ai_auth_file = os.environ.get("DASHBOARD_AI_AUTH", cfg.ai.ai_auth_file)
     cfg.ai.active_profile = os.environ.get("COCKPIT_AI_PROFILE", cfg.ai.active_profile)
     profiles_json = os.environ.get("COCKPIT_AI_PROFILES_JSON")
@@ -455,6 +498,7 @@ def finalize_ai_profiles(ai: AiConfig) -> None:
                 reasoning_effort=ai.reasoning_effort,
                 reasoning_summary=ai.reasoning_summary,
                 reasoning_context=ai.reasoning_context,
+                chat_template_kwargs=dict(ai.chat_template_kwargs),
                 api_key=ai.api_key,
             )
         )
@@ -511,6 +555,8 @@ def resolve_ai_profile(profile: AiProfile, fallback: AiConfig) -> None:
     fill_profile_field(profile, "reasoning_effort", fallback.reasoning_effort)
     fill_profile_field(profile, "reasoning_summary", fallback.reasoning_summary)
     fill_profile_field(profile, "reasoning_context", fallback.reasoning_context)
+    if not profile.chat_template_kwargs and fallback.chat_template_kwargs:
+        profile.chat_template_kwargs = dict(fallback.chat_template_kwargs)
     if profile.api_key_env and not profile.api_key:
         profile.api_key = os.environ.get(profile.api_key_env)
     if profile.base_url:
@@ -543,6 +589,7 @@ def select_ai_profile(
     ai.reasoning_effort = profile.reasoning_effort
     ai.reasoning_summary = profile.reasoning_summary
     ai.reasoning_context = profile.reasoning_context
+    ai.chat_template_kwargs = dict(profile.chat_template_kwargs)
     ai.api_key = profile.api_key
     return ai_profile_public(profile, active=True)
 
@@ -575,6 +622,7 @@ def active_ai_profile_public(ai: AiConfig) -> dict[str, Any]:
         "reasoning_effort": ai.reasoning_effort,
         "reasoning_summary": ai.reasoning_summary,
         "reasoning_context": ai.reasoning_context,
+        "chat_template_kwargs": dict(ai.chat_template_kwargs),
         "configured": bool(ai.enabled and ai.api_key and ai.base_url and ai.model),
         "active": True,
         "has_api_key": bool(ai.api_key),
@@ -592,6 +640,7 @@ def ai_profile_public(profile: AiProfile, active: bool = False) -> dict[str, Any
         "reasoning_effort": profile.reasoning_effort,
         "reasoning_summary": profile.reasoning_summary,
         "reasoning_context": profile.reasoning_context,
+        "chat_template_kwargs": dict(profile.chat_template_kwargs),
         "api_key_id": profile.api_key_id,
         "configured": ai_profile_configured(profile),
         "active": active,
