@@ -138,29 +138,47 @@ settings, and `api_keys` in that one file. Existing installations using
 
 Profiles may use different RKAPI wire formats. Codex-style profiles can use `wire_api: "responses"`; Claude profiles currently use `wire_api: "anthropic_messages"` so Dashboard can read returned `thinking`, `text`, and `tool_use` blocks.
 
-### DGX local OpenAI-compatible endpoint
+### DGX local gateway
 
-For a vLLM/SGLang server on the DGX, use the Chat Completions adapter. The
-Dashboard accepts the standard `tool_calls` shape and normalizes local
+For a DGX deployment, put a single OpenAI-compatible gateway in front of the
+resident model servers. The Dashboard then has one URL and one active profile;
+the gateway owns backend URLs and model aliases. A LiteLLM configuration
+template is provided at
+[`deploy/dgx/litellm.config.example.yaml`](deploy/dgx/litellm.config.example.yaml).
+After starting the resident vLLM/SGLang servers on ports 8000 and 8001, launch
+the gateway on the DGX with:
+
+```bash
+python -m pip install 'litellm[proxy]'
+litellm --config deploy/dgx/litellm.config.example.yaml --host 0.0.0.0 --port 4000
+```
+
+Keep port 4000 on the lab network or behind SSH/VPN; do not expose an
+unauthenticated gateway to the public internet. The template leaves
+authentication disabled for a private localhost deployment. To enable it,
+uncomment `general_settings.master_key`, set `DGX_GATEWAY_KEY`, and put the
+same value in `api_keys.dgx`.
+
+The Dashboard accepts the standard `tool_calls` shape and normalizes local
 reasoning fields (`reasoning_content`, `reasoning`, and `thinking`) into the
 same `agent_thinking` events used by Codex and Claude. When a model returns a
 reasoning channel, it is replayed in the next assistant message so Qwen/gpt-oss
 can continue a tool-use turn without losing its reasoning state.
 
-Put profiles like these in `backend/apis.local.json`:
+Put one gateway profile in `backend/apis.local.json`:
 
 ```json
 {
-  "active_profile": "dgx-qwen36",
+  "active_profile": "dgx-gateway",
   "api_keys": {
     "dgx": "EMPTY"
   },
   "profiles": [
     {
-      "id": "dgx-qwen36",
-      "label": "DGX Qwen3.6 NVFP4 executor",
-      "base_url": "http://DGX_HOST:8000/v1",
-      "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "id": "dgx-gateway",
+      "label": "DGX local model gateway",
+      "base_url": "http://DGX_HOST:4000/v1",
+      "model": "dgx-auto",
       "provider_name": "dgx",
       "wire_api": "chat_completions",
       "reasoning_effort": "high",
@@ -168,16 +186,6 @@ Put profiles like these in `backend/apis.local.json`:
         "enable_thinking": true,
         "preserve_thinking": true
       },
-      "api_key_id": "dgx"
-    },
-    {
-      "id": "dgx-gpt-oss-120b",
-      "label": "DGX gpt-oss-120b planner",
-      "base_url": "http://DGX_HOST:8001/v1",
-      "model": "openai/gpt-oss-120b",
-      "provider_name": "dgx",
-      "wire_api": "chat_completions",
-      "reasoning_effort": "high",
       "api_key_id": "dgx"
     }
   ]
@@ -202,12 +210,20 @@ server. OpenAI's published vLLM wheel is a special `0.10.1+gptoss` build with a
 CUDA 12.8 nightly dependency; it is not evidence that the same wheel is
 compatible with every DGX Spark image.
 
-The two profiles are independently selectable and make A/B evaluation easy.
-Calling one profile a "planner" does not automatically create a planner /
-executor pipeline: that requires an orchestrator which passes a structured
-plan to the executor. Until that is benchmarked, run the same MCP scenarios
-against each profile and compare tool-call validity, recovery after tool
-errors, unsafe-action rate, and end-to-end completion, not just token speed.
+The example file also contains `dgx-qwen36` and `dgx-gpt-oss-120b` aliases, all
+pointing to the same gateway URL, plus the existing RKAPI Codex and Claude
+profiles (their keys are intentionally empty until configured). Selecting a
+DGX alias changes only the `model` field sent to the gateway; the Dashboard
+still uses one API endpoint.
+
+The gateway can expose both models through aliases on the same URL, which is
+enough for A/B evaluation. A gateway load-balancing two deployments does not
+automatically create a planner/executor pipeline. That requires an
+orchestrator which passes a structured plan to the executor and owns the
+conversation/tool state. Start with one deterministic model alias, benchmark
+the same MCP scenarios against both aliases, and add semantic planner routing
+only after measuring tool-call validity, recovery after tool errors, unsafe
+action rate, and end-to-end completion.
 
 All providers share the Dashboard context policy: deterministic event compaction, persistent
 context checkpoints, pinned operating context, bounded tool outputs, and retry-time payload

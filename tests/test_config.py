@@ -10,6 +10,28 @@ from backend.config import load_config
 
 
 class CockpitConfigTests(unittest.TestCase):
+    def test_dgx_example_uses_one_gateway_endpoint_with_aliases(self) -> None:
+        example_path = Path(__file__).resolve().parents[1] / "backend" / "apis.example.json"
+        example = json.loads(example_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(example["active_profile"], "dgx-gateway")
+        self.assertGreaterEqual(len(example["profiles"]), 3)
+        profile = next(item for item in example["profiles"] if item["id"] == "dgx-gateway")
+        self.assertEqual(profile["id"], "dgx-gateway")
+        self.assertEqual(profile["base_url"], "http://DGX_HOST:4000/v1")
+        self.assertEqual(profile["model"], "dgx-auto")
+        self.assertEqual(profile["wire_api"], "chat_completions")
+        dgx_profiles = [item for item in example["profiles"] if item["id"].startswith("dgx-")]
+        self.assertEqual(
+            {item["base_url"] for item in dgx_profiles},
+            {"http://DGX_HOST:4000/v1"},
+        )
+        self.assertEqual(
+            {item["id"] for item in example["profiles"]}
+            & {"claude-opus-4-8", "gpt-5-6-terra"},
+            {"claude-opus-4-8", "gpt-5-6-terra"},
+        )
+
     def test_example_model_catalog_contains_comparable_xhigh_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(

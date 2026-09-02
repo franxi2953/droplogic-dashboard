@@ -1,15 +1,31 @@
 {
   "enabled": true,
-  "active_profile": "dgx-qwen36",
+  "active_profile": "dgx-gateway",
   "api_keys": {
-    "dgx": "EMPTY"
+    "dgx": "EMPTY",
+    "codex": "",
+    "claude_opus_4_8": ""
   },
   "profiles": [
     {
+      "id": "dgx-gateway",
+      "label": "DGX local model gateway",
+      "base_url": "http://DGX_HOST:4000/v1",
+      "model": "dgx-auto",
+      "provider_name": "dgx",
+      "wire_api": "chat_completions",
+      "reasoning_effort": "high",
+      "chat_template_kwargs": {
+        "enable_thinking": true,
+        "preserve_thinking": true
+      },
+      "api_key_id": "dgx"
+    },
+    {
       "id": "dgx-qwen36",
-      "label": "DGX Qwen3.6 NVFP4 executor",
-      "base_url": "http://127.0.0.1:8000/v1",
-      "model": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+      "label": "DGX Qwen3.6 via gateway",
+      "base_url": "http://DGX_HOST:4000/v1",
+      "model": "dgx-qwen36",
       "provider_name": "dgx",
       "wire_api": "chat_completions",
       "reasoning_effort": "high",
@@ -21,13 +37,57 @@
     },
     {
       "id": "dgx-gpt-oss-120b",
-      "label": "DGX gpt-oss-120b planner",
-      "base_url": "http://127.0.0.1:8001/v1",
-      "model": "openai/gpt-oss-120b",
+      "label": "DGX gpt-oss-120b via gateway",
+      "base_url": "http://DGX_HOST:4000/v1",
+      "model": "dgx-gpt-oss-120b",
       "provider_name": "dgx",
       "wire_api": "chat_completions",
       "reasoning_effort": "high",
       "api_key_id": "dgx"
+    },
+    {
+      "id": "claude-opus-5",
+      "label": "Claude Opus 5",
+      "base_url": "https://rkapi.com/v1",
+      "model": "claude-opus-5",
+      "provider_name": "anthropic",
+      "wire_api": "anthropic_messages",
+      "reasoning_effort": "xhigh",
+      "api_key_id": "claude_opus_4_8"
+    },
+    {
+      "id": "claude-opus-4-8",
+      "label": "Claude Opus 4.8",
+      "base_url": "https://rkapi.com/v1",
+      "model": "claude-opus-4-8",
+      "provider_name": "anthropic",
+      "wire_api": "anthropic_messages",
+      "reasoning_effort": "xhigh",
+      "api_key_id": "claude_opus_4_8"
+    },
+    {
+      "id": "gpt-5-6-terra",
+      "label": "GPT-5.6 Terra",
+      "base_url": "https://rkapi.com/v1",
+      "model": "gpt-5.6-terra",
+      "provider_name": "openai",
+      "wire_api": "responses",
+      "reasoning_effort": "xhigh",
+      "reasoning_summary": "detailed",
+      "reasoning_context": "all_turns",
+      "api_key_id": "codex"
+    },
+    {
+      "id": "gpt-5-6-sol",
+      "label": "GPT-5.6 Sol",
+      "base_url": "https://rkapi.com/v1",
+      "model": "gpt-5.6-sol",
+      "provider_name": "openai",
+      "wire_api": "responses",
+      "reasoning_effort": "xhigh",
+      "reasoning_summary": "detailed",
+      "reasoning_context": "all_turns",
+      "api_key_id": "codex"
     }
   ]
 }
