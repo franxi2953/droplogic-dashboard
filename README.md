@@ -145,8 +145,8 @@ resident model servers. The Dashboard then has one URL and one active profile;
 the gateway owns backend URLs and model aliases. A LiteLLM configuration
 template is provided at
 [`deploy/dgx/litellm.config.example.yaml`](deploy/dgx/litellm.config.example.yaml).
-After starting the resident vLLM/SGLang servers on ports 8000 and 8001, launch
-the gateway on the DGX with:
+After starting the single Qwen3.6 vLLM/SGLang server on port 8000, launch the
+gateway on the DGX with:
 
 ```bash
 python -m pip install 'litellm[proxy]'
@@ -204,26 +204,15 @@ card](https://huggingface.co/nvidia/Qwen3.6-35B-A3B-NVFP4) rather than guessing
 parser names. Its default maximum context is 262K, but start with 32K or 64K
 and raise it only after measuring free unified memory.
 
-For `gpt-oss-120b`, follow the [official OpenAI vLLM guide](https://developers.openai.com/cookbook/articles/gpt-oss/run-vllm)
-and verify the DGX Spark ARM64/CUDA build before making it a resident second
-server. OpenAI's published vLLM wheel is a special `0.10.1+gptoss` build with a
-CUDA 12.8 nightly dependency; it is not evidence that the same wheel is
-compatible with every DGX Spark image.
-
-The example file also contains `dgx-qwen36` and `dgx-gpt-oss-120b` aliases, all
-pointing to the same gateway URL, plus the existing RKAPI Codex and Claude
-profiles (their keys are intentionally empty until configured). Selecting a
-DGX alias changes only the `model` field sent to the gateway; the Dashboard
-still uses one API endpoint.
-
-The gateway can expose both models through aliases on the same URL, which is
-enough for A/B evaluation. A gateway load-balancing two deployments does not
-automatically create a planner/executor pipeline. That requires an
+The DGX configuration intentionally starts with one resident model and one
+gateway alias. The versioned `config.example.json` and the provider code keep
+the existing RKAPI Codex and Claude adapters available; this DGX-only
+`apis.local.json` does not activate those remote profiles. Add them to the
+private file later if you want them in the same profile selector.
+Adding `gpt-oss-120b` later is a separate deployment decision; it should not be
+treated as an automatic planner/executor pipeline. That would require an
 orchestrator which passes a structured plan to the executor and owns the
-conversation/tool state. Start with one deterministic model alias, benchmark
-the same MCP scenarios against both aliases, and add semantic planner routing
-only after measuring tool-call validity, recovery after tool errors, unsafe
-action rate, and end-to-end completion.
+conversation/tool state.
 
 All providers share the Dashboard context policy: deterministic event compaction, persistent
 context checkpoints, pinned operating context, bounded tool outputs, and retry-time payload

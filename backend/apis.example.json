@@ -22,30 +22,6 @@
       "api_key_id": "dgx"
     },
     {
-      "id": "dgx-qwen36",
-      "label": "DGX Qwen3.6 via gateway",
-      "base_url": "http://DGX_HOST:4000/v1",
-      "model": "dgx-qwen36",
-      "provider_name": "dgx",
-      "wire_api": "chat_completions",
-      "reasoning_effort": "high",
-      "chat_template_kwargs": {
-        "enable_thinking": true,
-        "preserve_thinking": true
-      },
-      "api_key_id": "dgx"
-    },
-    {
-      "id": "dgx-gpt-oss-120b",
-      "label": "DGX gpt-oss-120b via gateway",
-      "base_url": "http://DGX_HOST:4000/v1",
-      "model": "dgx-gpt-oss-120b",
-      "provider_name": "dgx",
-      "wire_api": "chat_completions",
-      "reasoning_effort": "high",
-      "api_key_id": "dgx"
-    },
-    {
       "id": "claude-opus-5",
       "label": "Claude Opus 5",
       "base_url": "https://rkapi.com/v1",

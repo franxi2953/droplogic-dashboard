@@ -1,30 +1,15 @@
 # Example gateway configuration for a DGX host.
 #
-# Run one vLLM/SGLang server per resident model on localhost (8000/8001), then
-# expose only this gateway port to the Dashboard. The Dashboard never needs to
-# know either backend URL.
+# Run one Qwen3.6 vLLM/SGLang server on localhost:8000, then expose only this
+# gateway port to the Dashboard. The Dashboard never needs to know the backend
+# URL or the underlying checkpoint name.
 
 model_list:
-  # The Dashboard's default model alias. Keep this deterministic while
-  # validating MCP tool calls; change the upstream to gpt-oss for an A/B run.
+  # The only DGX model for the initial deployment.
   - model_name: dgx-auto
     litellm_params:
       model: hosted_vllm/nvidia/Qwen3.6-35B-A3B-NVFP4
       api_base: http://127.0.0.1:8000/v1
-      api_key: EMPTY
-
-  # Optional aliases behind the same gateway URL. These are useful for
-  # benchmark runs, but do not create a planner/executor pipeline by
-  # themselves.
-  - model_name: dgx-qwen36
-    litellm_params:
-      model: hosted_vllm/nvidia/Qwen3.6-35B-A3B-NVFP4
-      api_base: http://127.0.0.1:8000/v1
-      api_key: EMPTY
-  - model_name: dgx-gpt-oss-120b
-    litellm_params:
-      model: hosted_vllm/openai/gpt-oss-120b
-      api_base: http://127.0.0.1:8001/v1
       api_key: EMPTY
 
 # For a gateway reachable beyond a trusted localhost network, enable an auth
