@@ -24,12 +24,104 @@ from backend.ai_provider import (
     chat_assistant_message,
     chat_model_response_metrics,
     context_compaction_strategy,
+    compact_chat_transcript,
     extract_chat_reasoning,
 )
 from backend.config import AiConfig
 
 
 class RetryPayloadCompactionTests(unittest.TestCase):
+    def test_chat_transcript_is_bounded_and_keeps_recent_tool_pair(self) -> None:
+        messages = [
+            {"role": "system", "content": "instructions"},
+            {"role": "user", "content": "authoritative state"},
+        ]
+        for index in range(20):
+            messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": "reasoning " + ("x" * 4_000),
+                        "tool_calls": [
+                            {
+                                "id": f"call_{index}",
+                                "type": "function",
+                                "function": {"name": "status", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": f"call_{index}", "content": "result"},
+                ]
+            )
+
+        removed = compact_chat_transcript(messages, max_chars=10_000)
+
+        self.assertGreater(removed, 0)
+        self.assertLessEqual(len(json.dumps(messages)), 10_000)
+        self.assertIn("context safety", messages[2]["content"])
+        self.assertEqual(messages[-1]["tool_call_id"], "call_19")
+
+    def test_goal_completion_stops_chat_tool_loop_without_followup_model_call(self) -> None:
+        async def exercise() -> tuple[dict, list[dict]]:
+            provider = AiProvider(
+                AiConfig(
+                    base_url="https://example.invalid/v1",
+                    model="dgx-auto",
+                    api_key="test-key",
+                    wire_api="chat_completions",
+                )
+            )
+            requests: list[dict] = []
+            response = {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "complete",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "dashboard_complete_goal",
+                                        "arguments": '{"summary":"done"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+
+            async def fake_post(payload: dict, **_: object) -> dict:
+                requests.append(deepcopy(payload))
+                return response
+
+            async def call_tool(_: str, __: dict) -> dict:
+                return {"ok": True, "status": "complete", "message": "Goal marked complete."}
+
+            provider._post_chat_completion = fake_post  # type: ignore[method-assign]
+            result = await provider.ask_with_tools(
+                prompt="finish",
+                events=[],
+                tools=[
+                    {
+                        "name": "dashboard_complete_goal",
+                        "description": "Complete the active goal",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+                call_tool=call_tool,
+            )
+            return result, requests
+
+        result, requests = asyncio.run(exercise())
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(result["stopped_reason"], "goal_completed")
+        self.assertEqual(result["text"], "Goal marked complete.")
+
     def test_chat_reasoning_normalizes_local_runtime_fields(self) -> None:
         data = {
             "choices": [

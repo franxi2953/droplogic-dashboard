@@ -33,6 +33,8 @@ RECENT_INPUT_TOOL_RESULT_WINDOW = 8
 MAX_ACTIVE_TOOL_OUTPUT_CHARS = 2_500
 MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS = 6_000
 MIN_ACTIVE_TOOL_OUTPUT_CHARS = 500
+MAX_CHAT_TRANSCRIPT_CHARS = 220_000
+CHAT_TRANSCRIPT_RECENT_MESSAGES = 10
 RESPONSE_CONTEXT_SCHEMA_VERSION = 1
 MAX_RESPONSE_CONTEXT_CHARS = 100_000
 MIN_RESPONSE_CONTEXT_CHARS = 20_000
@@ -52,6 +54,48 @@ DASHBOARD_AGENT_INSTRUCTIONS = (
     "repeated immediate status calls. If background planning is running, call "
     "planning_job_status once and wait for its returned result instead of polling in a tight loop."
 )
+
+
+def successful_goal_completion(tool: str, result: Any) -> bool:
+    """Return true only for the dashboard's terminal completion result."""
+    return (
+        tool == "dashboard_complete_goal"
+        and isinstance(result, dict)
+        and result.get("ok") is True
+        and result.get("status") == "complete"
+    )
+
+
+def compact_chat_transcript(messages: list[dict[str, Any]], max_chars: int = MAX_CHAT_TRANSCRIPT_CHARS) -> int:
+    """Bound the in-flight transcript accumulated across tool rounds."""
+    if len(messages) <= 2 or encoded_json_length(messages) <= max_chars:
+        return 0
+    prefix = messages[:2]
+    tail = messages[2:]
+    kept = tail[-CHAT_TRANSCRIPT_RECENT_MESSAGES:]
+    if kept and kept[0].get("role") == "tool" and len(tail) > len(kept):
+        kept.insert(0, tail[-CHAT_TRANSCRIPT_RECENT_MESSAGES - 1])
+    marker = {
+        "role": "user",
+        "content": (
+            "Earlier tool transcript was compacted for context safety. "
+            "Use the authoritative event log and recent tool result; do not repeat confirmed actions."
+        ),
+    }
+    compacted = [*prefix, marker, *kept]
+    # Keep the most recent state if the initial snapshot itself is unusually large.
+    while encoded_json_length(compacted) > max_chars and len(compacted) > 3:
+        compacted.pop(3)
+    if encoded_json_length(compacted) > max_chars:
+        for item in compacted:
+            content = item.get("content")
+            if isinstance(content, str) and len(content) > 2_000:
+                item["content"] = content[-2_000:]
+        while encoded_json_length(compacted) > max_chars and len(compacted) > 2:
+            compacted.pop(2)
+    removed = max(0, len(messages) - len(compacted))
+    messages[:] = compacted
+    return removed
 
 
 @dataclass
@@ -670,6 +714,7 @@ class AiProvider:
         tool_calls: list[dict[str, Any]] = []
         round_index = 0
         pending_calls: list[dict[str, Any]] = []
+        goal_completion_result: dict[str, Any] | None = None
         emitted_texts: set[str] = set()
         await emit_response_text(data, round_index, emitted_texts, on_text)
         reasoning = extract_reasoning_summary(data)
@@ -707,6 +752,12 @@ class AiProvider:
                     }
                 )
                 image_messages.extend(model_attachment_messages(name, call["call_id"], attachments))
+                if successful_goal_completion(name, result):
+                    goal_completion_result = result
+                    break
+            if goal_completion_result is not None:
+                input_list.extend(outputs)
+                break
             input_list.extend(outputs)
             if image_messages:
                 image_message_indices = list(range(len(input_list), len(input_list) + len(image_messages)))
@@ -760,7 +811,14 @@ class AiProvider:
 
         text = extract_response_text(data)
         stopped_reason = None
-        if pending_calls:
+        if goal_completion_result is not None:
+            stopped_reason = "goal_completed"
+            text = str(
+                goal_completion_result.get("message")
+                or goal_completion_result.get("summary")
+                or "Goal completed."
+            )
+        elif pending_calls:
             stopped_reason = "max_tool_rounds"
             pending_names = ", ".join(call["name"] for call in pending_calls)
             text = (
@@ -858,6 +916,7 @@ class AiProvider:
         all_reasoning: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         pending_calls: list[dict[str, Any]] = []
+        goal_completion_result: dict[str, Any] | None = None
         emitted_texts: set[str] = set()
         emitted_reasoning: set[str] = set()
         round_index = 0
@@ -889,12 +948,20 @@ class AiProvider:
                         "content": json.dumps(compacted_result, ensure_ascii=True, default=str),
                     }
                 )
+                if successful_goal_completion(name, result):
+                    goal_completion_result = result
+                    break
+            if goal_completion_result is not None:
+                # The completion tool is terminal. Do not ask the model for
+                # another turn after the dashboard has cleared the goal.
+                break
             compacted_tool_history = compact_consumed_tool_history(messages)
             compacted_tools = await compact_consumed_tool_outputs(
                 messages,
                 max_chars=max_tool_output_chars,
                 on_context_compacted=on_context_compacted,
             )
+            compact_chat_transcript(messages)
             messages[0] = {
                 "role": "system",
                 "content": instructions_with_pinned_context(instructions, pinned_context),
@@ -934,7 +1001,14 @@ class AiProvider:
 
         text = extract_chat_response_text(data)
         stopped_reason = None
-        if pending_calls:
+        if goal_completion_result is not None:
+            stopped_reason = "goal_completed"
+            text = str(
+                goal_completion_result.get("message")
+                or goal_completion_result.get("summary")
+                or "Goal completed."
+            )
+        elif pending_calls:
             stopped_reason = "max_tool_rounds"
             pending_names = ", ".join(call["name"] for call in pending_calls)
             text = (
