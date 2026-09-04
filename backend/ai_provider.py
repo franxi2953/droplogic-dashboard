@@ -33,8 +33,10 @@ RECENT_INPUT_TOOL_RESULT_WINDOW = 8
 MAX_ACTIVE_TOOL_OUTPUT_CHARS = 2_500
 MAX_ACTIVE_TOOL_OUTPUT_BATCH_CHARS = 6_000
 MIN_ACTIVE_TOOL_OUTPUT_CHARS = 500
-MAX_CHAT_TRANSCRIPT_CHARS = 90_000
+MAX_CHAT_TRANSCRIPT_CHARS = 220_000
 CHAT_TRANSCRIPT_RECENT_MESSAGES = 10
+CHAT_CONTEXT_CHARS_PER_TOKEN = 2
+CHAT_CONTEXT_REQUEST_RESERVE_CHARS = 8_000
 RESPONSE_CONTEXT_SCHEMA_VERSION = 1
 MAX_RESPONSE_CONTEXT_CHARS = 100_000
 MIN_RESPONSE_CONTEXT_CHARS = 20_000
@@ -68,7 +70,7 @@ def successful_goal_completion(tool: str, result: Any) -> bool:
 
 def compact_chat_transcript(messages: list[dict[str, Any]], max_chars: int = MAX_CHAT_TRANSCRIPT_CHARS) -> int:
     """Bound the in-flight transcript accumulated across tool rounds."""
-    if len(messages) <= 2 or encoded_json_length(messages) <= max_chars:
+    if encoded_json_length(messages) <= max_chars:
         return 0
     prefix = messages[:2]
     tail = messages[2:]
@@ -96,6 +98,63 @@ def compact_chat_transcript(messages: list[dict[str, Any]], max_chars: int = MAX
     removed = max(0, len(messages) - len(compacted))
     messages[:] = compacted
     return removed
+
+
+def chat_request_char_limit(config: AiConfig) -> int | None:
+    """Translate a configured token limit into a conservative JSON request budget."""
+    try:
+        max_context_tokens = int(config.max_context_tokens or 0)
+    except (TypeError, ValueError):
+        max_context_tokens = 0
+    if max_context_tokens <= 0:
+        return None
+    return max_context_tokens * CHAT_CONTEXT_CHARS_PER_TOKEN - CHAT_CONTEXT_REQUEST_RESERVE_CHARS
+
+
+def enforce_chat_payload_budget(payload: dict[str, Any], config: AiConfig) -> dict[str, Any] | None:
+    """Compact dashboard-owned chat history before it reaches the gateway."""
+    request_limit = chat_request_char_limit(config)
+    messages = payload.get("messages")
+    if request_limit is None or not isinstance(messages, list):
+        return None
+    before = encoded_json_length(payload)
+    if before <= request_limit:
+        return None
+
+    fixed_payload = dict(payload)
+    fixed_payload["messages"] = []
+    fixed_chars = encoded_json_length(fixed_payload)
+    message_limit = request_limit - fixed_chars
+    if message_limit < 4_000:
+        raise RuntimeError(
+            "Configured AI context budget is too small for the current MCP tool schemas. "
+            f"Request limit: {request_limit} chars; non-message payload: {fixed_chars} chars."
+        )
+
+    # Dashboard context is structured JSON, so compact it structurally before
+    # dropping complete historical chat turns.
+    compacted_context_sections = compact_input_user_contexts(
+        messages,
+        target_chars=max(4_000, message_limit // 2),
+    )
+    removed_messages = compact_chat_transcript(messages, max_chars=message_limit)
+    after = encoded_json_length(payload)
+    if after > request_limit:
+        raise RuntimeError(
+            "Dashboard could not fit the request within the configured AI context budget. "
+            f"Request: {after} chars; limit: {request_limit} chars."
+        )
+    return {
+        "scope": "chat_context_budget",
+        "message": "Dashboard compacted chat context before the provider request.",
+        "max_context_tokens": config.max_context_tokens,
+        "estimated_chars_before": before,
+        "estimated_chars_after": after,
+        "request_char_limit": request_limit,
+        "message_char_limit": message_limit,
+        "compacted_user_context_sections": compacted_context_sections,
+        "removed_messages": removed_messages,
+    }
 
 
 @dataclass
@@ -894,6 +953,9 @@ class AiProvider:
             "tool_choice": "auto",
         }
         apply_chat_options(payload, self.config)
+        compaction_details = enforce_chat_payload_budget(payload, self.config)
+        if compaction_details is not None and on_context_compacted is not None:
+            await on_context_compacted(compaction_details)
         request_started = time.monotonic()
         data = await self._post_chat_completion(
             payload,
@@ -961,7 +1023,6 @@ class AiProvider:
                 max_chars=max_tool_output_chars,
                 on_context_compacted=on_context_compacted,
             )
-            compact_chat_transcript(messages)
             messages[0] = {
                 "role": "system",
                 "content": instructions_with_pinned_context(instructions, pinned_context),
@@ -973,6 +1034,9 @@ class AiProvider:
                 "tool_choice": "auto",
             }
             apply_chat_options(followup, self.config)
+            compaction_details = enforce_chat_payload_budget(followup, self.config)
+            if compaction_details is not None and on_context_compacted is not None:
+                await on_context_compacted(compaction_details)
             round_index += 1
             request_started = time.monotonic()
             data = await self._post_chat_completion(

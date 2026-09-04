@@ -62,6 +62,7 @@ class AiProfile:
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
     reasoning_context: str | None = None
+    max_context_tokens: int | None = None
     # Extra OpenAI-compatible request fields used by local runtimes. Qwen3.6
     # uses chat_template_kwargs to enable and preserve its thinking channel.
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -87,6 +88,9 @@ class AiConfig:
     ai_auth_file: str = "backend/ai_auth.local.json"
     active_profile: str | None = None
     profiles: list[AiProfile] = field(default_factory=list)
+    # Optional per-profile total input budget. The provider adapter reserves
+    # space for instructions and tool schemas before retaining chat history.
+    max_context_tokens: int | None = None
     # The cockpit budgets model context in characters. Use ~4 chars/token as
     # a conservative conversion, and keep agent turns below provider edge cases.
     max_context_chars: int = 300_000
@@ -204,6 +208,11 @@ def load_config(path: str | None = None) -> CockpitConfig:
                 for item in ai_raw.get("profiles", [])
                 if isinstance(item, dict)
             ],
+            max_context_tokens=(
+                int(ai_raw["max_context_tokens"])
+                if ai_raw.get("max_context_tokens") is not None
+                else None
+            ),
             max_context_chars=int(ai_raw.get("max_context_chars", 300_000)),
             target_context_chars=int(ai_raw.get("target_context_chars", 40_000)),
             recent_event_target=int(ai_raw.get("recent_event_target", 80)),
@@ -268,6 +277,11 @@ def parse_ai_profile(raw: dict[str, Any]) -> AiProfile:
         reasoning_effort=raw.get("reasoning_effort"),
         reasoning_summary=raw.get("reasoning_summary"),
         reasoning_context=raw.get("reasoning_context"),
+        max_context_tokens=(
+            int(raw["max_context_tokens"])
+            if raw.get("max_context_tokens") is not None
+            else None
+        ),
         chat_template_kwargs=(
             dict(raw["chat_template_kwargs"])
             if isinstance(raw.get("chat_template_kwargs"), dict)
@@ -305,6 +319,8 @@ def apply_dashboard_ai_files(ai: AiConfig) -> None:
         ai.reasoning_effort = raw_config.get("reasoning_effort", ai.reasoning_effort)
         ai.reasoning_summary = raw_config.get("reasoning_summary", ai.reasoning_summary)
         ai.reasoning_context = raw_config.get("reasoning_context", ai.reasoning_context)
+        if raw_config.get("max_context_tokens") is not None:
+            ai.max_context_tokens = int(raw_config["max_context_tokens"])
         ai.api_key = raw_config.get("api_key", ai.api_key)
         if isinstance(raw_config.get("chat_template_kwargs"), dict):
             ai.chat_template_kwargs = dict(raw_config["chat_template_kwargs"])
@@ -384,6 +400,9 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     cfg.ai.target_context_chars = int(
         os.environ.get("COCKPIT_AI_TARGET_CONTEXT_CHARS", cfg.ai.target_context_chars)
     )
+    max_context_tokens = os.environ.get("COCKPIT_AI_MAX_CONTEXT_TOKENS")
+    if max_context_tokens is not None:
+        cfg.ai.max_context_tokens = int(max_context_tokens)
     cfg.ai.recent_event_target = int(os.environ.get("COCKPIT_AI_RECENT_EVENT_TARGET", cfg.ai.recent_event_target))
     cfg.ai.large_event_chars = int(os.environ.get("COCKPIT_AI_LARGE_EVENT_CHARS", cfg.ai.large_event_chars))
     cfg.ai.max_tool_output_chars = int(
@@ -498,6 +517,7 @@ def finalize_ai_profiles(ai: AiConfig) -> None:
                 reasoning_effort=ai.reasoning_effort,
                 reasoning_summary=ai.reasoning_summary,
                 reasoning_context=ai.reasoning_context,
+                max_context_tokens=ai.max_context_tokens,
                 chat_template_kwargs=dict(ai.chat_template_kwargs),
                 api_key=ai.api_key,
             )
@@ -589,6 +609,7 @@ def select_ai_profile(
     ai.reasoning_effort = profile.reasoning_effort
     ai.reasoning_summary = profile.reasoning_summary
     ai.reasoning_context = profile.reasoning_context
+    ai.max_context_tokens = profile.max_context_tokens
     ai.chat_template_kwargs = dict(profile.chat_template_kwargs)
     ai.api_key = profile.api_key
     return ai_profile_public(profile, active=True)
@@ -622,6 +643,7 @@ def active_ai_profile_public(ai: AiConfig) -> dict[str, Any]:
         "reasoning_effort": ai.reasoning_effort,
         "reasoning_summary": ai.reasoning_summary,
         "reasoning_context": ai.reasoning_context,
+        "max_context_tokens": ai.max_context_tokens,
         "chat_template_kwargs": dict(ai.chat_template_kwargs),
         "configured": bool(ai.enabled and ai.api_key and ai.base_url and ai.model),
         "active": True,
@@ -640,6 +662,7 @@ def ai_profile_public(profile: AiProfile, active: bool = False) -> dict[str, Any
         "reasoning_effort": profile.reasoning_effort,
         "reasoning_summary": profile.reasoning_summary,
         "reasoning_context": profile.reasoning_context,
+        "max_context_tokens": profile.max_context_tokens,
         "chat_template_kwargs": dict(profile.chat_template_kwargs),
         "api_key_id": profile.api_key_id,
         "configured": ai_profile_configured(profile),

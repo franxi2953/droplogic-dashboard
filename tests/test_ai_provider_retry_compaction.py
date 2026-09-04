@@ -25,12 +25,48 @@ from backend.ai_provider import (
     chat_model_response_metrics,
     context_compaction_strategy,
     compact_chat_transcript,
+    enforce_chat_payload_budget,
     extract_chat_reasoning,
 )
 from backend.config import AiConfig
 
 
 class RetryPayloadCompactionTests(unittest.TestCase):
+    def test_profile_token_budget_counts_tool_schemas_and_bounds_initial_request(self) -> None:
+        config = AiConfig(max_context_tokens=10_000)
+        payload = {
+            "model": "dgx-auto",
+            "messages": [
+                {"role": "system", "content": "instructions"},
+                {
+                    "role": "user",
+                    "content": (
+                        "Curated dashboard event log JSON for model context:\n"
+                        + json.dumps([{"type": "event", "text": "x" * 20_000}])
+                        + "\n\nUser request:\ndo the work"
+                    ),
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "large_tool",
+                        "description": "y" * 4_000,
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "tool_choice": "auto",
+        }
+
+        details = enforce_chat_payload_budget(payload, config)
+
+        self.assertIsNotNone(details)
+        self.assertLessEqual(len(json.dumps(payload)), 12_000)
+        self.assertGreater(details["compacted_user_context_sections"], 0)
+        self.assertIn("User request:\ndo the work", payload["messages"][-1]["content"])
+
     def test_chat_transcript_is_bounded_and_keeps_recent_tool_pair(self) -> None:
         messages = [
             {"role": "system", "content": "instructions"},

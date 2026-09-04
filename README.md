@@ -182,6 +182,7 @@ Put one gateway profile in `backend/apis.local.json`:
       "provider_name": "dgx",
       "wire_api": "chat_completions",
       "reasoning_effort": "high",
+      "max_context_tokens": 100000,
       "chat_template_kwargs": {
         "enable_thinking": true,
         "preserve_thinking": true

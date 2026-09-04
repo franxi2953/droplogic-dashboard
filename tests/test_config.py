@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from backend.config import load_config
+from backend.config import active_ai_profile_public, load_config, select_ai_profile
 
 
 class CockpitConfigTests(unittest.TestCase):
@@ -21,6 +21,7 @@ class CockpitConfigTests(unittest.TestCase):
         self.assertEqual(profile["base_url"], "http://DGX_HOST:4000/v1")
         self.assertEqual(profile["model"], "dgx-auto")
         self.assertEqual(profile["wire_api"], "chat_completions")
+        self.assertEqual(profile["max_context_tokens"], 100_000)
         dgx_profiles = [item for item in example["profiles"] if item["id"].startswith("dgx-")]
         self.assertEqual([item["id"] for item in dgx_profiles], ["dgx-gateway"])
         self.assertEqual([item["model"] for item in dgx_profiles], ["dgx-auto"])
@@ -181,6 +182,56 @@ class CockpitConfigTests(unittest.TestCase):
             config.ai.chat_template_kwargs,
             {"enable_thinking": True, "preserve_thinking": True},
         )
+
+    def test_profile_context_limit_is_selected_without_leaking_to_other_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            ai_config_path = Path(temp_dir) / "apis.json"
+            ai_config_path.write_text(
+                json.dumps(
+                    {
+                        "active_profile": "dgx",
+                        "api_keys": {"dgx": "EMPTY", "cloud": "secret"},
+                        "profiles": [
+                            {
+                                "id": "dgx",
+                                "label": "DGX",
+                                "base_url": "https://ml.example/v1",
+                                "model": "dgx-auto",
+                                "wire_api": "chat_completions",
+                                "max_context_tokens": 100000,
+                                "api_key_id": "dgx",
+                            },
+                            {
+                                "id": "cloud",
+                                "label": "Cloud",
+                                "base_url": "https://api.example/v1",
+                                "model": "cloud-model",
+                                "wire_api": "responses",
+                                "api_key_id": "cloud",
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_APIS_FILE": str(ai_config_path),
+                    "DASHBOARD_AI_CONFIG": str(Path(temp_dir) / "missing-legacy.json"),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-auth.json"),
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertEqual(config.ai.max_context_tokens, 100_000)
+        self.assertEqual(active_ai_profile_public(config.ai)["max_context_tokens"], 100_000)
+        select_ai_profile(config.ai, "cloud")
+        self.assertIsNone(config.ai.max_context_tokens)
+        self.assertIsNone(active_ai_profile_public(config.ai)["max_context_tokens"])
 
     def test_unified_apis_file_is_single_source_for_profiles_and_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
