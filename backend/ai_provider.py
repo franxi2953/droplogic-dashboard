@@ -1023,6 +1023,7 @@ class AiProvider:
                 max_chars=max_tool_output_chars,
                 on_context_compacted=on_context_compacted,
             )
+            compact_chat_transcript(messages)
             messages[0] = {
                 "role": "system",
                 "content": instructions_with_pinned_context(instructions, pinned_context),
