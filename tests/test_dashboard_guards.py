@@ -116,6 +116,36 @@ class AgentContinuityGuardTests(unittest.TestCase):
         )
 
 
+class LiveWebSocketDisconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_expected_stale_disconnect_is_not_recorded_as_an_error(self) -> None:
+        class StaleSocket:
+            def __aiter__(self) -> "StaleSocket":
+                return self
+
+            async def __anext__(self) -> object:
+                raise RuntimeError(
+                    "received 4001 (private use) dashboard live websocket stale; "
+                    "then sent 4001 (private use) dashboard live websocket stale"
+                )
+
+        recorded: list[tuple[str, dict[str, object]]] = []
+        app = object.__new__(CockpitApp)
+        app.live_clients = set()
+        app._client_send_locks = {}
+        app.live = {}
+
+        async def record(event_type: str, **fields: object) -> dict[str, object]:
+            recorded.append((event_type, fields))
+            return {}
+
+        app.record = record
+        socket = StaleSocket()
+        await app.handle_live_ws(socket)
+
+        self.assertEqual(recorded, [])
+        self.assertNotIn(socket, app.live_clients)
+
+
 class McpToolCatalogRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_list_tools_retries_without_restarting_mcp(self) -> None:
         class FakeSession:

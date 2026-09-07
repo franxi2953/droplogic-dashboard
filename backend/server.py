@@ -1369,6 +1369,9 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     continue
                 if message.get("type") == "get_live" and self.live:
                     await self.safe_send(websocket, {"type": "live", "live": self.live})
+        except Exception as exc:
+            if not websocket_closed_ok(exc):
+                await self.record("live_ws_error", level="warning", message=str(exc))
         finally:
             self.live_clients.discard(websocket)
             self._client_send_locks.pop(websocket, None)
