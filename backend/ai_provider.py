@@ -49,6 +49,11 @@ DASHBOARD_AGENT_INSTRUCTIONS = (
     "unless the tool result confirms it. Keep user-facing narration brief, but use the "
     "available tool calls to make real progress. Continue tool-use until the requested "
     "checkpoint is reached, a user confirmation is required, or a real blocker/error occurs. "
+    "On every continuation, read the most recent MCP result first. Identify the last confirmed "
+    "action and the single immediate unmet requirement, then call exactly the next tool needed. "
+    "Reason as far ahead as necessary to choose that action safely, but do not repeatedly enumerate "
+    "or re-plan the entire protocol. Treat required_next_tool and recommended_status_call in an MCP "
+    "result as authoritative unless they conflict with safety or the named tool is unavailable. "
     "Do not query status after every action; when fresh live state is needed, prefer "
     "execution_status_summary() over separate runtime/executor/matrix/droplet/plan status calls. "
     "If execute_segment_to_breakpoint starts a background wait, call "
@@ -59,7 +64,9 @@ DASHBOARD_AGENT_INSTRUCTIONS = (
     "or clear state again in the same request unless a later tool result explicitly proves the runtime "
     "failed. Match every emitted tool call to the immediate next action stated in your reasoning. "
     "When the user asks to show the whole cartridge, use whole_chip_camera and request a streamer "
-    "visualizer_frame so the camera image is actually recorded and previewable."
+    "visualizer_frame so the camera image is actually recorded and previewable. When the request says "
+    "to show the whole cartridge during the protocol, preserve whole_chip_camera for every segment; "
+    "do not switch back to follow_droplets unless the user requests a microscope inspection."
 )
 
 
