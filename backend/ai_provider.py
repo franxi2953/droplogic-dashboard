@@ -54,7 +54,12 @@ DASHBOARD_AGENT_INSTRUCTIONS = (
     "If execute_segment_to_breakpoint starts a background wait, call "
     "execution_wait_status(wait_seconds=recommended_wait_seconds) as a timer and avoid "
     "repeated immediate status calls. If background planning is running, call "
-    "planning_job_status once and wait for its returned result instead of polling in a tight loop."
+    "planning_job_status once and wait for its returned result instead of polling in a tight loop. "
+    "A successful load_system or restart_system is initialization already completed: never initialize "
+    "or clear state again in the same request unless a later tool result explicitly proves the runtime "
+    "failed. Match every emitted tool call to the immediate next action stated in your reasoning. "
+    "When the user asks to show the whole cartridge, use whole_chip_camera and request a streamer "
+    "visualizer_frame so the camera image is actually recorded and previewable."
 )
 
 

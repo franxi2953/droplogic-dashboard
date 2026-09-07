@@ -98,6 +98,7 @@ class AiConfig:
     recent_event_target: int = 80
     large_event_chars: int = 6_000
     max_tool_output_chars: int = 4_000
+    max_tool_rounds: int = 24
     ai_context_summary_enabled: bool = True
     ai_context_summary_trigger_chars: int = 120_000
     ai_context_summary_max_chars: int = 12_000
@@ -218,6 +219,7 @@ def load_config(path: str | None = None) -> CockpitConfig:
             recent_event_target=int(ai_raw.get("recent_event_target", 80)),
             large_event_chars=int(ai_raw.get("large_event_chars", 6_000)),
             max_tool_output_chars=int(ai_raw.get("max_tool_output_chars", 4_000)),
+            max_tool_rounds=int(ai_raw.get("max_tool_rounds", 24)),
             ai_context_summary_enabled=bool(ai_raw.get("ai_context_summary_enabled", True)),
             ai_context_summary_trigger_chars=int(ai_raw.get("ai_context_summary_trigger_chars", 120_000)),
             ai_context_summary_max_chars=int(ai_raw.get("ai_context_summary_max_chars", 12_000)),
@@ -407,6 +409,9 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     cfg.ai.large_event_chars = int(os.environ.get("COCKPIT_AI_LARGE_EVENT_CHARS", cfg.ai.large_event_chars))
     cfg.ai.max_tool_output_chars = int(
         os.environ.get("COCKPIT_AI_MAX_TOOL_OUTPUT_CHARS", cfg.ai.max_tool_output_chars)
+    )
+    cfg.ai.max_tool_rounds = int(
+        os.environ.get("COCKPIT_AI_MAX_TOOL_ROUNDS", cfg.ai.max_tool_rounds)
     )
     cfg.ai.ai_context_summary_enabled = parse_bool(
         os.environ.get("COCKPIT_AI_CONTEXT_SUMMARY_ENABLED"),

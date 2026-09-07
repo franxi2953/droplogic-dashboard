@@ -612,6 +612,23 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         selection["catalog_count"] = len(shards)
         return selection
 
+    def deterministic_guide_paths(self, prompt: str, goal: dict[str, Any]) -> list[str]:
+        """Route common BoxMini requests without spending a model turn on file selection."""
+        text = f"{prompt}\n{goal.get('objective') or ''}".lower()
+        routes = [
+            (("initialize", "initialise", "load system", "reset matrix", "clear matrix"), "agent-guide/03-startup-state-large-values.md"),
+            (("calibrat",), "agent-guide/04-calibration-geometry.md"),
+            (("plan", "execute", "protocol", "move", "path", "trajectory"), "agent-guide/06-planning-execution-rhythm.md"),
+            (("droplet", "reservoir", "inject"), "agent-guide/07-droplets-reservoirs-injection.md"),
+            (("extract",), "agent-guide/08-reservoir-extraction.md"),
+            (("whole cartridge", "whole chip", "execution view", "follow droplet"), "agent-guide/09-execution-view-modes-diagnostics.md"),
+            (("image", "photo", "camera", "microscope", "brightfield", "fluorescen", "light"), "agent-guide/10-imaging-light-vision.md"),
+            (("temperature", "thermal", "melting"), "agent-guide/11-temperature.md"),
+            (("fault", "unsafe", "emergency", "collision"), "agent-guide/12-faults-safety-stops.md"),
+        ]
+        available = {str(item.get("path") or "") for item in self.available_guide_shards()}
+        return [path for markers, path in routes if path in available and any(marker in text for marker in markers)][:5]
+
     async def broadcast_event(self, event: dict[str, Any]) -> None:
         message = json.dumps({"type": "event", "event": event}, ensure_ascii=True)
         stale = []
@@ -3189,6 +3206,71 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             }
         return None
 
+    @staticmethod
+    def agent_continuity_guard_result(
+        state: dict[str, Any],
+        tool: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Reject destructive repeats and impossible next steps within one agent request."""
+        if tool in {"load_system", "restart_system"} and state.get("initialized"):
+            return {
+                "ok": False,
+                "isError": True,
+                "reason": "agent_state_continuity_guard",
+                "tool_not_run": tool,
+                "error": (
+                    "BoxMini was already initialized successfully in this request. Repeating this call "
+                    "would erase the current droplets and plan. Continue from the confirmed state."
+                ),
+                "required_next_tool": "create_droplet" if not state.get("droplet_created") else None,
+            }
+        if tool == "clear_droplet_state" and (state.get("matrix_reset") or state.get("droplets_cleared")):
+            return {
+                "ok": False,
+                "isError": True,
+                "reason": "agent_state_continuity_guard",
+                "tool_not_run": tool,
+                "error": (
+                    "Droplet and plan state was already cleared in this request. Do not clear it again; "
+                    "continue with droplet creation or the existing plan."
+                ),
+                "required_next_tool": "create_droplet" if not state.get("droplet_created") else None,
+            }
+        if tool in {"plan_move", "start_plan"} and state.get("known_empty") and not state.get("droplet_created"):
+            return {
+                "ok": False,
+                "isError": True,
+                "reason": "agent_state_continuity_guard",
+                "tool_not_run": tool,
+                "error": "No droplet exists after the confirmed reset. Create the requested droplet first.",
+                "required_next_tool": "create_droplet",
+            }
+        return None
+
+    @staticmethod
+    def update_agent_continuity_state(
+        state: dict[str, Any],
+        tool: str,
+        arguments: dict[str, Any],
+        result: Any,
+    ) -> None:
+        if not mcp_tool_call_succeeded(result):
+            return
+        if tool in {"load_system", "restart_system"}:
+            state["initialized"] = True
+            if bool(arguments.get("reset_matrix")):
+                state["matrix_reset"] = True
+                state["known_empty"] = True
+                state["droplet_created"] = False
+        elif tool == "clear_droplet_state":
+            state["droplets_cleared"] = True
+            state["known_empty"] = True
+            state["droplet_created"] = False
+        elif tool == "create_droplet":
+            state["droplet_created"] = True
+            state["known_empty"] = False
+
     async def ensure_required_guide_context(
         self,
         guide_context_state: dict[str, Any],
@@ -3356,13 +3438,22 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         """Run the guide-selector model out of band and apply its MCP context update."""
         events = self.recorder.events_for_run(self.recorder.run_id)
         goal = self.goal_status()
-        selection = await self.select_turn_guide_shards(
-            prompt,
-            goal,
-            events,
-            on_retry,
-            on_context_compacted,
-        )
+        deterministic_paths = self.deterministic_guide_paths(prompt, goal)
+        if deterministic_paths:
+            selection = {
+                "paths": deterministic_paths,
+                "reason": "Deterministic guide routing from the active request and goal.",
+            }
+            selection_source = "deterministic_request_router"
+        else:
+            selection = await self.select_turn_guide_shards(
+                prompt,
+                goal,
+                events,
+                on_retry,
+                on_context_compacted,
+            )
+            selection_source = "separate_guide_selector"
         requested_paths = list(selection.get("paths") or [])
         if not requested_paths:
             await self.record(
@@ -3445,7 +3536,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         await self.record(
             event_type,
             internal=True,
-            source="separate_guide_selector",
+            source=selection_source,
             trigger_tool=trigger_tool,
             trigger_round=trigger_round,
             selected_paths=selected,
@@ -3645,6 +3736,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 "last_request_paths": [],
                 "active_round": None,
             }
+            agent_continuity_state: dict[str, Any] = {}
 
             async def logged_tool_call(tool: str, arguments: dict[str, Any]) -> Any:
                 if tool == GUIDE_CONTEXT_TOOL:
@@ -3737,48 +3829,62 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     if mcp_auto_started and tool in MCP_STATEFUL_EXECUTION_TOOLS:
                         result = self.mcp_runtime_restarted_result(tool, via="agent")
                     else:
-                        melting_workflow_guard = self.melting_capture_workflow_guard_result(
+                        continuity_guard = self.agent_continuity_guard_result(
+                            agent_continuity_state,
                             tool,
                             call_arguments,
-                            prompt,
                         )
-                        if melting_workflow_guard is not None:
-                            result = melting_workflow_guard
+                        if continuity_guard is not None:
+                            result = continuity_guard
                         else:
-                            guide_requirement_result = await self.ensure_required_guide_context(
-                                guide_context_state,
+                            melting_workflow_guard = self.melting_capture_workflow_guard_result(
                                 tool,
                                 call_arguments,
-                                trigger_round=guide_context_state.get("active_round"),
+                                prompt,
                             )
-                            if guide_requirement_result is not None:
-                                result = guide_requirement_result
+                            if melting_workflow_guard is not None:
+                                result = melting_workflow_guard
                             else:
-                                health_guard_result = await self.mcp_health_guard_result(
+                                guide_requirement_result = await self.ensure_required_guide_context(
+                                    guide_context_state,
                                     tool,
-                                    via="agent",
-                                    arguments=call_arguments,
+                                    call_arguments,
+                                    trigger_round=guide_context_state.get("active_round"),
                                 )
-                                if health_guard_result is not None:
-                                    result = health_guard_result
+                                if guide_requirement_result is not None:
+                                    result = guide_requirement_result
                                 else:
-                                    if tool == "move_stage":
-                                        await self.broadcast_stage_motion_start(
-                                            call_arguments,
-                                            source="agent",
-                                            call_event_id=call_event.get("t"),
-                                        )
-                                        stage_motion_invoked = True
-                                    if tool == "verify_droplets":
-                                        result = await self.call_verify_droplets_observed(
-                                            call_arguments,
-                                            source="agent",
-                                            call_event_id=call_event.get("t"),
-                                        )
+                                    health_guard_result = await self.mcp_health_guard_result(
+                                        tool,
+                                        via="agent",
+                                        arguments=call_arguments,
+                                    )
+                                    if health_guard_result is not None:
+                                        result = health_guard_result
                                     else:
-                                        result = await self.call_agent_mcp_tool(tool, call_arguments)
+                                        if tool == "move_stage":
+                                            await self.broadcast_stage_motion_start(
+                                                call_arguments,
+                                                source="agent",
+                                                call_event_id=call_event.get("t"),
+                                            )
+                                            stage_motion_invoked = True
+                                        if tool == "verify_droplets":
+                                            result = await self.call_verify_droplets_observed(
+                                                call_arguments,
+                                                source="agent",
+                                                call_event_id=call_event.get("t"),
+                                            )
+                                        else:
+                                            result = await self.call_agent_mcp_tool(tool, call_arguments)
                     tool_total_seconds = time.monotonic() - tool_started
                     result = mark_failed_mcp_payload(result)
+                    self.update_agent_continuity_state(
+                        agent_continuity_state,
+                        tool,
+                        call_arguments,
+                        result,
+                    )
                     if tool == "move_stage" and stage_motion_invoked:
                         await self.broadcast_stage_motion_end(
                             call_arguments,
@@ -3821,14 +3927,6 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                         call_event_id=call_event.get("t"),
                         via="agent",
                     )
-                    await self.refresh_agent_guide_context(
-                        guide_context_state,
-                        prompt,
-                        trigger_tool=tool,
-                        trigger_round=guide_context_state.get("active_round"),
-                        on_retry=logged_provider_retry,
-                        on_context_compacted=logged_context_compaction,
-                    )
                     return model_result
                 except asyncio.CancelledError:
                     raise
@@ -3848,14 +3946,6 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                         error=str(exc),
                         call_event_id=call_event.get("t"),
                         via="agent",
-                    )
-                    await self.refresh_agent_guide_context(
-                        guide_context_state,
-                        prompt,
-                        trigger_tool=tool,
-                        trigger_round=guide_context_state.get("active_round"),
-                        on_retry=logged_provider_retry,
-                        on_context_compacted=logged_context_compaction,
                     )
                     return {"error": str(exc), "isError": True}
 
@@ -3961,6 +4051,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 on_text=logged_text,
                 on_model_response=logged_model_response,
                 on_retry=logged_provider_retry,
+                max_tool_rounds=max(1, self.config.ai.max_tool_rounds),
                 max_tool_output_chars=self.config.ai.max_tool_output_chars,
                 on_context_compacted=logged_context_compaction,
             )

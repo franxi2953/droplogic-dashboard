@@ -77,6 +77,7 @@
     "recent_event_target": 80,
     "large_event_chars": 6000,
     "max_tool_output_chars": 4000,
+    "max_tool_rounds": 24,
     "ai_context_summary_enabled": true,
     "ai_context_summary_trigger_chars": 120000,
     "ai_context_summary_max_chars": 12000,

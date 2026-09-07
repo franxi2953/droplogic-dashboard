@@ -37,6 +37,7 @@ sys.modules.setdefault("mcp.server.stdio", SimpleNamespace(stdio_server=None))
 from backend.agent_tools import filter_agent_tools
 from backend.goals import melting_goal_completion_blocker
 from backend.mcp_client import McpStdioClient
+from backend.runtime_utils import websocket_closed_ok
 from backend.server import CockpitApp, exception_diagnostic
 
 
@@ -45,6 +46,73 @@ class AgentFailureDiagnosticTests(unittest.TestCase):
         self.assertEqual(
             exception_diagnostic(AssertionError()),
             "AssertionError: AssertionError()",
+        )
+
+    def test_dashboard_watchdog_close_codes_are_expected_disconnects(self) -> None:
+        self.assertTrue(
+            websocket_closed_ok(
+                RuntimeError(
+                    "received 4000 (private use) dashboard main websocket stale; "
+                    "then sent 4000 (private use) dashboard main websocket stale"
+                )
+            )
+        )
+        self.assertTrue(
+            websocket_closed_ok(
+                RuntimeError(
+                    "received 4001 (private use) dashboard live websocket stale; "
+                    "then sent 4001 (private use) dashboard live websocket stale"
+                )
+            )
+        )
+        self.assertFalse(websocket_closed_ok(RuntimeError("received 4002 unexpected failure")))
+
+
+class AgentContinuityGuardTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = object.__new__(CockpitApp)
+
+    def test_successful_reset_blocks_destructive_repeat_and_requires_droplet(self) -> None:
+        state: dict[str, object] = {}
+        self.app.update_agent_continuity_state(
+            state,
+            "load_system",
+            {"system": "boxmini", "reset_matrix": True},
+            {"ok": True},
+        )
+
+        repeated = self.app.agent_continuity_guard_result(
+            state,
+            "load_system",
+            {"system": "boxmini", "reset_matrix": True},
+        )
+        premature_plan = self.app.agent_continuity_guard_result(state, "plan_move", {})
+
+        self.assertEqual(repeated["reason"], "agent_state_continuity_guard")
+        self.assertEqual(premature_plan["required_next_tool"], "create_droplet")
+
+    def test_created_droplet_allows_planning_but_not_a_later_reset(self) -> None:
+        state: dict[str, object] = {}
+        self.app.update_agent_continuity_state(
+            state,
+            "load_system",
+            {"system": "boxmini", "reset_matrix": True},
+            {"ok": True},
+        )
+        self.app.update_agent_continuity_state(
+            state,
+            "create_droplet",
+            {"droplet_id": 1},
+            {"ok": True},
+        )
+
+        self.assertIsNone(self.app.agent_continuity_guard_result(state, "plan_move", {}))
+        self.assertIsNotNone(
+            self.app.agent_continuity_guard_result(
+                state,
+                "restart_system",
+                {"system": "boxmini", "reset_matrix": True},
+            )
         )
 
 
@@ -743,6 +811,7 @@ class SeparateGuideSelectorTests(unittest.IsolatedAsyncioTestCase):
 
         self.app.recorder = FakeRecorder()
         self.app.goal_status = lambda: {"status": "active", "objective": "Run a thermal step."}
+        self.app.deterministic_guide_paths = lambda *_args: []
         self.app.select_turn_guide_shards = fake_select
         self.app.ensure_mcp_started_for_tool = fake_ensure
         self.app.call_agent_mcp_tool = fake_call
@@ -804,6 +873,30 @@ class SeparateGuideSelectorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual([tool["name"] for tool in tools], ["plan_move"])
+
+    def test_common_protocol_guide_routing_is_deterministic(self) -> None:
+        self.app.available_guide_shards = lambda: [
+            {"path": "agent-guide/03-startup-state-large-values.md"},
+            {"path": "agent-guide/06-planning-execution-rhythm.md"},
+            {"path": "agent-guide/07-droplets-reservoirs-injection.md"},
+            {"path": "agent-guide/09-execution-view-modes-diagnostics.md"},
+            {"path": "agent-guide/10-imaging-light-vision.md"},
+        ]
+
+        paths = self.app.deterministic_guide_paths(
+            "Initialize BoxMini, clear matrix, create a droplet, move it in a path, and show the whole cartridge.",
+            {"objective": "Execute the protocol."},
+        )
+
+        self.assertEqual(
+            paths,
+            [
+                "agent-guide/03-startup-state-large-values.md",
+                "agent-guide/06-planning-execution-rhythm.md",
+                "agent-guide/07-droplets-reservoirs-injection.md",
+                "agent-guide/09-execution-view-modes-diagnostics.md",
+            ],
+        )
 
 
 if __name__ == "__main__":

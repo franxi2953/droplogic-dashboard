@@ -31,6 +31,8 @@ def websocket_closed_ok(exc: Exception) -> bool:
     return (
         "received 1000 (OK)" in text
         or "sent 1000 (OK)" in text
+        or "dashboard main websocket stale" in text
+        or "dashboard live websocket stale" in text
         or "going away" in text
         or "keepalive ping timeout" in text
         or "no close frame received" in text

@@ -18,8 +18,10 @@ const LIVE_RENDER_MIN_INTERVAL_MS = 120;
 const TIMELINE_ACTIVE_EXECUTION_AUTO_FOLLOW_GRACE_MS = 1200;
 const WS_HEARTBEAT_INTERVAL_MS = 5000;
 const WS_STALE_TIMEOUT_MS = 15000;
+const WS_HEARTBEAT_GRACE_MS = 5000;
 const LIVE_WS_HEARTBEAT_INTERVAL_MS = 3000;
 const LIVE_WS_STALE_TIMEOUT_MS = 8000;
+const LIVE_WS_HEARTBEAT_GRACE_MS = 3000;
 const STREAMER_HISTOGRAM_BINS = 256;
 const STREAMER_HISTOGRAM_SAMPLE_EDGE = 256;
 const STREAMER_HISTOGRAM_AUTO_BLACK_PERCENTILE = 0.01;
@@ -3278,25 +3280,37 @@ function ensureRealtimeWatchdogs() {
     const now = Date.now();
 
     if (state.ws?.readyState === WebSocket.OPEN) {
-      if (now - state.wsLastHeartbeatAt >= WS_HEARTBEAT_INTERVAL_MS) {
+      const heartbeatOutstanding = state.wsLastHeartbeatAt > state.wsLastMessageAt;
+      if (!heartbeatOutstanding && now - state.wsLastHeartbeatAt >= WS_HEARTBEAT_INTERVAL_MS) {
         state.wsLastHeartbeatAt = now;
         try {
           send({ type: "get_status" });
         } catch {}
       }
-      if (state.wsLastMessageAt && now - state.wsLastMessageAt >= WS_STALE_TIMEOUT_MS) {
+      if (
+        state.wsLastMessageAt
+        && now - state.wsLastMessageAt >= WS_STALE_TIMEOUT_MS
+        && heartbeatOutstanding
+        && now - state.wsLastHeartbeatAt >= WS_HEARTBEAT_GRACE_MS
+      ) {
         closeStaleSocket(state.ws, 4000, "dashboard main websocket stale");
       }
     }
 
     if (state.liveWs?.readyState === WebSocket.OPEN) {
-      if (now - state.liveWsLastHeartbeatAt >= LIVE_WS_HEARTBEAT_INTERVAL_MS) {
+      const heartbeatOutstanding = state.liveWsLastHeartbeatAt > state.liveWsLastMessageAt;
+      if (!heartbeatOutstanding && now - state.liveWsLastHeartbeatAt >= LIVE_WS_HEARTBEAT_INTERVAL_MS) {
         state.liveWsLastHeartbeatAt = now;
         try {
           state.liveWs.send(JSON.stringify({ type: "get_live" }));
         } catch {}
       }
-      if (state.liveWsLastMessageAt && now - state.liveWsLastMessageAt >= LIVE_WS_STALE_TIMEOUT_MS) {
+      if (
+        state.liveWsLastMessageAt
+        && now - state.liveWsLastMessageAt >= LIVE_WS_STALE_TIMEOUT_MS
+        && heartbeatOutstanding
+        && now - state.liveWsLastHeartbeatAt >= LIVE_WS_HEARTBEAT_GRACE_MS
+      ) {
         closeStaleSocket(state.liveWs, 4001, "dashboard live websocket stale");
       }
     }
