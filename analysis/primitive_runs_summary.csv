@@ -1,0 +1,9 @@
+model,primitive,success,completion_rejections,mcp_calls,mcp_failures,mcp_success_pct,provider_retries,frames_executed,frames_planned,frame_completion_pct,input_tokens,output_tokens,total_tokens,model_time_s,wall_time_s,estimated_api_usd,api_error_seconds,wall_time_no_api_error_s,active_wall_s,paused_seconds
+Claude Opus 4.8,1,True,0,33,0,100.0,0,95,95,100.0,20357,4966,25323,206.8,619.8,0.2259,0.0,619.8,619.8,0.0
+Claude Opus 5,1,True,0,36,1,97.2,0,58,58,100.0,24028,5418,29446,244.6,583.1,0.2556,0.0,435.2,583.1,148.0
+GPT-5.6 Terra,1,True,0,38,2,94.7,0,42,42,100.0,1009900,3836,1013736,390.7,4598.2,2.0658,0.0,869.4,869.4,0.0
+GPT-5.6 Sol,1,True,0,36,0,100.0,0,32,33,97.0,868645,4915,873560,280.0,1368.3,1.7864,0.0,672.3,672.3,0.0
+Claude Opus 4.8,2,True,0,73,7,90.4,0,430,430,100.0,44328,8881,53209,408.0,1525.0,0.4437,0.0,689.4,1525.0,835.5
+Claude Opus 5,2,True,0,45,1,97.8,0,385,385,100.0,32149,7888,40037,327.6,1020.9,0.3579,0.0,537.7,1020.9,483.2
+GPT-5.6 Terra,2,True,0,54,2,96.3,8,309,309,100.0,1415079,10189,1425268,731.2,1997.2,2.9524,340.8,1437.0,1997.2,219.4
+GPT-5.6 Sol,2,True,1,17,0,100.0,1,309,309,100.0,241231,4612,245843,234.4,554.7,0.5286,16.4,192.6,554.7,345.6
