@@ -10,7 +10,7 @@ from backend.config import active_ai_profile_public, load_config, select_ai_prof
 
 
 class CockpitConfigTests(unittest.TestCase):
-    def test_agent_tool_round_limit_has_bounded_default_and_env_override(self) -> None:
+    def test_agent_tool_round_limit_is_unlimited_by_default_and_supports_env_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
             config_path.write_text("{}", encoding="utf-8")
@@ -26,6 +26,38 @@ class CockpitConfigTests(unittest.TestCase):
                 config = load_config(str(config_path))
 
         self.assertEqual(config.ai.max_tool_rounds, 12)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_AI_CONFIG": str(Path(temp_dir) / "missing-ai.json"),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-auth.json"),
+                    "COCKPIT_AI_MAX_TOOL_ROUNDS": "unlimited",
+                },
+                clear=False,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertIsNone(config.ai.max_tool_rounds)
+
+    def test_agent_tool_round_limit_defaults_to_unlimited(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            with patch.dict(
+                "os.environ",
+                {
+                    "DASHBOARD_AI_CONFIG": str(Path(temp_dir) / "missing-ai.json"),
+                    "DASHBOARD_AI_AUTH": str(Path(temp_dir) / "missing-auth.json"),
+                },
+                clear=True,
+            ):
+                config = load_config(str(config_path))
+
+        self.assertIsNone(config.ai.max_tool_rounds)
 
     def test_dgx_example_uses_one_gateway_model(self) -> None:
         example_path = Path(__file__).resolve().parents[1] / "backend" / "apis.example.json"

@@ -325,6 +325,8 @@ class AiProvider:
             "reasoning_effort": self.config.reasoning_effort,
             "reasoning_summary": self.config.reasoning_summary,
             "reasoning_context": self.config.reasoning_context,
+            "max_tool_rounds": self.config.max_tool_rounds,
+            "tool_round_limit_enabled": self.config.max_tool_rounds is not None,
             "context_compaction_strategy": context_compaction_strategy(self.config),
             "native_response_compaction_enabled": bool(self.config.native_response_compaction_enabled),
             "native_response_compaction_threshold": self.config.native_response_compaction_threshold,

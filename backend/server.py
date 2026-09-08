@@ -4054,7 +4054,9 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 on_text=logged_text,
                 on_model_response=logged_model_response,
                 on_retry=logged_provider_retry,
-                max_tool_rounds=max(1, self.config.ai.max_tool_rounds),
+                # Tool rounds are unlimited unless an operator explicitly
+                # configures COCKPIT_AI_MAX_TOOL_ROUNDS (or max_tool_rounds).
+                max_tool_rounds=self.config.ai.max_tool_rounds,
                 max_tool_output_chars=self.config.ai.max_tool_output_chars,
                 on_context_compacted=logged_context_compaction,
             )

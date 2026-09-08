@@ -98,7 +98,10 @@ class AiConfig:
     recent_event_target: int = 80
     large_event_chars: int = 6_000
     max_tool_output_chars: int = 4_000
-    max_tool_rounds: int = 24
+    # Optional safety cap for agent tool rounds.  ``None`` means the model may
+    # continue until it stops requesting tools; this is the normal dashboard
+    # behavior.  Set a positive value to impose an explicit per-request cap.
+    max_tool_rounds: int | None = None
     ai_context_summary_enabled: bool = True
     ai_context_summary_trigger_chars: int = 120_000
     ai_context_summary_max_chars: int = 12_000
@@ -219,7 +222,7 @@ def load_config(path: str | None = None) -> CockpitConfig:
             recent_event_target=int(ai_raw.get("recent_event_target", 80)),
             large_event_chars=int(ai_raw.get("large_event_chars", 6_000)),
             max_tool_output_chars=int(ai_raw.get("max_tool_output_chars", 4_000)),
-            max_tool_rounds=int(ai_raw.get("max_tool_rounds", 24)),
+            max_tool_rounds=parse_optional_int(ai_raw.get("max_tool_rounds")),
             ai_context_summary_enabled=bool(ai_raw.get("ai_context_summary_enabled", True)),
             ai_context_summary_trigger_chars=int(ai_raw.get("ai_context_summary_trigger_chars", 120_000)),
             ai_context_summary_max_chars=int(ai_raw.get("ai_context_summary_max_chars", 12_000)),
@@ -410,8 +413,9 @@ def apply_env_overrides(cfg: CockpitConfig) -> None:
     cfg.ai.max_tool_output_chars = int(
         os.environ.get("COCKPIT_AI_MAX_TOOL_OUTPUT_CHARS", cfg.ai.max_tool_output_chars)
     )
-    cfg.ai.max_tool_rounds = int(
-        os.environ.get("COCKPIT_AI_MAX_TOOL_ROUNDS", cfg.ai.max_tool_rounds)
+    cfg.ai.max_tool_rounds = parse_optional_int(
+        os.environ.get("COCKPIT_AI_MAX_TOOL_ROUNDS"),
+        cfg.ai.max_tool_rounds,
     )
     cfg.ai.ai_context_summary_enabled = parse_bool(
         os.environ.get("COCKPIT_AI_CONTEXT_SUMMARY_ENABLED"),
@@ -698,3 +702,18 @@ def parse_bool(value: str | None, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_optional_int(value: Any, default: int | None = None) -> int | None:
+    """Parse an optional positive integer, with explicit unlimited values."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "none", "null", "unlimited", "off", "false", "0"}:
+            return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else None

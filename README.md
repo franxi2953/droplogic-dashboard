@@ -336,7 +336,8 @@ $env:DROPLOGIC_CAPTURE_ROOT="C:\path\to\captures"
 
 Dashboard tracks the size of every model request and compacts old context aggressively:
 
-- the default AI context target is `40000` characters with a `300000` character hard limit, tool outputs are trimmed to the configured `4000` character limit or a tighter active-call cap, and an agent request stops after `24` tool rounds unless configured otherwise;
+- the default AI context target is `40000` characters with a `300000` character hard limit, and tool outputs are trimmed to the configured `4000` character limit or a tighter active-call cap;
+- agent tool rounds are unlimited by default. Set `ai.max_tool_rounds` or `COCKPIT_AI_MAX_TOOL_ROUNDS` to a positive integer when an explicit per-request cap is desired; use `null`, `0`, or `unlimited` to disable the cap;
 - old state snapshots are pruned from model context when newer snapshots exist;
 - old tool chatter, including older failed results, is reduced to compact timeline markers while the latest result per tool, recent pending calls, and failure metadata summaries are preserved;
 - the latest tool result is protected through history summarization and retry-time compaction so the agent can still see the most recent observation;

@@ -158,6 +158,78 @@ class RetryPayloadCompactionTests(unittest.TestCase):
         self.assertEqual(result["stopped_reason"], "goal_completed")
         self.assertEqual(result["text"], "Goal marked complete.")
 
+    def test_unlimited_tool_rounds_continue_past_former_default_cap(self) -> None:
+        async def exercise() -> tuple[dict, list[dict]]:
+            provider = AiProvider(
+                AiConfig(
+                    base_url="https://example.invalid/v1",
+                    model="dgx-auto",
+                    api_key="test-key",
+                    wire_api="chat_completions",
+                )
+            )
+            requests: list[dict] = []
+            responses = [
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": f"call_{index}",
+                                        "type": "function",
+                                        "function": {"name": "runtime_status", "arguments": "{}"},
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+                for index in range(25)
+            ]
+            responses.append(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "Finished after the long run."},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+
+            async def fake_post(payload: dict, **_: object) -> dict:
+                requests.append(deepcopy(payload))
+                return responses.pop(0)
+
+            async def call_tool(_: str, __: dict) -> dict:
+                return {"ok": True}
+
+            provider._post_chat_completion = fake_post  # type: ignore[method-assign]
+            result = await provider.ask_with_tools(
+                prompt="keep going",
+                events=[],
+                tools=[
+                    {
+                        "name": "runtime_status",
+                        "description": "Read runtime status",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+                call_tool=call_tool,
+            )
+            return result, requests
+
+        result, requests = asyncio.run(exercise())
+
+        self.assertEqual(len(requests), 26)
+        self.assertEqual(len(result["tool_calls"]), 25)
+        self.assertIsNone(result["stopped_reason"])
+        self.assertEqual(result["text"], "Finished after the long run.")
+
     def test_chat_reasoning_normalizes_local_runtime_fields(self) -> None:
         data = {
             "choices": [
