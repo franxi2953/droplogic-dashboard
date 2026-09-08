@@ -1316,6 +1316,7 @@ class AiProvider:
                 body = response.text
                 raise RuntimeError(f"{exc}. Response body: {body}") from exc
             data = response.json()
+            raise_for_embedded_provider_error(data)
             data["_cockpit_retry_attempts"] = attempt
             return data
 
@@ -1380,6 +1381,7 @@ class AiProvider:
                 body = response.text
                 raise RuntimeError(f"{exc}. Response body: {body}") from exc
             data = response.json()
+            raise_for_embedded_provider_error(data)
             data["_cockpit_retry_attempts"] = attempt
             return data
 
@@ -1445,6 +1447,7 @@ class AiProvider:
                 body = response.text
                 raise RuntimeError(f"{exc}. Response body: {body}") from exc
             data = response.json()
+            raise_for_embedded_provider_error(data)
             data["_cockpit_retry_attempts"] = attempt
             return data
 
@@ -2626,6 +2629,20 @@ def provider_error_code(response: httpx.Response) -> str:
     if not isinstance(error, dict):
         return ""
     return str(error.get("code") or error.get("type") or "").strip().lower()
+
+
+def raise_for_embedded_provider_error(data: Any) -> None:
+    """Reject gateway errors carried in an HTTP 200 keepalive response."""
+    if not isinstance(data, dict):
+        return
+    error = data.get("error")
+    if not error:
+        return
+    if isinstance(error, dict):
+        message = error.get("message") or error.get("detail") or json.dumps(error, ensure_ascii=True, default=str)
+    else:
+        message = str(error)
+    raise RuntimeError(f"Provider returned an error payload: {message}")
 
 
 def is_retryable_request_error(exc: httpx.RequestError) -> bool:

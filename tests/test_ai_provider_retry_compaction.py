@@ -27,11 +27,22 @@ from backend.ai_provider import (
     compact_chat_transcript,
     enforce_chat_payload_budget,
     extract_chat_reasoning,
+    raise_for_embedded_provider_error,
 )
 from backend.config import AiConfig
 
 
 class RetryPayloadCompactionTests(unittest.TestCase):
+    def test_http_200_gateway_error_payload_is_not_treated_as_empty_completion(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "serializer rejected the request"):
+            raise_for_embedded_provider_error(
+                {"error": {"message": "serializer rejected the request", "type": "gateway_error"}}
+            )
+
+        raise_for_embedded_provider_error(
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "error": None}
+        )
+
     def test_profile_token_budget_counts_tool_schemas_and_bounds_initial_request(self) -> None:
         config = AiConfig(max_context_tokens=10_000)
         payload = {
