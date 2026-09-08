@@ -24,6 +24,7 @@ from .pinned_context import parse_guide_shard_selection
 
 
 RETRY_PAYLOAD_COMPACT_EVERY = 5
+MAX_PROVIDER_ATTEMPTS = 3
 RETRY_PAYLOAD_EVENT_LOG_TARGET_CHARS = 70_000
 RETRY_PAYLOAD_MIN_EVENT_LOG_TARGET_CHARS = 16_000
 RETRY_PAYLOAD_MIN_TOOL_OUTPUT_CHARS = 1_500
@@ -1291,6 +1292,8 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
+                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                        raise RuntimeError(f"Provider request failed after {attempt} attempts: {exc}") from exc
                     continue
                 if is_retryable_response(response):
                     if on_retry is not None:
@@ -1308,6 +1311,8 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
+                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                        break
                     continue
                 break
             try:
@@ -1356,6 +1361,8 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
+                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                        raise RuntimeError(f"Provider request failed after {attempt} attempts: {exc}") from exc
                     continue
                 if is_retryable_response(response):
                     if on_retry is not None:
@@ -1373,6 +1380,8 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
+                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                        break
                     continue
                 break
             try:
@@ -1422,6 +1431,8 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
+                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                        raise RuntimeError(f"Provider request failed after {attempt} attempts: {exc}") from exc
                     continue
                 if is_retryable_response(response):
                     if on_retry is not None:
@@ -1439,6 +1450,8 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
+                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                        break
                     continue
                 break
             try:
