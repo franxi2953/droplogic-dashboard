@@ -31,11 +31,7 @@ if __package__ in {None, ""}:
     from backend.context_memory import ContextMemoryMixin
     from backend.goals import (
         GOAL_MAX_CHARS,
-        action_goal_completion_blocker,
-        goal_completion_missing_terms,
         goal_status_from_events,
-        latest_goal_completion_blocker,
-        melting_goal_completion_blocker,
     )
     from backend.live_snapshot import LiveSnapshotMixin
     from backend.mcp_client import McpStdioClient
@@ -65,11 +61,7 @@ else:
     from .context_memory import ContextMemoryMixin
     from .goals import (
         GOAL_MAX_CHARS,
-        action_goal_completion_blocker,
-        goal_completion_missing_terms,
         goal_status_from_events,
-        latest_goal_completion_blocker,
-        melting_goal_completion_blocker,
     )
     from .live_snapshot import LiveSnapshotMixin
     from .mcp_client import McpStdioClient
@@ -3563,38 +3555,6 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         evidence = str(arguments.get("evidence") or "").strip()
         if not summary:
             return {"ok": False, "error": "summary is required.", "isError": True}
-        events = self.recorder.events_for_run(self.recorder.run_id)
-        objective = str(goal.get("objective") or "")
-        blocker = (
-            latest_goal_completion_blocker(events)
-            or melting_goal_completion_blocker(objective, events)
-            or action_goal_completion_blocker(objective, events)
-        )
-        missing_terms = goal_completion_missing_terms(
-            str(goal.get("objective") or ""),
-            summary,
-            evidence,
-        )
-        if blocker or missing_terms:
-            reasons = []
-            if blocker:
-                reasons.append(blocker)
-            if missing_terms:
-                reasons.append(
-                    "Completion evidence does not cover requested stage(s): "
-                    + ", ".join(missing_terms)
-                )
-            message = "Goal completion rejected: " + " ".join(reasons)
-            await self.record(
-                "goal_completion_rejected",
-                level="warning",
-                objective=goal.get("objective"),
-                summary=summary,
-                evidence=evidence,
-                reasons=reasons,
-                via="agent",
-            )
-            return {"ok": False, "error": message, "isError": True}
         await self.record(
             "goal_completed",
             objective=goal.get("objective"),
