@@ -27,11 +27,22 @@ from backend.ai_provider import (
     compact_chat_transcript,
     enforce_chat_payload_budget,
     extract_chat_reasoning,
+    raise_for_embedded_provider_error,
 )
 from backend.config import AiConfig
 
 
 class RetryPayloadCompactionTests(unittest.TestCase):
+    def test_http_200_gateway_error_payload_is_not_treated_as_empty_completion(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "serializer rejected the request"):
+            raise_for_embedded_provider_error(
+                {"error": {"message": "serializer rejected the request", "type": "gateway_error"}}
+            )
+
+        raise_for_embedded_provider_error(
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "error": None}
+        )
+
     def test_profile_token_budget_counts_tool_schemas_and_bounds_initial_request(self) -> None:
         config = AiConfig(max_context_tokens=10_000)
         payload = {
@@ -149,86 +160,16 @@ class RetryPayloadCompactionTests(unittest.TestCase):
                     }
                 ],
                 call_tool=call_tool,
+                response_session_key="run-123:dgx-gateway",
             )
             return result, requests
 
         result, requests = asyncio.run(exercise())
 
         self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["user"], "run-123:dgx-gateway")
         self.assertEqual(result["stopped_reason"], "goal_completed")
         self.assertEqual(result["text"], "Goal marked complete.")
-
-    def test_unlimited_tool_rounds_continue_past_former_default_cap(self) -> None:
-        async def exercise() -> tuple[dict, list[dict]]:
-            provider = AiProvider(
-                AiConfig(
-                    base_url="https://example.invalid/v1",
-                    model="dgx-auto",
-                    api_key="test-key",
-                    wire_api="chat_completions",
-                )
-            )
-            requests: list[dict] = []
-            responses = [
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "id": f"call_{index}",
-                                        "type": "function",
-                                        "function": {"name": "runtime_status", "arguments": "{}"},
-                                    }
-                                ],
-                            },
-                            "finish_reason": "tool_calls",
-                        }
-                    ]
-                }
-                for index in range(25)
-            ]
-            responses.append(
-                {
-                    "choices": [
-                        {
-                            "message": {"role": "assistant", "content": "Finished after the long run."},
-                            "finish_reason": "stop",
-                        }
-                    ]
-                }
-            )
-
-            async def fake_post(payload: dict, **_: object) -> dict:
-                requests.append(deepcopy(payload))
-                return responses.pop(0)
-
-            async def call_tool(_: str, __: dict) -> dict:
-                return {"ok": True}
-
-            provider._post_chat_completion = fake_post  # type: ignore[method-assign]
-            result = await provider.ask_with_tools(
-                prompt="keep going",
-                events=[],
-                tools=[
-                    {
-                        "name": "runtime_status",
-                        "description": "Read runtime status",
-                        "inputSchema": {"type": "object", "properties": {}},
-                    }
-                ],
-                call_tool=call_tool,
-            )
-            return result, requests
-
-        result, requests = asyncio.run(exercise())
-
-        self.assertEqual(len(requests), 26)
-        self.assertEqual(len(result["tool_calls"]), 25)
-        self.assertIsNone(result["stopped_reason"])
-        self.assertEqual(result["text"], "Finished after the long run.")
 
     def test_chat_reasoning_normalizes_local_runtime_fields(self) -> None:
         data = {

@@ -29,7 +29,7 @@ It is intentionally separate from the `droplogic` Python package: DropLogic rema
 - **Main Control**: large live streamer with source, overlay, histogram, and display-level controls; matrix visualizer; temperature chart; and BoxMini state panels with per-priority command queues.
 - **Agent Chat**: a Codex/OpenAI-compatible control loop with thinking summaries, tool calls, retries, cancellation, copy buttons, and run history.
 - **Local Audio Input**: browser microphone capture sent to a local speech-to-text model before text is placed into the agent prompt.
-- **Context Analysis**: per-request token charts, context breakdown histograms, compaction events, retry diagnostics, and tool-output size badges.
+- **Context Analysis**: per-request token charts, context breakdown histograms, retry diagnostics, tool-output size badges, and a compact chronological tool-call history with status and timing.
 - **Run Records**: append-only `events.jsonl` histories, artifacts, visualizer frames, and persistent context checkpoints.
 - **MCP Proxy Mode**: agents can keep using the DropLogic MCP tool surface while Dashboard observes, records, and displays the same session.
 

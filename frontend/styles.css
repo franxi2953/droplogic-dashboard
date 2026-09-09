@@ -4359,21 +4359,23 @@ pre {
   white-space: nowrap;
 }
 
-.context-event-panel {
+.tool-history-panel {
   display: flex;
-  flex: 1 1 auto;
+  flex: 1 1 175px;
   flex-direction: column;
-  min-height: 0;
+  min-height: 130px;
+  max-height: clamp(155px, 23vh, 230px);
   margin-top: 9px;
   padding-top: 8px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.context-event-panel header {
+.tool-history-panel header {
   justify-content: space-between;
+  min-height: 16px;
 }
 
-.context-event-panel h3 {
+.tool-history-panel h3 {
   margin: 0;
   color: var(--muted);
   font-size: 10px;
@@ -4382,7 +4384,13 @@ pre {
   text-transform: uppercase;
 }
 
-.context-event-panel ol {
+.tool-history-panel header > span {
+  color: var(--muted);
+  font-family: Consolas, ui-monospace, monospace;
+  font-size: 9px;
+}
+
+.tool-history-panel ol {
   display: grid;
   align-content: start;
   flex: 1 1 auto;
@@ -4394,7 +4402,7 @@ pre {
   overflow: auto;
 }
 
-.context-event-panel li {
+.tool-history-panel li {
   display: grid;
   grid-template-columns: 10px minmax(0, 1fr) auto;
   align-items: center;
@@ -4406,28 +4414,52 @@ pre {
   background: rgba(255, 255, 255, 0.025);
 }
 
-.context-event-dot {
+.tool-history-panel li.tool-history-empty {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+  text-align: center;
+}
+
+.tool-history-item:focus-visible {
+  border-color: rgba(100, 210, 255, 0.52);
+  outline: none;
+}
+
+.tool-history-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--warn);
+  box-shadow: 0 0 0 2px rgba(255, 159, 10, 0.11);
 }
 
-.context-event-main {
+.tool-history-item.success .tool-history-dot {
+  background: var(--good);
+  box-shadow: 0 0 0 2px rgba(48, 209, 88, 0.1);
+}
+
+.tool-history-item.error .tool-history-dot {
+  background: var(--bad);
+  box-shadow: 0 0 0 2px rgba(255, 69, 58, 0.1);
+}
+
+.tool-history-main {
   min-width: 0;
 }
 
-.context-event-title {
+.tool-history-title {
   display: block;
   overflow: hidden;
   color: var(--text);
+  font-family: Consolas, ui-monospace, monospace;
   font-size: 11px;
   line-height: 1.1;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.context-event-sub {
+.tool-history-sub {
   display: block;
   margin-top: 2px;
   overflow: hidden;
@@ -4437,11 +4469,27 @@ pre {
   white-space: nowrap;
 }
 
-.context-event-value {
-  color: var(--accent);
+.tool-history-value {
+  display: grid;
+  justify-items: end;
+  gap: 1px;
+  color: var(--muted);
   font-family: Consolas, ui-monospace, monospace;
-  font-size: 10px;
+  font-size: 9px;
   white-space: nowrap;
+}
+
+.tool-history-status {
+  color: var(--warn);
+  font-size: 10px;
+}
+
+.tool-history-item.success .tool-history-status {
+  color: var(--good);
+}
+
+.tool-history-item.error .tool-history-status {
+  color: var(--bad);
 }
 
 .token-metrics {

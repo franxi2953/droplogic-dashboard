@@ -1,11 +1,137 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .tool_payloads import compact_tool_payload
 
 
 GOAL_MAX_CHARS = 4000
+
+
+def action_goal_completion_blocker(objective: str, events: list[dict[str, Any]]) -> str:
+    """Require run-local MCP evidence for concrete BoxMini action claims."""
+    objective_text = str(objective or "").lower()
+    start_index = 0
+    for index, event in enumerate(events):
+        if event.get("type") in {"goal_set", "goal_updated"}:
+            start_index = index + 1
+    current_events = events[start_index:]
+
+    call_arguments: dict[Any, dict[str, Any]] = {}
+    for event in current_events:
+        if event.get("type") != "mcp_tool_call":
+            continue
+        event_id = event.get("t")
+        arguments = event.get("arguments")
+        if event_id is not None and isinstance(arguments, dict):
+            call_arguments[event_id] = arguments
+
+    successful_calls: list[tuple[str, dict[str, Any]]] = []
+    successful_events: list[tuple[int, str, dict[str, Any]]] = []
+    for event_index, event in enumerate(current_events):
+        if event.get("type") != "mcp_tool_result" or event.get("ok") is not True or event.get("error"):
+            continue
+        name = str(event.get("tool") or "")
+        arguments = call_arguments.get(event.get("call_event_id"), {})
+        successful_calls.append((name, arguments))
+        successful_events.append(
+            (event_index, name, compact_tool_payload(event.get("result")))
+        )
+    successful_tools = {name for name, _arguments in successful_calls if name}
+
+    def mentions(*terms: str) -> bool:
+        return any(re.search(rf"\b{re.escape(term)}\b", objective_text) for term in terms)
+
+    missing: list[str] = []
+    if mentions("initialize", "initialise", "restart") and not successful_tools.intersection(
+        {"load_system", "restart_system"}
+    ):
+        missing.append("system initialization")
+
+    asks_for_clear = mentions("clear", "reset") and mentions("matrix", "state", "electrodes")
+    clear_confirmed = any(
+        (name in {"load_system", "restart_system"} and arguments.get("reset_matrix") is True)
+        or (name == "set_matrix_cells" and arguments.get("value") in {0, False})
+        for name, arguments in successful_calls
+    )
+    if asks_for_clear and not clear_confirmed:
+        missing.append("matrix reset")
+
+    droplet_subject = mentions("droplet", "droplets", "block", "blocks")
+    if droplet_subject and mentions("create", "inject") and not successful_tools.intersection(
+        {"create_droplet", "inject_droplet", "advanced_drop_call"}
+    ):
+        missing.append("droplet creation")
+
+    asks_for_motion = droplet_subject and mentions("move", "route", "path", "cross", "target", "targets")
+    if asks_for_motion:
+        if not successful_tools.intersection({"plan_move", "advanced_drop_call"}):
+            missing.append("movement planning")
+        if not successful_tools.intersection(
+            {
+                "execute_segment_to_breakpoint",
+                "start_execute_until_breakpoint",
+                "start_plan",
+                "resume_plan",
+                "advanced_drop_call",
+            }
+        ):
+            missing.append("movement execution")
+        motion_event_indices = [
+            index
+            for index, name, _payload in successful_events
+            if name
+            in {
+                "plan_move",
+                "advanced_drop_call",
+                "execute_segment_to_breakpoint",
+                "start_execute_until_breakpoint",
+                "start_plan",
+                "resume_plan",
+            }
+        ]
+        status_events = [
+            (index, payload)
+            for index, name, payload in successful_events
+            if name == "execution_status_summary" and isinstance(payload, dict)
+        ]
+        latest_status = status_events[-1] if status_events else None
+        if not latest_status or (motion_event_indices and latest_status[0] < max(motion_event_indices)):
+            missing.append("terminal execution status")
+        elif isinstance(latest_status[1], dict):
+            status = latest_status[1]
+            executor = status.get("executor")
+            plan = status.get("plan")
+            droplets = status.get("droplets")
+            progress = executor.get("progress") if isinstance(executor, dict) else None
+            terminal_ok = (
+                isinstance(executor, dict)
+                and executor.get("is_executing") is False
+                and isinstance(progress, (int, float))
+                and progress >= 100
+                and isinstance(plan, dict)
+                and plan.get("planning_success") is True
+            )
+            if isinstance(droplets, dict) and isinstance(droplets.get("droplets"), list):
+                terminal_ok = terminal_ok and all(
+                    item.get("at_target") is True
+                    for item in droplets["droplets"]
+                    if isinstance(item, dict) and item.get("active", True)
+                )
+            if not terminal_ok:
+                missing.append("confirmed completed execution")
+
+    asks_for_whole_view = (
+        ("whole cartridge" in objective_text or "whole chip" in objective_text)
+        and mentions("show", "display", "view")
+    )
+    if asks_for_whole_view and "set_execution_view_mode" not in successful_tools:
+        missing.append("whole-cartridge view")
+
+    if not missing:
+        return ""
+    return "Run-local MCP evidence is missing for: " + ", ".join(missing) + "."
 
 
 def latest_goal_completion_blocker(events: list[dict[str, Any]]) -> str:

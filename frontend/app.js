@@ -2649,7 +2649,7 @@ function renderTokenAnalytics() {
   setText("tokensImages", samples.length ? String(totalImages) : "-");
   renderTokenContextChart(samples, totalOutput);
   renderContextHistogram(last);
-  renderContextEventList();
+  renderToolHistory();
 }
 
 function tokenSamples() {
@@ -2840,98 +2840,178 @@ function breakdownValue(breakdown, label) {
   return Number(item?.value || 0);
 }
 
-function renderContextEventList() {
-  const list = $("contextEventList");
+function renderToolHistory() {
+  const list = $("toolHistoryList");
   if (!list) return;
-  const events = state.events
-    .filter((event) =>
-      [
-        "agent_model_response",
-        "agent_provider_retry",
-        "context_compacted",
-        "context_checkpoint_saved",
-        "context_checkpoint_used",
-        "context_ai_summary",
-      ].includes(event.type)
-    )
-    .slice(-9)
-    .reverse();
+  const entries = toolCallHistoryEntries(state.events);
+  const previousScrollTop = list.scrollTop;
+  const wasAtLatest = previousScrollTop <= 4;
+  setText(
+    "toolHistoryMeta",
+    `${entries.length}${state.eventWindow.hasMore ? "+" : ""} ${entries.length === 1 ? "call" : "calls"}`,
+  );
   list.textContent = "";
-  if (!events.length) {
+  if (!entries.length) {
     const li = document.createElement("li");
-    li.className = "context-event-empty";
-    li.textContent = "No context events yet";
+    li.className = "tool-history-empty";
+    li.textContent = "No tool calls yet";
     list.appendChild(li);
     return;
   }
-  for (const event of events) {
-    const item = contextEventSummary(event);
+  for (const entry of [...entries].reverse()) {
     const li = document.createElement("li");
+    li.className = `tool-history-item ${entry.status}`;
+    li.tabIndex = 0;
+    li.title = toolHistoryEntryTitle(entry);
+    li.setAttribute("aria-label", `${entry.tool}, ${entry.status}, ${entry.timeLabel}`);
     const dot = document.createElement("span");
-    dot.className = "context-event-dot";
-    dot.style.background = item.color;
+    dot.className = "tool-history-dot";
     const main = document.createElement("span");
-    main.className = "context-event-main";
+    main.className = "tool-history-main";
     const title = document.createElement("span");
-    title.className = "context-event-title";
-    title.textContent = item.title;
+    title.className = "tool-history-title";
+    title.textContent = entry.tool;
     const sub = document.createElement("span");
-    sub.className = "context-event-sub";
-    sub.textContent = item.sub;
+    sub.className = "tool-history-sub";
+    sub.textContent = [entry.viaLabel, entry.argumentsLabel].filter(Boolean).join(" / ");
     main.append(title, sub);
     const value = document.createElement("span");
-    value.className = "context-event-value";
-    value.textContent = item.value;
+    value.className = "tool-history-value";
+    const status = document.createElement("span");
+    status.className = "tool-history-status";
+    status.textContent = entry.statusLabel;
+    const time = document.createElement("time");
+    time.dateTime = entry.timestamp;
+    time.textContent = entry.timeLabel;
+    value.append(status, time);
     li.append(dot, main, value);
     list.appendChild(li);
   }
+  list.scrollTop = wasAtLatest ? 0 : previousScrollTop;
 }
 
-function contextEventSummary(event) {
-  if (event.type === "agent_model_response") {
-    const tk = Number(event.input_tokens ?? event.estimated_context_tokens ?? 0);
-    const round = Number.isFinite(Number(event.round)) ? `round ${event.round}` : "model response";
-    const calls = Array.isArray(event.tool_calls) && event.tool_calls.length ? `tools: ${event.tool_calls.join(", ")}` : "no tool call";
-    return {
-      title: `Model ${round}`,
-      sub: calls,
-      value: tk ? `${formatTokenCount(tk)} tk` : "",
-      color: "#64d2ff",
-    };
+function toolCallHistoryEntries(events = []) {
+  const entries = [];
+  const pendingById = new Map();
+  for (const event of events || []) {
+    if (isToolCallHistoryCall(event)) {
+      const entry = toolCallHistoryEntry(event);
+      entries.push(entry);
+      if (entry.callId) pendingById.set(entry.callId, entry);
+      continue;
+    }
+    if (!isToolCallHistoryResult(event)) continue;
+    const callId = toolCallHistoryCallId(event);
+    let entry = callId ? pendingById.get(callId) : null;
+    if (!entry) {
+      entry = [...entries].reverse().find((candidate) => (
+        candidate.status === "pending"
+        && candidate.tool === String(event.tool || "unknown tool")
+        && (!event.via || candidate.via === event.via)
+      ));
+    }
+    if (!entry) {
+      entry = toolCallHistoryEntry(null, event);
+      entries.push(entry);
+    } else {
+      applyToolHistoryResult(entry, event);
+    }
+    if (callId) pendingById.delete(callId);
   }
-  if (event.type === "agent_provider_retry") {
-    const code = event.status_code || event.error_type || "retry";
-    return {
-      title: `Provider retry ${event.attempt || ""}`.trim(),
-      sub: explainErrorCode(code),
-      value: event.request_chars ? formatCompactNumber(event.request_chars) : String(code),
-      color: "#ff9f0a",
-    };
-  }
-  if (event.type === "context_compacted") {
-    const before = event.estimated_chars_before ? formatCompactNumber(event.estimated_chars_before) : "";
-    const after = event.estimated_chars_after ? formatCompactNumber(event.estimated_chars_after) : "";
-    return {
-      title: contextCompactionSummary(event),
-      sub: [before, after].filter(Boolean).join(" -> ") || event.scope || "context",
-      value: event.estimated_chars_after ? `${formatTokenCount(Number(event.estimated_chars_after) / 4)} tk~` : "",
-      color: "#30d158",
-    };
-  }
-  if (event.type === "context_checkpoint_saved" || event.type === "context_checkpoint_used") {
-    return {
-      title: contextCheckpointSummary(event),
-      sub: `${event.covered_event_count || 0} covered events`,
-      value: event.checkpoint_chars ? formatCompactNumber(event.checkpoint_chars) : "",
-      color: "#bf5af2",
-    };
-  }
-  return {
-    title: contextAiSummaryTitle(event),
-    sub: event.message || "AI memory event",
-    value: event.source_event_count ? `${event.source_event_count} ev` : "",
-    color: "#bf5af2",
+  return entries;
+}
+
+function isToolCallHistoryCall(event) {
+  return event?.type === "mcp_tool_call" || event?.type === "dashboard_tool_call";
+}
+
+function isToolCallHistoryResult(event) {
+  return event?.type === "mcp_tool_result" || event?.type === "dashboard_tool_result";
+}
+
+function toolCallHistoryEntry(call, result = null) {
+  const source = call || result || {};
+  const entry = {
+    call,
+    result: null,
+    callId: toolCallHistoryCallId(call || result),
+    tool: String(source.tool || "unknown tool"),
+    via: String(source.via || ""),
+    viaLabel: toolHistoryViaLabel(source.via),
+    arguments: call?.arguments || source.dashboard_actual_arguments || null,
+    argumentsLabel: toolHistoryArgumentsLabel(call?.arguments || source.dashboard_actual_arguments),
+    status: "pending",
+    statusLabel: "running",
+    timestamp: String(source.ts || ""),
+    timeLabel: toolHistoryTimeLabel(source),
+    durationSeconds: null,
   };
+  if (result) applyToolHistoryResult(entry, result);
+  return entry;
+}
+
+function applyToolHistoryResult(entry, result) {
+  entry.result = result;
+  const failed = result?.ok === false || Boolean(result?.error) || result?.level === "error";
+  entry.status = failed ? "error" : "success";
+  entry.durationSeconds = toolHistoryDurationSeconds(entry.call, result);
+  entry.statusLabel = failed
+    ? "error"
+    : (Number.isFinite(entry.durationSeconds) ? formatCompactSeconds(entry.durationSeconds) : "ok");
+}
+
+function toolCallHistoryCallId(event) {
+  const value = isToolCallHistoryCall(event) ? event?.t : event?.call_event_id;
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function toolHistoryArgumentsLabel(argumentsValue) {
+  if (!argumentsValue || typeof argumentsValue !== "object" || !Object.keys(argumentsValue).length) {
+    return "no arguments";
+  }
+  return shortText(shortJson(argumentsValue), 110);
+}
+
+function toolHistoryViaLabel(value) {
+  const via = String(value || "dashboard").replace(/_/g, " ");
+  return via === "cockpit proxy" ? "MCP proxy" : via;
+}
+
+function toolHistoryDurationSeconds(call, result) {
+  const reported = firstFiniteNumber(
+    getPath(result, "dashboard_timing.tool_total_seconds"),
+    getPath(result, "duration_seconds"),
+    getPath(result, "elapsed_seconds"),
+  );
+  if (Number.isFinite(reported) && reported >= 0) return Number(reported);
+  const started = eventTimeSeconds(call);
+  const finished = eventTimeSeconds(result);
+  if (!Number.isFinite(started) || !Number.isFinite(finished)) return null;
+  return Math.max(0, finished - started);
+}
+
+function toolHistoryTimeLabel(event) {
+  const seconds = eventTimeSeconds(event);
+  if (!Number.isFinite(seconds)) return "";
+  return new Date(seconds * 1000).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function toolHistoryEntryTitle(entry) {
+  const lines = [
+    `${entry.tool} - ${entry.status}`,
+    entry.timestamp || eventTimeLabel(entry.call || entry.result),
+    entry.viaLabel ? `via: ${entry.viaLabel}` : "",
+    `arguments: ${prettyJson(entry.arguments || {})}`,
+  ];
+  if (entry.result) {
+    const resultText = entry.result.error || formatToolResultText(entry.result);
+    lines.push(`result: ${shortText(resultText, 600)}`);
+  }
+  return lines.filter(Boolean).join("\n");
 }
 
 function contextBreakdown(sample) {

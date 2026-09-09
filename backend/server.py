@@ -31,6 +31,7 @@ if __package__ in {None, ""}:
     from backend.context_memory import ContextMemoryMixin
     from backend.goals import (
         GOAL_MAX_CHARS,
+        action_goal_completion_blocker,
         goal_completion_missing_terms,
         goal_status_from_events,
         latest_goal_completion_blocker,
@@ -64,6 +65,7 @@ else:
     from .context_memory import ContextMemoryMixin
     from .goals import (
         GOAL_MAX_CHARS,
+        action_goal_completion_blocker,
         goal_completion_missing_terms,
         goal_status_from_events,
         latest_goal_completion_blocker,
@@ -3562,9 +3564,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
         if not summary:
             return {"ok": False, "error": "summary is required.", "isError": True}
         events = self.recorder.events_for_run(self.recorder.run_id)
-        blocker = latest_goal_completion_blocker(events) or melting_goal_completion_blocker(
-            str(goal.get("objective") or ""),
-            events,
+        objective = str(goal.get("objective") or "")
+        blocker = (
+            latest_goal_completion_blocker(events)
+            or melting_goal_completion_blocker(objective, events)
+            or action_goal_completion_blocker(objective, events)
         )
         missing_terms = goal_completion_missing_terms(
             str(goal.get("objective") or ""),
@@ -4054,9 +4058,7 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 on_text=logged_text,
                 on_model_response=logged_model_response,
                 on_retry=logged_provider_retry,
-                # Tool rounds are unlimited unless an operator explicitly
-                # configures COCKPIT_AI_MAX_TOOL_ROUNDS (or max_tool_rounds).
-                max_tool_rounds=self.config.ai.max_tool_rounds,
+                max_tool_rounds=max(1, self.config.ai.max_tool_rounds),
                 max_tool_output_chars=self.config.ai.max_tool_output_chars,
                 on_context_compacted=logged_context_compaction,
             )

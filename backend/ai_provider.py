@@ -692,6 +692,7 @@ class AiProvider:
                 tools,
                 call_tool,
                 pinned_context=pinned_context,
+                session_key=response_session_key,
                 on_reasoning=on_reasoning,
                 on_text=on_text,
                 on_model_response=on_model_response,
@@ -937,6 +938,7 @@ class AiProvider:
         tools: list[dict[str, Any]],
         call_tool: Callable[[str, dict[str, Any]], Awaitable[Any]],
         pinned_context: str | None = None,
+        session_key: str | None = None,
         on_reasoning: Callable[[str, int], Awaitable[None]] | None = None,
         on_text: Callable[[str, int], Awaitable[None]] | None = None,
         on_model_response: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
@@ -965,6 +967,8 @@ class AiProvider:
             "tools": chat_tools,
             "tool_choice": "auto",
         }
+        if session_key:
+            payload["user"] = session_key
         apply_chat_options(payload, self.config)
         compaction_details = enforce_chat_payload_budget(payload, self.config)
         if compaction_details is not None and on_context_compacted is not None:
@@ -1047,6 +1051,8 @@ class AiProvider:
                 "tools": chat_tools,
                 "tool_choice": "auto",
             }
+            if session_key:
+                followup["user"] = session_key
             apply_chat_options(followup, self.config)
             compaction_details = enforce_chat_payload_budget(followup, self.config)
             if compaction_details is not None and on_context_compacted is not None:

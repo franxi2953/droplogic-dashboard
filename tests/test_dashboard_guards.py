@@ -35,7 +35,7 @@ sys.modules.setdefault("mcp.server", SimpleNamespace(Server=object))
 sys.modules.setdefault("mcp.server.stdio", SimpleNamespace(stdio_server=None))
 
 from backend.agent_tools import filter_agent_tools
-from backend.goals import melting_goal_completion_blocker
+from backend.goals import action_goal_completion_blocker, melting_goal_completion_blocker
 from backend.mcp_client import McpStdioClient
 from backend.runtime_utils import websocket_closed_ok
 from backend.server import CockpitApp, exception_diagnostic
@@ -771,6 +771,68 @@ class MeltingGoalCompletionTests(unittest.TestCase):
 
 
 class DashboardGoalCompletionEnforcementTests(unittest.IsolatedAsyncioTestCase):
+    def test_boxmini_action_goal_rejects_textual_evidence_without_actions(self) -> None:
+        objective = (
+            "Initialize BoxMini. Clear the matrix and show the whole cartridge. "
+            "Create six separated 2 x 2 droplet-like blocks and route them across the cartridge."
+        )
+        events = [
+            {"type": "goal_set", "objective": objective, "t": 1},
+            {"type": "mcp_tool_call", "tool": "resume_timeline", "arguments": {}, "t": 2},
+            {
+                "type": "mcp_tool_result",
+                "tool": "resume_timeline",
+                "call_event_id": 2,
+                "ok": True,
+            },
+        ]
+
+        blocker = action_goal_completion_blocker(objective, events)
+
+        self.assertIn("system initialization", blocker)
+        self.assertIn("matrix reset", blocker)
+        self.assertIn("droplet creation", blocker)
+        self.assertIn("movement planning", blocker)
+        self.assertIn("movement execution", blocker)
+        self.assertIn("whole-cartridge view", blocker)
+
+    def test_boxmini_action_goal_accepts_matching_run_local_tool_evidence(self) -> None:
+        objective = (
+            "Initialize BoxMini. Clear the matrix and show the whole cartridge. "
+            "Create a droplet and move it in a path."
+        )
+        tools = [
+            ("restart_system", {"system": "boxmini", "reset_matrix": True}),
+            ("set_execution_view_mode", {"mode": "whole_chip_camera"}),
+            ("create_droplet", {"droplet_id": 1}),
+            ("plan_move", {"background": True}),
+            ("execute_segment_to_breakpoint", {"frame_number": 5}),
+            ("execution_status_summary", {}),
+        ]
+        events: list[dict[str, object]] = [{"type": "goal_set", "objective": objective, "t": 1}]
+        for index, (tool, arguments) in enumerate(tools, 2):
+            result: dict[str, object] = {}
+            if tool == "execution_status_summary":
+                result = {
+                    "executor": {"is_executing": False, "progress": 100.0},
+                    "plan": {"planning_success": True},
+                    "droplets": {"droplets": [{"active": True, "at_target": True}]},
+                }
+            events.extend(
+                [
+                    {"type": "mcp_tool_call", "tool": tool, "arguments": arguments, "t": index},
+                    {
+                        "type": "mcp_tool_result",
+                        "tool": tool,
+                        "call_event_id": index,
+                        "ok": True,
+                        "result": result,
+                    },
+                ]
+            )
+
+        self.assertEqual(action_goal_completion_blocker(objective, events), "")
+
     async def test_dashboard_rejects_completed_claim_after_cancelled_melting_routine(self) -> None:
         app = object.__new__(CockpitApp)
         recorded: list[tuple[str, dict[str, object]]] = []
