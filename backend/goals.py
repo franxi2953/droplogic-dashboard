@@ -35,9 +35,11 @@ def action_goal_completion_blocker(objective: str, events: list[dict[str, Any]])
         name = str(event.get("tool") or "")
         arguments = call_arguments.get(event.get("call_event_id"), {})
         successful_calls.append((name, arguments))
-        successful_events.append(
-            (event_index, name, compact_tool_payload(event.get("result")))
-        )
+        payload = compact_tool_payload(event.get("result"))
+        # MCP envelopes commonly put the actual status below structuredContent.result.
+        while isinstance(payload, dict) and "executor" not in payload and isinstance(payload.get("result"), dict):
+            payload = payload["result"]
+        successful_events.append((event_index, name, payload))
     successful_tools = {name for name, _arguments in successful_calls if name}
 
     def mentions(*terms: str) -> bool:

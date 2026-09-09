@@ -814,9 +814,13 @@ class DashboardGoalCompletionEnforcementTests(unittest.IsolatedAsyncioTestCase):
             result: dict[str, object] = {}
             if tool == "execution_status_summary":
                 result = {
-                    "executor": {"is_executing": False, "progress": 100.0},
-                    "plan": {"planning_success": True},
-                    "droplets": {"droplets": [{"active": True, "at_target": True}]},
+                    "structuredContent": {
+                        "result": {
+                            "executor": {"is_executing": False, "progress": 100.0},
+                            "plan": {"planning_success": True},
+                            "droplets": {"droplets": [{"active": True, "at_target": True}]},
+                        }
+                    }
                 }
             events.extend(
                 [
