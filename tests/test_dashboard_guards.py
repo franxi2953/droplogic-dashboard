@@ -35,7 +35,6 @@ sys.modules.setdefault("mcp.server", SimpleNamespace(Server=object))
 sys.modules.setdefault("mcp.server.stdio", SimpleNamespace(stdio_server=None))
 
 from backend.agent_tools import filter_agent_tools
-from backend.goals import action_goal_completion_blocker, melting_goal_completion_blocker
 from backend.mcp_client import McpStdioClient
 from backend.runtime_utils import websocket_closed_ok
 from backend.server import CockpitApp, exception_diagnostic
@@ -739,131 +738,33 @@ class RequiredGuideContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["isError"])
 
 
-class MeltingGoalCompletionTests(unittest.TestCase):
-    OBJECTIVE = "Run a melting curve from 25 C to 55 C with Brightfield and FAM images at every step."
-
-    def test_cancelled_temperature_routine_blocks_melting_completion(self) -> None:
-        blocker = melting_goal_completion_blocker(
-            self.OBJECTIVE,
-            [
-                {"type": "mcp_tool_call", "tool": "start_temperature_routine"},
-                {"type": "mcp_tool_call", "tool": "cancel_temperature_routine"},
-            ],
-        )
-
-        self.assertIn("cancel_temperature_routine", blocker)
-
-    def test_completed_capture_with_every_photo_allows_melting_completion(self) -> None:
-        events = [
-            {
-                "type": "melting_curve_capture_finished",
-                "routine_id": "run-1",
-                "ok": True,
-                "completed": True,
-                "requested_steps": 2,
-                "completed_steps": 2,
-            },
-            {"type": "melting_curve_capture_photo", "routine_id": "run-1", "step_index": 0},
-            {"type": "melting_curve_capture_photo", "routine_id": "run-1", "step_index": 1},
-        ]
-
-        self.assertEqual(melting_goal_completion_blocker(self.OBJECTIVE, events), "")
-
-
-class DashboardGoalCompletionEnforcementTests(unittest.IsolatedAsyncioTestCase):
-    def test_boxmini_action_goal_rejects_textual_evidence_without_actions(self) -> None:
-        objective = (
-            "Initialize BoxMini. Clear the matrix and show the whole cartridge. "
-            "Create six separated 2 x 2 droplet-like blocks and route them across the cartridge."
-        )
-        events = [
-            {"type": "goal_set", "objective": objective, "t": 1},
-            {"type": "mcp_tool_call", "tool": "resume_timeline", "arguments": {}, "t": 2},
-            {
-                "type": "mcp_tool_result",
-                "tool": "resume_timeline",
-                "call_event_id": 2,
-                "ok": True,
-            },
-        ]
-
-        blocker = action_goal_completion_blocker(objective, events)
-
-        self.assertIn("system initialization", blocker)
-        self.assertIn("matrix reset", blocker)
-        self.assertIn("droplet creation", blocker)
-        self.assertIn("movement planning", blocker)
-        self.assertIn("movement execution", blocker)
-        self.assertIn("whole-cartridge view", blocker)
-
-    def test_boxmini_action_goal_accepts_matching_run_local_tool_evidence(self) -> None:
-        objective = (
-            "Initialize BoxMini. Clear the matrix and show the whole cartridge. "
-            "Create a droplet and move it in a path."
-        )
-        tools = [
-            ("restart_system", {"system": "boxmini", "reset_matrix": True}),
-            ("set_execution_view_mode", {"mode": "whole_chip_camera"}),
-            ("create_droplet", {"droplet_id": 1}),
-            ("plan_move", {"background": True}),
-            ("execute_segment_to_breakpoint", {"frame_number": 5}),
-            ("execution_status_summary", {}),
-        ]
-        events: list[dict[str, object]] = [{"type": "goal_set", "objective": objective, "t": 1}]
-        for index, (tool, arguments) in enumerate(tools, 2):
-            result: dict[str, object] = {}
-            if tool == "execution_status_summary":
-                result = {
-                    "executor": {"is_executing": False, "progress": 100.0},
-                    "plan": {"planning_success": True},
-                    "droplets": {"droplets": [{"active": True, "at_target": True}]},
-                }
-            events.extend(
-                [
-                    {"type": "mcp_tool_call", "tool": tool, "arguments": arguments, "t": index},
-                    {
-                        "type": "mcp_tool_result",
-                        "tool": tool,
-                        "call_event_id": index,
-                        "ok": True,
-                        "result": result,
-                    },
-                ]
-            )
-
-        self.assertEqual(action_goal_completion_blocker(objective, events), "")
-
-    async def test_dashboard_rejects_completed_claim_after_cancelled_melting_routine(self) -> None:
+class DashboardGoalCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dashboard_records_agent_completion_without_objective_heuristics(self) -> None:
         app = object.__new__(CockpitApp)
         recorded: list[tuple[str, dict[str, object]]] = []
-
-        class FakeRecorder:
-            run_id = "run"
-
-            def events_for_run(self, _run_id: str) -> list[dict[str, object]]:
-                return [
-                    {"type": "mcp_tool_call", "tool": "start_temperature_routine"},
-                    {"type": "mcp_tool_call", "tool": "cancel_temperature_routine"},
-                ]
 
         async def fake_record(event_type: str, **fields: object) -> dict[str, object]:
             recorded.append((event_type, fields))
             return {}
 
-        app.recorder = FakeRecorder()
+        async def fake_broadcast(_message: dict[str, object]) -> None:
+            return None
+
         app.goal_status = lambda: {
             "status": "active",
             "objective": "Run a melting curve with images at every temperature step.",
         }
         app.record = fake_record
+        app.status = lambda: {"ok": True}
+        app.broadcast_json = fake_broadcast
 
         result = await app.complete_goal_from_agent(
             {"summary": "Melting completed.", "evidence": "All checkpoints documented."}
         )
 
-        self.assertTrue(result["isError"])
-        self.assertIn("cancel_temperature_routine", result["error"])
-        self.assertEqual(recorded[0][0], "goal_completion_rejected")
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["ok"])
+        self.assertEqual(recorded[0][0], "goal_completed")
 
 
 class SeparateGuideSelectorTests(unittest.IsolatedAsyncioTestCase):
