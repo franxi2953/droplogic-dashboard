@@ -160,12 +160,14 @@ class RetryPayloadCompactionTests(unittest.TestCase):
                     }
                 ],
                 call_tool=call_tool,
+                response_session_key="run-123:dgx-gateway",
             )
             return result, requests
 
         result, requests = asyncio.run(exercise())
 
         self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["user"], "run-123:dgx-gateway")
         self.assertEqual(result["stopped_reason"], "goal_completed")
         self.assertEqual(result["text"], "Goal marked complete.")
 
