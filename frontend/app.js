@@ -2430,6 +2430,7 @@ function formatContextMetricsTitle(metrics) {
   if (metrics.input_item_count) parts.push(`${metrics.input_item_count} input items`);
   if (metrics.function_call_output_count) parts.push(`${metrics.function_call_output_count} tool outputs`);
   if (metrics.retry_attempts) parts.push(`${metrics.retry_attempts} retries`);
+  if (metrics.retry_wait_seconds) parts.push(`${metrics.retry_wait_seconds}s retry backoff`);
   if (metrics.attempt) parts.push(`retry attempt ${metrics.attempt}`);
   return parts.join("; ") || "model request metrics unavailable";
 }
@@ -2519,8 +2520,10 @@ function providerRetrySummary(event) {
   const parts = [`attempt ${event.attempt || "?"}`];
   if (event.status_code) parts.push(`HTTP ${event.status_code}`);
   if (event.error_type) parts.push(event.error_type);
-  const delay = Number(event.delay_seconds || 0);
-  parts.push(delay > 0 ? `after ${delay}s` : "now");
+  const cumulativeWait = Number(event.cumulative_retry_wait_seconds || 0);
+  if (cumulativeWait > 0) parts.push(`${cumulativeWait}s waited total`);
+  const nextDelay = Number(event.next_retry_delay_seconds || 0);
+  parts.push(nextDelay > 0 ? `next in ${nextDelay}s` : "retrying");
   return parts.join(" / ");
 }
 
@@ -2533,8 +2536,12 @@ function providerRetryText(event) {
   const response = cleanProviderResponsePreview(event.response || event.body_preview || "", event.status_code);
   if (response) lines.push(`response: ${response}`);
   if (event.body_chars) lines.push(`response size: ${formatCompactNumber(event.body_chars)}`);
-  const delay = Number(event.delay_seconds || 0);
-  lines.push(delay > 0 ? `retry delay before this attempt: ${delay}s` : "retry delay before this attempt: immediate");
+  const waited = Number(event.retry_wait_seconds_before_attempt || 0);
+  const cumulativeWait = Number(event.cumulative_retry_wait_seconds || 0);
+  lines.push(`retry backoff before this attempt (actual): ${waited}s`);
+  lines.push(`retry backoff accumulated (actual): ${cumulativeWait}s`);
+  const nextDelay = Number(event.next_retry_delay_seconds || 0);
+  lines.push(nextDelay > 0 ? `next retry backoff scheduled: ${nextDelay}s` : "retrying now");
   return lines.join("\n");
 }
 

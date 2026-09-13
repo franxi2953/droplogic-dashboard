@@ -86,6 +86,8 @@ else:
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
 GOAL_COMPLETE_TOOL = "dashboard_complete_goal"
 GUIDE_CONTEXT_TOOL = "select_guide_context"
+NEXT_GUIDES_MARKER = "NEXT_GUIDES"
+NEXT_GUIDES_PATTERN = re.compile(r"(?im)^\s*NEXT_GUIDES\s*:\s*(\[[^\r\n]*\])\s*$")
 DEFAULT_AGENT_FRAME_DELAY_SECONDS = 1.0
 DEFAULT_AGENT_EXECUTION_WAIT_SECONDS = 30.0
 DEFAULT_AGENT_PLANNING_WAIT_SECONDS = 15.0
@@ -128,6 +130,62 @@ MCP_HEALTH_GUARDED_TOOLS = {
     "temperature_hold",
     "verify_droplets",
 }
+
+
+def parse_next_guide_declaration(text: str, allowed_paths: list[str]) -> dict[str, Any]:
+    """Parse the model's ordered next-turn guide declaration."""
+    matches = NEXT_GUIDES_PATTERN.findall(str(text or ""))
+    if not matches:
+        return {"status": "missing", "paths": [], "invalid_paths": []}
+    if len(matches) != 1:
+        return {
+            "status": "invalid",
+            "paths": [],
+            "invalid_paths": [],
+            "error": f"Expected exactly one {NEXT_GUIDES_MARKER} line; received {len(matches)}.",
+        }
+    try:
+        raw_paths = json.loads(matches[0])
+    except json.JSONDecodeError as exc:
+        return {
+            "status": "invalid",
+            "paths": [],
+            "invalid_paths": [],
+            "error": f"{NEXT_GUIDES_MARKER} is not a valid JSON array: {exc.msg}.",
+        }
+    if not isinstance(raw_paths, list) or not all(isinstance(path, str) for path in raw_paths):
+        return {
+            "status": "invalid",
+            "paths": [],
+            "invalid_paths": [],
+            "error": f"{NEXT_GUIDES_MARKER} must be a JSON array of guide path strings.",
+        }
+    allowed = set(allowed_paths)
+    paths: list[str] = []
+    invalid: list[str] = []
+    for raw_path in raw_paths:
+        path = raw_path.strip().replace("\\", "/")
+        if path not in allowed:
+            if path not in invalid:
+                invalid.append(path)
+            continue
+        if path not in paths:
+            paths.append(path)
+    if invalid:
+        return {
+            "status": "invalid",
+            "paths": [],
+            "invalid_paths": invalid,
+            "error": "One or more declared guide paths are not present in the guide catalog.",
+        }
+    return {"status": "valid", "paths": paths, "invalid_paths": []}
+
+
+# A health probe can briefly exceed the short MCP request timeout while a
+# camera/streamer or hardware initialization call is releasing a lock.  Keep
+# the guard fail-closed, but allow a bounded set of increasingly patient
+# probes before refusing the requested tool.
+MCP_HEALTH_CHECK_TIMEOUTS_SECONDS = (3.0, 6.0, 12.0, 24.0)
 RUN_EVENT_WINDOW_LIMIT = 420
 RUN_EVENT_OLDER_LIMIT = 260
 FRONTEND_OMITTED_EVENT_TYPES = {
@@ -392,10 +450,27 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
     ) -> dict[str, Any] | None:
         if not self.mcp_tool_requires_health(tool, arguments) or not self.mcp.running:
             return None
-        health_result = await self.safe_tool("health_check", timeout_seconds=3.0)
-        health = self.normalized_health_payload(health_result)
-        if isinstance(health, dict) and health.get("ok") is True:
-            return None
+        health = None
+        health_attempts: list[dict[str, Any]] = []
+        for attempt, timeout_seconds in enumerate(MCP_HEALTH_CHECK_TIMEOUTS_SECONDS, start=1):
+            health_result = await self.safe_tool("health_check", timeout_seconds=timeout_seconds)
+            health = self.normalized_health_payload(health_result)
+            attempt_record: dict[str, Any] = {
+                "attempt": attempt,
+                "timeout_seconds": timeout_seconds,
+            }
+            if isinstance(health, dict):
+                attempt_record.update(
+                    {
+                        "ok": health.get("ok"),
+                        "error": health.get("error"),
+                    }
+                )
+            else:
+                attempt_record.update({"ok": False, "error": "unstructured health payload"})
+            health_attempts.append(attempt_record)
+            if isinstance(health, dict) and health.get("ok") is True:
+                return None
         if not isinstance(health, dict):
             health = {
                 "ok": False,
@@ -409,8 +484,10 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             "tool_not_run": tool,
             "via": via,
             "health": health,
+            "health_attempts": health_attempts,
             "error": (
-                f"Refusing to run {tool}: the MCP runtime health check failed. "
+                f"Refusing to run {tool}: the MCP runtime health check failed after "
+                f"{len(health_attempts)} attempts. "
                 "Do not continue hardware execution until the BoxMini system is restarted "
                 "or the queue workers are healthy."
             ),
@@ -521,11 +598,138 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                     merged[path] = {**item, "source": source, "root": str(root.resolve())}
         return [merged[path] for path in sorted(merged)]
 
+    def guide_declaration_context(self, declaration_state: dict[str, Any]) -> str:
+        shards = self.available_guide_shards()
+        catalog_lines = [
+            f"- {item.get('path')} | {item.get('title') or 'Untitled'} | {int(item.get('chars') or 0)} chars"
+            for item in shards
+            if item.get("path")
+        ]
+        alert = str(declaration_state.get("alert") or "").strip()
+        sections = [
+            "# Next-turn guide declaration",
+            (
+                "In every reasoning turn, emit exactly one standalone line selecting the detailed guides "
+                "needed for the NEXT reasoning turn. Rank paths from highest to lowest priority. Use exact "
+                f"catalog paths and JSON syntax. Use `{NEXT_GUIDES_MARKER}: []` only when no detailed guide "
+                "will be relevant next. This declaration is metadata, not a tool call."
+            ),
+            f'Example: {NEXT_GUIDES_MARKER}: ["agent-guide/06-planning-execution-rhythm.md", "agent-guide/07-droplets-reservoirs-injection.md"]',
+            "## Available guide paths\n" + "\n".join(catalog_lines),
+        ]
+        if alert:
+            sections.insert(1, alert)
+        return "\n\n".join(sections)
+
+    @staticmethod
+    def guide_declaration_alert(
+        declaration: dict[str, Any],
+        allowed_paths: list[str],
+    ) -> str:
+        status = str(declaration.get("status") or "missing")
+        invalid = list(declaration.get("invalid_paths") or [])
+        reason = str(declaration.get("error") or "").strip()
+        details = []
+        if status == "missing":
+            details.append(f"THE PREVIOUS RESPONSE OMITTED THE REQUIRED {NEXT_GUIDES_MARKER} LINE.")
+        else:
+            details.append(f"THE PREVIOUS {NEXT_GUIDES_MARKER} LINE WAS INVALID.")
+        if reason:
+            details.append(reason)
+        if invalid:
+            details.append("Invalid names: " + ", ".join(invalid))
+        details.extend(
+            [
+                "IN THIS RESPONSE, EMIT EXACTLY ONE CORRECTED STANDALONE LINE.",
+                f'Example: {NEXT_GUIDES_MARKER}: ["agent-guide/06-planning-execution-rhythm.md"]',
+                "Allowed paths: " + ", ".join(allowed_paths),
+            ]
+        )
+        return "\n".join(details)
+
+    async def apply_agent_guide_declaration(
+        self,
+        guide_context_state: dict[str, Any],
+        declaration_state: dict[str, Any],
+        text: str,
+        *,
+        round_index: int,
+        source: str,
+    ) -> bool:
+        allowed_paths = [
+            str(item.get("path") or "")
+            for item in self.available_guide_shards()
+            if item.get("path")
+        ]
+        declaration = parse_next_guide_declaration(text, allowed_paths)
+        if declaration["status"] == "missing":
+            return False
+
+        declaration_state["round"] = round_index
+        declaration_state["source"] = source
+        declaration_state["status"] = declaration["status"]
+        if declaration["status"] != "valid":
+            declaration_state["alert"] = self.guide_declaration_alert(declaration, allowed_paths)
+            await self.record(
+                "guide_context_declaration_invalid",
+                level="warning",
+                internal=True,
+                round=round_index,
+                source=source,
+                error=declaration.get("error"),
+                invalid_paths=declaration.get("invalid_paths") or [],
+            )
+            return False
+
+        ranked_paths = list(declaration["paths"])
+        if (
+            declaration_state.get("round") == round_index
+            and declaration_state.get("status") == "valid"
+            and declaration_state.get("ranked_paths") == ranked_paths
+        ):
+            return True
+        _, guide_metadata = self.load_turn_guide_expansions(ranked_paths)
+        effective_paths = self.effective_guide_paths(guide_metadata)
+        omitted_paths = [
+            str(item.get("path") or "")
+            for item in guide_metadata.get("files") or []
+            if isinstance(item, dict) and item.get("omitted")
+        ]
+        previous = list(guide_context_state.get("paths") or [])
+        guide_context_state["paths"] = effective_paths
+        guide_context_state["reason"] = "Declared by the agent for its next reasoning turn."
+        guide_context_state["revision"] = int(guide_context_state.get("revision") or 0) + 1
+        declaration_state["alert"] = ""
+        declaration_state["ranked_paths"] = ranked_paths
+        event_type = "guide_context_selected" if not previous else "guide_context_changed"
+        await self.record(
+            event_type,
+            internal=True,
+            source="agent_next_guides_declaration",
+            declaration_source=source,
+            trigger_round=round_index,
+            ranked_paths=ranked_paths,
+            selected_paths=effective_paths,
+            effective_paths=effective_paths,
+            omitted_guide_paths=omitted_paths,
+            previous_paths=previous,
+            reason=guide_context_state["reason"],
+            revision=guide_context_state["revision"],
+            **guide_metadata,
+        )
+        return True
+
     def load_turn_guide_expansions(self, paths: list[str]) -> tuple[str, dict[str, Any]]:
+        header = (
+            "# Turn-Scoped Detailed Guide Expansions\n"
+            "These detailed guide files were selected for this model turn only. "
+            "Re-evaluate guide needs on the next turn.\n\n"
+        )
         sections: list[str] = []
         loaded: list[dict[str, Any]] = []
         missing: list[str] = []
-        current_chars = 0
+        current_chars = len(header)
+        capacity_reached = False
         seen: set[str] = set()
         for raw_path in paths:
             clean_path = str(raw_path).strip().replace("\\", "/")
@@ -549,79 +753,28 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             text = path.read_text(encoding="utf-8").strip()
             section = f"### {clean_path}\n{text}"
             next_chars = len(section) + 2
-            if sections and current_chars + next_chars > GUIDE_EXPANSION_CHAR_LIMIT:
-                loaded.append({"path": clean_path, "omitted": True, "reason": "guide_expansion_char_limit"})
-                break
+            if capacity_reached or current_chars + next_chars > GUIDE_EXPANSION_CHAR_LIMIT:
+                capacity_reached = True
+                loaded.append(
+                    {
+                        "path": clean_path,
+                        "omitted": True,
+                        "reason": "guide_priority_budget_exhausted",
+                        "chars": len(text),
+                    }
+                )
+                continue
             sections.append(section)
             current_chars += next_chars
             loaded.append({"path": clean_path, "source": source, "root": str(root), "chars": len(text), "sent_chars": len(section)})
         if not sections:
             return "", {"files": loaded, "missing": missing, "sent_chars": 0}
-        context = (
-            "# Turn-Scoped Detailed Guide Expansions\n"
-            "These detailed guide files were selected for this model turn only. "
-            "Re-evaluate guide needs on the next turn.\n\n"
-            + "\n\n".join(sections)
-        )
+        context = header + "\n\n".join(sections)
         return context, {
             "files": loaded,
             "missing": missing,
             "sent_chars": len(context),
         }
-
-    async def select_turn_guide_shards(
-        self,
-        prompt: str,
-        goal: dict[str, Any],
-        events: list[dict[str, Any]],
-        on_retry: Any,
-        on_context_compacted: Any,
-    ) -> dict[str, Any]:
-        shards = self.available_guide_shards()
-        if not shards:
-            return {"paths": [], "reason": "no guide shards available", "catalog_count": 0}
-        selector_prompt = (
-            f"{prompt}\n\n"
-            f"The selected detailed guide files must fit within {GUIDE_EXPANSION_CHAR_LIMIT} total characters. "
-            "Use the catalog char counts and select the smallest complete set for the next turn."
-        )
-        if goal.get("status") == "active" and goal.get("objective"):
-            selector_prompt = f"{prompt}\n\nActive goal:\n{goal.get('objective')}"
-        try:
-            selection = await self.ai.select_guide_shards(
-                selector_prompt,
-                events,
-                shards,
-                max_files=5,
-                on_retry=on_retry,
-                on_context_compacted=on_context_compacted,
-            )
-        except Exception as exc:
-            return {
-                "paths": [],
-                "reason": f"guide shard selector failed: {exc}",
-                "catalog_count": len(shards),
-                "error": str(exc),
-            }
-        selection["catalog_count"] = len(shards)
-        return selection
-
-    def deterministic_guide_paths(self, prompt: str, goal: dict[str, Any]) -> list[str]:
-        """Route common BoxMini requests without spending a model turn on file selection."""
-        text = f"{prompt}\n{goal.get('objective') or ''}".lower()
-        routes = [
-            (("initialize", "initialise", "load system", "reset matrix", "clear matrix"), "agent-guide/03-startup-state-large-values.md"),
-            (("calibrat",), "agent-guide/04-calibration-geometry.md"),
-            (("plan", "execute", "protocol", "move", "path", "trajectory"), "agent-guide/06-planning-execution-rhythm.md"),
-            (("droplet", "reservoir", "inject"), "agent-guide/07-droplets-reservoirs-injection.md"),
-            (("extract",), "agent-guide/08-reservoir-extraction.md"),
-            (("whole cartridge", "whole chip", "execution view", "follow droplet"), "agent-guide/09-execution-view-modes-diagnostics.md"),
-            (("image", "photo", "camera", "microscope", "brightfield", "fluorescen", "light"), "agent-guide/10-imaging-light-vision.md"),
-            (("temperature", "thermal", "melting"), "agent-guide/11-temperature.md"),
-            (("fault", "unsafe", "emergency", "collision"), "agent-guide/12-faults-safety-stops.md"),
-        ]
-        available = {str(item.get("path") or "") for item in self.available_guide_shards()}
-        return [path for markers, path in routes if path in available and any(marker in text for marker in markers)][:5]
 
     async def broadcast_event(self, event: dict[str, Any]) -> None:
         message = json.dumps({"type": "event", "event": event}, ensure_ascii=True)
@@ -3331,24 +3484,6 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             }
 
         _, guide_metadata = self.load_turn_guide_expansions(selected)
-        capacity_error = self.guide_selection_capacity_result(result, guide_metadata)
-        if capacity_error is not None:
-            await self.record(
-                "guide_context_selection_failed",
-                level="warning",
-                internal=True,
-                source="tool_requirement",
-                trigger_tool=tool,
-                trigger_round=trigger_round,
-                required_paths=required,
-                missing_paths=missing,
-                selected_paths=selected,
-                selector_error=capacity_error["error"],
-                omitted_guide_paths=capacity_error["omitted_guide_paths"],
-                fallback_paths=previous,
-            )
-            return capacity_error
-
         effective_paths = self.effective_guide_paths(guide_metadata)
         missing_effective = [path for path in required if path not in effective_paths]
         if missing_effective:
@@ -3360,6 +3495,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 "required_guide_paths": required,
                 "loaded_guide_paths": effective_paths,
                 "missing_guide_paths": missing_effective,
+                "omitted_guide_paths": [
+                    str(item.get("path") or "")
+                    for item in guide_metadata.get("files") or []
+                    if isinstance(item, dict) and item.get("omitted")
+                ],
             }
 
         guide_context_state["paths"] = effective_paths
@@ -3376,6 +3516,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             missing_paths=missing,
             selected_paths=selected,
             effective_paths=effective_paths,
+            omitted_guide_paths=[
+                str(item.get("path") or "")
+                for item in guide_metadata.get("files") or []
+                if isinstance(item, dict) and item.get("omitted")
+            ],
             previous_paths=previous,
             reason=guide_context_state["reason"],
             revision=guide_context_state["revision"],
@@ -3394,158 +3539,6 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
             if path and path not in paths:
                 paths.append(path)
         return paths
-
-    @classmethod
-    def guide_selection_capacity_result(
-        cls,
-        result: dict[str, Any],
-        guide_metadata: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Reject a selection that cannot be delivered in full to the next model turn."""
-        omitted = [
-            str(item.get("path") or "")
-            for item in guide_metadata.get("files") or []
-            if isinstance(item, dict) and item.get("omitted")
-        ]
-        if not omitted:
-            return None
-        return {
-            "ok": False,
-            "isError": True,
-            "error": (
-                "Guide selection exceeds the next-turn expansion capacity. None of the selection was applied. "
-                "Choose a smaller set of one to five detailed shards that includes the guides needed next."
-            ),
-            "selected_paths": list(result.get("selected_paths") or []),
-            "omitted_guide_paths": omitted,
-            "effective_guide_paths": cls.effective_guide_paths(guide_metadata),
-            "required_tool": GUIDE_CONTEXT_TOOL,
-        }
-
-    async def refresh_agent_guide_context(
-        self,
-        guide_context_state: dict[str, Any],
-        prompt: str,
-        *,
-        trigger_tool: str | None,
-        trigger_round: int | None,
-        on_retry: Any,
-        on_context_compacted: Any,
-    ) -> bool:
-        """Run the guide-selector model out of band and apply its MCP context update."""
-        events = self.recorder.events_for_run(self.recorder.run_id)
-        goal = self.goal_status()
-        deterministic_paths = self.deterministic_guide_paths(prompt, goal)
-        if deterministic_paths:
-            selection = {
-                "paths": deterministic_paths,
-                "reason": "Deterministic guide routing from the active request and goal.",
-            }
-            selection_source = "deterministic_request_router"
-        else:
-            selection = await self.select_turn_guide_shards(
-                prompt,
-                goal,
-                events,
-                on_retry,
-                on_context_compacted,
-            )
-            selection_source = "separate_guide_selector"
-        requested_paths = list(selection.get("paths") or [])
-        if not requested_paths:
-            await self.record(
-                "guide_context_selection_failed",
-                level="warning",
-                internal=True,
-                trigger_tool=trigger_tool,
-                trigger_round=trigger_round,
-                selector_reason=selection.get("reason"),
-                selector_error=selection.get("error") or "Guide selector returned no detailed guide paths.",
-                fallback_paths=list(guide_context_state.get("paths") or []),
-            )
-            return False
-
-        try:
-            await self.ensure_mcp_started_for_tool(via="guide_selector", tool=GUIDE_CONTEXT_TOOL)
-            raw_result = await self.call_agent_mcp_tool(
-                GUIDE_CONTEXT_TOOL,
-                {
-                    "paths": requested_paths,
-                    "reason": str(selection.get("reason") or "Automatic next-turn guide selection."),
-                },
-            )
-            result = compact_tool_payload(mark_failed_mcp_payload(raw_result))
-        except Exception as exc:
-            result = {"ok": False, "error": str(exc), "isError": True}
-
-        if not isinstance(result, dict) or not result.get("ok"):
-            await self.record(
-                "guide_context_selection_failed",
-                level="warning",
-                internal=True,
-                trigger_tool=trigger_tool,
-                trigger_round=trigger_round,
-                selected_paths=requested_paths,
-                selector_reason=selection.get("reason"),
-                selector_error=(result or {}).get("error") if isinstance(result, dict) else "Invalid MCP selection result.",
-                fallback_paths=list(guide_context_state.get("paths") or []),
-            )
-            return False
-
-        selected = result.get("selected_paths")
-        if not isinstance(selected, list) or not all(isinstance(path, str) for path in selected):
-            await self.record(
-                "guide_context_selection_failed",
-                level="warning",
-                internal=True,
-                trigger_tool=trigger_tool,
-                trigger_round=trigger_round,
-                selected_paths=requested_paths,
-                selector_reason=selection.get("reason"),
-                selector_error="MCP returned no usable selected_paths.",
-                fallback_paths=list(guide_context_state.get("paths") or []),
-            )
-            return False
-
-        _, guide_metadata = self.load_turn_guide_expansions(selected)
-        capacity_error = self.guide_selection_capacity_result(result, guide_metadata)
-        if capacity_error is not None:
-            await self.record(
-                "guide_context_selection_failed",
-                level="warning",
-                internal=True,
-                trigger_tool=trigger_tool,
-                trigger_round=trigger_round,
-                selected_paths=selected,
-                selector_reason=selection.get("reason"),
-                selector_error=capacity_error["error"],
-                omitted_guide_paths=capacity_error["omitted_guide_paths"],
-                fallback_paths=list(guide_context_state.get("paths") or []),
-            )
-            return False
-
-        effective_paths = self.effective_guide_paths(guide_metadata)
-        previous = list(guide_context_state.get("paths") or [])
-        guide_context_state["paths"] = effective_paths
-        guide_context_state["reason"] = str(result.get("reason") or selection.get("reason") or "")
-        guide_context_state["revision"] = int(result.get("revision") or guide_context_state.get("revision", 0) + 1)
-        event_type = "guide_context_selected" if not previous else "guide_context_changed"
-        await self.record(
-            event_type,
-            internal=True,
-            source=selection_source,
-            trigger_tool=trigger_tool,
-            trigger_round=trigger_round,
-            selected_paths=selected,
-            effective_paths=effective_paths,
-            previous_paths=previous,
-            reason=guide_context_state["reason"],
-            revision=guide_context_state["revision"],
-            selector_reason=selection.get("reason"),
-            catalog_count=selection.get("catalog_count"),
-            **guide_metadata,
-        )
-        return True
 
     async def complete_goal_from_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         goal = self.goal_status()
@@ -3703,6 +3696,11 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 "last_request_paths": [],
                 "active_round": None,
             }
+            guide_declaration_state: dict[str, Any] = {
+                "round": None,
+                "status": "initial",
+                "alert": "",
+            }
             agent_continuity_state: dict[str, Any] = {}
 
             async def logged_tool_call(tool: str, arguments: dict[str, Any]) -> Any:
@@ -3723,26 +3721,30 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                         selected = result.get("selected_paths") if result.get("ok") else None
                         if isinstance(selected, list) and all(isinstance(path, str) for path in selected):
                             _, guide_metadata = self.load_turn_guide_expansions(selected)
-                            capacity_error = self.guide_selection_capacity_result(result, guide_metadata)
-                            if capacity_error is not None:
-                                result = capacity_error
-                            else:
-                                effective_paths = self.effective_guide_paths(guide_metadata)
-                                previous = list(guide_context_state["paths"])
-                                guide_context_state["paths"] = effective_paths
-                                guide_context_state["reason"] = str(result.get("reason") or "")
-                                guide_context_state["revision"] = int(
-                                    result.get("revision") or guide_context_state["revision"] + 1
-                                )
-                                await self.record(
-                                    "guide_context_changed",
-                                    selected_paths=selected,
-                                    effective_paths=effective_paths,
-                                    previous_paths=previous,
-                                    reason=guide_context_state["reason"],
-                                    revision=guide_context_state["revision"],
-                                    call_event_id=call_event.get("t"),
-                                )
+                            effective_paths = self.effective_guide_paths(guide_metadata)
+                            previous = list(guide_context_state["paths"])
+                            guide_context_state["paths"] = effective_paths
+                            guide_context_state["reason"] = str(result.get("reason") or "")
+                            guide_context_state["revision"] = int(
+                                result.get("revision") or guide_context_state["revision"] + 1
+                            )
+                            result = dict(result)
+                            result["effective_paths"] = effective_paths
+                            result["omitted_guide_paths"] = [
+                                str(item.get("path") or "")
+                                for item in guide_metadata.get("files") or []
+                                if isinstance(item, dict) and item.get("omitted")
+                            ]
+                            await self.record(
+                                "guide_context_changed",
+                                selected_paths=selected,
+                                effective_paths=effective_paths,
+                                omitted_guide_paths=result["omitted_guide_paths"],
+                                previous_paths=previous,
+                                reason=guide_context_state["reason"],
+                                revision=guide_context_state["revision"],
+                                call_event_id=call_event.get("t"),
+                            )
                         context_update = result.get("context_update")
                         if isinstance(context_update, dict) and "files" in context_update:
                             result = dict(result)
@@ -3918,21 +3920,70 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
 
             async def logged_reasoning(text: str, round_index: int) -> None:
                 await self.record("agent_thinking", text=text, round=round_index)
+                await self.apply_agent_guide_declaration(
+                    guide_context_state,
+                    guide_declaration_state,
+                    text,
+                    round_index=round_index,
+                    source="reasoning",
+                )
 
             async def logged_text(text: str, round_index: int) -> None:
                 await self.record("agent_message", text=text, round=round_index)
+                await self.apply_agent_guide_declaration(
+                    guide_context_state,
+                    guide_declaration_state,
+                    text,
+                    round_index=round_index,
+                    source="assistant_text",
+                )
 
             async def logged_model_response(metrics: dict[str, Any]) -> None:
-                guide_context_state["active_round"] = metrics.get("round")
+                round_index = int(metrics.get("round") or 0)
+                guide_context_state["active_round"] = round_index
+                allowed_paths = [
+                    str(item.get("path") or "")
+                    for item in self.available_guide_shards()
+                    if item.get("path")
+                ]
+                missing_declaration = {"status": "missing", "paths": [], "invalid_paths": []}
+                guide_declaration_state.update(
+                    {
+                        "round": round_index,
+                        "status": "missing",
+                        "source": "",
+                        "alert": self.guide_declaration_alert(missing_declaration, allowed_paths),
+                    }
+                )
+                metadata_status = str(metrics.get("next_guides_status") or "missing")
+                metadata_paths = metrics.get("next_guides")
+                if metadata_status == "declared" and isinstance(metadata_paths, list):
+                    await self.apply_agent_guide_declaration(
+                        guide_context_state,
+                        guide_declaration_state,
+                        f"{NEXT_GUIDES_MARKER}: {json.dumps(metadata_paths, ensure_ascii=True)}",
+                        round_index=round_index,
+                        source=str(metrics.get("next_guides_source") or "provider_metadata"),
+                    )
+                elif metadata_status == "invalid":
+                    guide_declaration_state.update(
+                        {
+                            "status": "invalid",
+                            "source": str(metrics.get("next_guides_source") or "provider_metadata"),
+                            "alert": (
+                                f"THE PREVIOUS {NEXT_GUIDES_MARKER} METADATA WAS INVALID. "
+                                "IN THIS RESPONSE, EMIT EXACTLY ONE CORRECTED STANDALONE NEXT_GUIDES JSON ARRAY LINE."
+                            ),
+                        }
+                    )
                 metrics["ai_profile"] = self.ai.status().get("profile")
                 metrics["guide_paths"] = list(guide_context_state["last_request_paths"])
                 metrics["guide_context_revision"] = guide_context_state["revision"]
-                metrics["guide_context_source"] = "separate_guide_selector"
+                metrics["guide_context_source"] = "agent_next_guides_declaration"
                 await self.record("agent_model_response", **metrics)
 
             async def logged_provider_retry(details: dict[str, Any]) -> None:
-                level = "error" if int(details.get("attempt") or 0) == 1 else "warning"
-                await self.record("agent_provider_retry", level=level, **details)
+                await self.record("agent_provider_retry", level="warning", **details)
 
             async def logged_context_compaction(details: dict[str, Any]) -> None:
                 await self.record("context_compacted", **details)
@@ -3960,14 +4011,6 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
 
             goal = self.goal_status()
             pinned_context, pinned_context_metadata = self.load_pinned_context()
-            await self.refresh_agent_guide_context(
-                guide_context_state,
-                prompt,
-                trigger_tool=None,
-                trigger_round=None,
-                on_retry=logged_provider_retry,
-                on_context_compacted=logged_context_compaction,
-            )
             goal_context = self.goal_pinned_context(goal)
             if goal_context:
                 tools = [*tools, *self.goal_completion_tool(goal)]
@@ -3988,10 +4031,12 @@ class CockpitApp(AudioHandlersMixin, LiveSnapshotMixin, ContextMemoryMixin):
                 active_guide_context, active_guide_metadata = self.load_turn_guide_expansions(guide_context_state["paths"])
                 guide_context_state["paths"] = self.effective_guide_paths(active_guide_metadata)
                 guide_context_state["last_request_paths"] = list(guide_context_state["paths"])
-                if not active_guide_context:
-                    return pinned_context
-                context = f"{pinned_context}\n\n{active_guide_context}" if pinned_context else active_guide_context
-                return context
+                guide_declaration_context = self.guide_declaration_context(guide_declaration_state)
+                return "\n\n".join(
+                    section
+                    for section in [pinned_context, active_guide_context, guide_declaration_context]
+                    if section
+                )
 
             active_profile = self.ai.status().get("profile")
             profile_id = str(

@@ -9,6 +9,8 @@ import types
 import unittest
 from pathlib import Path
 
+# Allow both direct execution and unittest discovery from the repository root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.modules.setdefault("httpx", types.SimpleNamespace(Response=object))
 
 from backend.ai_provider import (
@@ -18,6 +20,7 @@ from backend.ai_provider import (
     compact_payload_for_retry,
     load_response_context_session,
     model_response_metrics,
+    next_guides_metadata,
     response_context_items,
     save_response_context_session,
     apply_response_context_options,
@@ -25,14 +28,129 @@ from backend.ai_provider import (
     chat_model_response_metrics,
     context_compaction_strategy,
     compact_chat_transcript,
+    decode_response_event_stream,
     enforce_chat_payload_budget,
     extract_chat_reasoning,
+    normalized_provider_attempt_limit,
+    provider_retry_metrics,
+    provider_retry_delay_seconds,
     raise_for_embedded_provider_error,
+    retry_after_seconds,
+    response_stream_payload,
 )
 from backend.config import AiConfig
 
 
 class RetryPayloadCompactionTests(unittest.TestCase):
+    def test_next_guides_metadata_normalizes_dgx_handoff(self) -> None:
+        data = {
+            "dgx_routing": {
+                "handoff": {
+                    "next_guides": ["agent-guide/b.md", "agent-guide/a.md"],
+                }
+            }
+        }
+        self.assertEqual(
+            next_guides_metadata(data),
+            {
+                "next_guides": ["agent-guide/b.md", "agent-guide/a.md"],
+                "next_guides_status": "declared",
+                "next_guides_source": "dgx_handoff",
+            },
+        )
+
+    def test_next_guides_metadata_reads_text_for_native_providers(self) -> None:
+        data = {
+            "content": [
+                {"type": "thinking", "thinking": 'NEXT_GUIDES: ["agent-guide/a.md"]'},
+            ]
+        }
+        self.assertEqual(next_guides_metadata(data)["next_guides"], ["agent-guide/a.md"])
+        self.assertEqual(next_guides_metadata(data)["next_guides_status"], "declared")
+
+    def test_next_guides_metadata_distinguishes_invalid_from_missing(self) -> None:
+        self.assertEqual(next_guides_metadata({})["next_guides_status"], "missing")
+        self.assertEqual(
+            next_guides_metadata({"choices": [{"message": {"next_guides": {"bad": True}}}]})[
+                "next_guides_status"
+            ],
+            "invalid",
+        )
+
+    def test_provider_attempt_limit_defaults_to_six_and_accepts_single_attempt(self) -> None:
+        self.assertEqual(normalized_provider_attempt_limit(None), 6)
+        self.assertEqual(normalized_provider_attempt_limit(1), 1)
+        self.assertEqual(normalized_provider_attempt_limit(0), 1)
+
+    def test_rate_limit_backoff_is_slower_than_transient_server_backoff(self) -> None:
+        rate_limited = types.SimpleNamespace(status_code=429, headers={})
+        unavailable = types.SimpleNamespace(status_code=503, headers={})
+
+        self.assertEqual(provider_retry_delay_seconds(1, response=rate_limited), 5.0)
+        self.assertEqual(provider_retry_delay_seconds(2, response=rate_limited), 15.0)
+        self.assertEqual(provider_retry_delay_seconds(1, response=unavailable), 1.0)
+
+    def test_retry_after_header_overrides_shorter_local_backoff(self) -> None:
+        response = types.SimpleNamespace(status_code=429, headers={"retry-after": "42"})
+
+        self.assertEqual(retry_after_seconds(response), 42.0)
+        self.assertEqual(provider_retry_delay_seconds(1, response=response), 42.0)
+
+    def test_retry_after_header_is_capped(self) -> None:
+        response = types.SimpleNamespace(status_code=429, headers={"retry-after": "9999"})
+
+        self.assertEqual(retry_after_seconds(response), 120.0)
+
+    def test_retry_metrics_separate_actual_backoff_from_request_elapsed_time(self) -> None:
+        metrics = provider_retry_metrics(
+            {
+                "_cockpit_retry_attempts": 3,
+                "_cockpit_retry_wait_seconds": 8.5,
+            },
+            elapsed_seconds=20.0,
+        )
+
+        self.assertEqual(metrics["provider_attempts"], 3)
+        self.assertEqual(metrics["retry_attempts"], 2)
+        self.assertEqual(metrics["retry_wait_seconds"], 8.5)
+        self.assertEqual(metrics["elapsed_excluding_retry_wait_seconds"], 11.5)
+
+    def test_response_stream_payload_is_non_mutating(self) -> None:
+        payload = {"model": "gpt-test", "input": [{"role": "user", "content": "hello"}]}
+
+        streamed = response_stream_payload(payload)
+
+        self.assertNotIn("stream", payload)
+        self.assertIsNot(streamed, payload)
+        self.assertTrue(streamed["stream"])
+
+    def test_response_stream_returns_canonical_completed_response(self) -> None:
+        expected = {
+            "id": "resp_123",
+            "status": "completed",
+            "output": [{"type": "message", "content": []}],
+        }
+
+        async def lines():
+            yield "event: response.created"
+            yield 'data: {"type":"response.created","response":{"id":"resp_123","status":"in_progress"}}'
+            yield ""
+            yield "event: response.completed"
+            yield "data: " + json.dumps({"type": "response.completed", "response": expected})
+            yield ""
+            yield "data: [DONE]"
+
+        result = asyncio.run(decode_response_event_stream(lines()))
+
+        self.assertEqual(result, expected)
+
+    def test_response_stream_surfaces_provider_error(self) -> None:
+        async def lines():
+            yield 'data: {"type":"error","error":{"message":"upstream failed"}}'
+
+        with self.assertRaisesRegex(RuntimeError, "upstream failed"):
+            asyncio.run(decode_response_event_stream(lines()))
+
     def test_http_200_gateway_error_payload_is_not_treated_as_empty_completion(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "serializer rejected the request"):
             raise_for_embedded_provider_error(

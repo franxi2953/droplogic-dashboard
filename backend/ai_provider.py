@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from email.utils import parsedate_to_datetime
 import re
 import json
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,13 @@ from .context_builder import (
     encoded_json_length,
     stale_state_snapshot_indices,
 )
-from .pinned_context import parse_guide_shard_selection
 
 
 RETRY_PAYLOAD_COMPACT_EVERY = 5
-MAX_PROVIDER_ATTEMPTS = 3
+MAX_PROVIDER_ATTEMPTS = 6
+PROVIDER_RETRY_DELAYS_SECONDS = (0.0, 1.0, 3.0, 7.0, 15.0, 30.0)
+RATE_LIMIT_RETRY_DELAYS_SECONDS = (0.0, 5.0, 15.0, 30.0, 60.0, 90.0)
+MAX_RETRY_AFTER_SECONDS = 120.0
 RETRY_PAYLOAD_EVENT_LOG_TARGET_CHARS = 70_000
 RETRY_PAYLOAD_MIN_EVENT_LOG_TARGET_CHARS = 16_000
 RETRY_PAYLOAD_MIN_TOOL_OUTPUT_CHARS = 1_500
@@ -67,7 +70,11 @@ DASHBOARD_AGENT_INSTRUCTIONS = (
     "When the user asks to show the whole cartridge, use whole_chip_camera and request a streamer "
     "visualizer_frame so the camera image is actually recorded and previewable. When the request says "
     "to show the whole cartridge during the protocol, preserve whole_chip_camera for every segment; "
-    "do not switch back to follow_droplets unless the user requests a microscope inspection."
+    "do not switch back to follow_droplets unless the user requests a microscope inspection. "
+    "At the end of every reasoning summary, emit exactly one standalone `NEXT_GUIDES: [...]` line. "
+    "It must be a JSON array of exact guide paths, ranked from highest to lowest priority, for the NEXT "
+    "reasoning turn. The available paths are in pinned context. This is metadata, not a tool call. "
+    "Use `NEXT_GUIDES: []` only when no detailed guide will be relevant next."
 )
 
 
@@ -519,6 +526,7 @@ class AiProvider:
             data = await self._post_anthropic_message(
                 anthropic_payload,
                 on_retry=on_retry,
+                max_attempts=1,
                 on_retry_compact=retry_payload_compactor(
                     anthropic_payload,
                     max_tool_output_chars=6_000,
@@ -548,6 +556,7 @@ class AiProvider:
             data = await self._post_chat_completion(
                 chat_payload,
                 on_retry=on_retry,
+                max_attempts=1,
                 on_retry_compact=retry_payload_compactor(
                     chat_payload,
                     max_tool_output_chars=6_000,
@@ -562,6 +571,7 @@ class AiProvider:
         data = await self._post_response(
             payload,
             on_retry=on_retry,
+            max_attempts=1,
             on_retry_compact=retry_payload_compactor(
                 payload,
                 max_tool_output_chars=6_000,
@@ -572,80 +582,6 @@ class AiProvider:
         if len(text) > max_chars:
             text = f"{text[: max_chars - 200].rstrip()}\n\n[AI memory truncated to configured limit.]"
         return text
-
-    async def select_guide_shards(
-        self,
-        prompt: str,
-        events: list[dict[str, Any]],
-        shard_catalog: list[dict[str, Any]],
-        max_files: int = 5,
-        on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-        on_context_compacted: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
-    ) -> dict[str, Any]:
-        if not self.configured or not shard_catalog:
-            return {"paths": [], "reason": "guide shard selection unavailable"}
-
-        allowed_paths = [str(item.get("path") or "") for item in shard_catalog if item.get("path")]
-        selection_context = [
-            build_run_memory(events),
-            *events[-20:],
-        ]
-        instructions = (
-            "Select DropLogic BoxMini guide shards to refresh before the next agent turn. "
-            "You are not executing the task. Choose only files whose detailed rules are likely "
-            "needed for this exact user request, active goal, recent tool failures, or safety risk. "
-            f"Return only JSON with keys `paths` and `reason`. `paths` must contain 0 to {max_files} "
-            "items from the provided catalog, with no invented paths."
-        )
-        content = (
-            f"User request:\n{prompt}\n\n"
-            f"Available guide shards:\n{json.dumps(shard_catalog, ensure_ascii=True, default=str)}\n\n"
-            "Compact recent run context:\n"
-            f"{json.dumps(selection_context, ensure_ascii=True, default=str)}"
-        )
-
-        if uses_anthropic_messages(self.config):
-            payload = {
-                "model": self.config.model,
-                "system": instructions,
-                "max_tokens": 1200,
-                "messages": [{"role": "user", "content": content}],
-            }
-            data = await self._post_anthropic_message(
-                payload,
-                on_retry=on_retry,
-                on_retry_compact=retry_payload_compactor(payload, on_context_compacted=on_context_compacted),
-            )
-            text = extract_anthropic_text(data)
-        elif uses_chat_completions(self.config):
-            payload = {
-                "model": self.config.model,
-                "messages": [
-                    {"role": "system", "content": instructions},
-                    {"role": "user", "content": content},
-                ],
-            }
-            data = await self._post_chat_completion(
-                payload,
-                on_retry=on_retry,
-                on_retry_compact=retry_payload_compactor(payload, on_context_compacted=on_context_compacted),
-            )
-            text = extract_chat_response_text(data)
-        else:
-            payload = {
-                "model": self.config.model,
-                "instructions": instructions,
-                "input": [{"role": "user", "content": content}],
-            }
-            apply_response_context_options(payload, self.config)
-            data = await self._post_response(
-                payload,
-                on_retry=on_retry,
-                on_retry_compact=retry_payload_compactor(payload, on_context_compacted=on_context_compacted),
-            )
-            text = extract_response_text(data)
-
-        return parse_guide_shard_selection(text, allowed_paths=allowed_paths, max_files=max_files)
 
     async def ask_with_tools(
         self,
@@ -1267,30 +1203,84 @@ class AiProvider:
         payload: dict[str, Any],
         on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_retry_compact: Callable[[int], Awaitable[None]] | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
         url = f"{self.config.base_url}/responses"
-        delays = [0.0, 0.0, 0.25, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0]
+        attempt_limit = normalized_provider_attempt_limit(max_attempts)
+        next_delay = 0.0
+        total_retry_wait_seconds = 0.0
         attempt = 0
         async with httpx.AsyncClient(timeout=None) as client:
             while True:
-                delay = delays[attempt] if attempt < len(delays) else delays[-1]
+                delay = next_delay
                 if delay > 0:
+                    wait_started = time.monotonic()
                     await asyncio.sleep(delay)
+                    waited_before_attempt = time.monotonic() - wait_started
+                    total_retry_wait_seconds += waited_before_attempt
+                else:
+                    waited_before_attempt = 0.0
                 attempt += 1
                 try:
-                    response = await client.post(url, headers=headers, json=payload)
+                    request_payload = response_stream_payload(payload)
+                    async with client.stream("POST", url, headers=headers, json=request_payload) as response:
+                        if is_retryable_response(response):
+                            await response.aread()
+                            body = response.text
+                            will_retry = attempt < attempt_limit
+                            next_delay = provider_retry_delay_seconds(attempt, response=response) if will_retry else 0.0
+                            if on_retry is not None and will_retry:
+                                await on_retry(
+                                    {
+                                        "attempt": attempt,
+                                        "delay_seconds": delay,
+                                        "retry_wait_seconds_before_attempt": round(waited_before_attempt, 3),
+                                        "cumulative_retry_wait_seconds": round(total_retry_wait_seconds, 3),
+                                        "next_retry_delay_seconds": next_delay,
+                                        "status_code": response.status_code,
+                                        "response": preview_response_body(body),
+                                        "body_preview": preview_response_body(body),
+                                        "body_chars": len(body),
+                                        **payload_diagnostics(payload),
+                                    }
+                                )
+                            if response.status_code != 429 and attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
+                                await on_retry_compact(attempt)
+                            if attempt >= attempt_limit:
+                                raise RuntimeError(
+                                    f"Provider request failed after {attempt} attempts: "
+                                    f"HTTP {response.status_code}. Response body: {body}"
+                                )
+                            continue
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError as exc:
+                            await response.aread()
+                            body = response.text
+                            raise RuntimeError(f"{exc}. Response body: {body}") from exc
+                        content_type = response.headers.get("content-type", "").lower()
+                        if "text/event-stream" in content_type:
+                            data = await decode_response_event_stream(response.aiter_lines())
+                        else:
+                            await response.aread()
+                            data = response.json()
                 except httpx.RequestError as exc:
                     if not is_retryable_request_error(exc):
                         raise RuntimeError(f"Request error for {url}: {exc}") from exc
-                    if on_retry is not None:
+                    will_retry = attempt < attempt_limit
+                    next_delay = provider_retry_delay_seconds(attempt) if will_retry else 0.0
+                    if on_retry is not None and will_retry:
                         await on_retry(
                             {
                                 "attempt": attempt,
                                 "delay_seconds": delay,
+                                "retry_wait_seconds_before_attempt": round(waited_before_attempt, 3),
+                                "cumulative_retry_wait_seconds": round(total_retry_wait_seconds, 3),
+                                "next_retry_delay_seconds": next_delay,
                                 "error": str(exc),
                                 "error_type": type(exc).__name__,
                                 **payload_diagnostics(payload),
@@ -1298,68 +1288,56 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
-                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                    if attempt >= attempt_limit:
                         raise RuntimeError(f"Provider request failed after {attempt} attempts: {exc}") from exc
                     continue
-                if is_retryable_response(response):
-                    if on_retry is not None:
-                        body = response.text
-                        await on_retry(
-                            {
-                                "attempt": attempt,
-                                "delay_seconds": delay,
-                                "status_code": response.status_code,
-                                "response": preview_response_body(body),
-                                "body_preview": preview_response_body(body),
-                                "body_chars": len(body),
-                                **payload_diagnostics(payload),
-                            }
-                        )
-                    if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
-                        await on_retry_compact(attempt)
-                    if attempt >= MAX_PROVIDER_ATTEMPTS:
-                        break
-                    continue
-                break
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                body = response.text
-                raise RuntimeError(f"{exc}. Response body: {body}") from exc
-            data = response.json()
-            raise_for_embedded_provider_error(data)
-            data["_cockpit_retry_attempts"] = attempt
-            return data
+                raise_for_embedded_provider_error(data)
+                data["_cockpit_retry_attempts"] = attempt
+                data["_cockpit_retry_wait_seconds"] = round(total_retry_wait_seconds, 3)
+                return data
 
     async def _post_chat_completion(
         self,
         payload: dict[str, Any],
         on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_retry_compact: Callable[[int], Awaitable[None]] | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
         url = f"{self.config.base_url}/chat/completions"
-        delays = [0.0, 0.0, 0.25, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0]
+        attempt_limit = normalized_provider_attempt_limit(max_attempts)
+        next_delay = 0.0
+        total_retry_wait_seconds = 0.0
         attempt = 0
         async with httpx.AsyncClient(timeout=None) as client:
             while True:
-                delay = delays[attempt] if attempt < len(delays) else delays[-1]
+                delay = next_delay
                 if delay > 0:
+                    wait_started = time.monotonic()
                     await asyncio.sleep(delay)
+                    waited_before_attempt = time.monotonic() - wait_started
+                    total_retry_wait_seconds += waited_before_attempt
+                else:
+                    waited_before_attempt = 0.0
                 attempt += 1
                 try:
                     response = await client.post(url, headers=headers, json=payload)
                 except httpx.RequestError as exc:
                     if not is_retryable_request_error(exc):
                         raise RuntimeError(f"Request error for {url}: {exc}") from exc
-                    if on_retry is not None:
+                    will_retry = attempt < attempt_limit
+                    next_delay = provider_retry_delay_seconds(attempt) if will_retry else 0.0
+                    if on_retry is not None and will_retry:
                         await on_retry(
                             {
                                 "attempt": attempt,
                                 "delay_seconds": delay,
+                                "retry_wait_seconds_before_attempt": round(waited_before_attempt, 3),
+                                "cumulative_retry_wait_seconds": round(total_retry_wait_seconds, 3),
+                                "next_retry_delay_seconds": next_delay,
                                 "error": str(exc),
                                 "error_type": type(exc).__name__,
                                 **payload_diagnostics(payload),
@@ -1367,16 +1345,21 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
-                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                    if attempt >= attempt_limit:
                         raise RuntimeError(f"Provider request failed after {attempt} attempts: {exc}") from exc
                     continue
                 if is_retryable_response(response):
-                    if on_retry is not None:
+                    will_retry = attempt < attempt_limit
+                    next_delay = provider_retry_delay_seconds(attempt, response=response) if will_retry else 0.0
+                    if on_retry is not None and will_retry:
                         body = response.text
                         await on_retry(
                             {
                                 "attempt": attempt,
                                 "delay_seconds": delay,
+                                "retry_wait_seconds_before_attempt": round(waited_before_attempt, 3),
+                                "cumulative_retry_wait_seconds": round(total_retry_wait_seconds, 3),
+                                "next_retry_delay_seconds": next_delay,
                                 "status_code": response.status_code,
                                 "response": preview_response_body(body),
                                 "body_preview": preview_response_body(body),
@@ -1384,9 +1367,9 @@ class AiProvider:
                                 **payload_diagnostics(payload),
                             }
                         )
-                    if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
+                    if response.status_code != 429 and attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
-                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                    if attempt >= attempt_limit:
                         break
                     continue
                 break
@@ -1398,6 +1381,7 @@ class AiProvider:
             data = response.json()
             raise_for_embedded_provider_error(data)
             data["_cockpit_retry_attempts"] = attempt
+            data["_cockpit_retry_wait_seconds"] = round(total_retry_wait_seconds, 3)
             return data
 
     async def _post_anthropic_message(
@@ -1405,6 +1389,7 @@ class AiProvider:
         payload: dict[str, Any],
         on_retry: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
         on_retry_compact: Callable[[int], Awaitable[None]] | None = None,
+        max_attempts: int | None = None,
     ) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
@@ -1412,24 +1397,36 @@ class AiProvider:
             "anthropic-version": "2023-06-01",
         }
         url = f"{self.config.base_url}/messages"
-        delays = [0.0, 0.0, 0.25, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0]
+        attempt_limit = normalized_provider_attempt_limit(max_attempts)
+        next_delay = 0.0
+        total_retry_wait_seconds = 0.0
         attempt = 0
         async with httpx.AsyncClient(timeout=None) as client:
             while True:
-                delay = delays[attempt] if attempt < len(delays) else delays[-1]
+                delay = next_delay
                 if delay > 0:
+                    wait_started = time.monotonic()
                     await asyncio.sleep(delay)
+                    waited_before_attempt = time.monotonic() - wait_started
+                    total_retry_wait_seconds += waited_before_attempt
+                else:
+                    waited_before_attempt = 0.0
                 attempt += 1
                 try:
                     response = await client.post(url, headers=headers, json=payload)
                 except httpx.RequestError as exc:
                     if not is_retryable_request_error(exc):
                         raise RuntimeError(f"Request error for {url}: {exc}") from exc
-                    if on_retry is not None:
+                    will_retry = attempt < attempt_limit
+                    next_delay = provider_retry_delay_seconds(attempt) if will_retry else 0.0
+                    if on_retry is not None and will_retry:
                         await on_retry(
                             {
                                 "attempt": attempt,
                                 "delay_seconds": delay,
+                                "retry_wait_seconds_before_attempt": round(waited_before_attempt, 3),
+                                "cumulative_retry_wait_seconds": round(total_retry_wait_seconds, 3),
+                                "next_retry_delay_seconds": next_delay,
                                 "error": str(exc),
                                 "error_type": type(exc).__name__,
                                 **payload_diagnostics(payload),
@@ -1437,16 +1434,21 @@ class AiProvider:
                         )
                     if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
-                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                    if attempt >= attempt_limit:
                         raise RuntimeError(f"Provider request failed after {attempt} attempts: {exc}") from exc
                     continue
                 if is_retryable_response(response):
-                    if on_retry is not None:
+                    will_retry = attempt < attempt_limit
+                    next_delay = provider_retry_delay_seconds(attempt, response=response) if will_retry else 0.0
+                    if on_retry is not None and will_retry:
                         body = response.text
                         await on_retry(
                             {
                                 "attempt": attempt,
                                 "delay_seconds": delay,
+                                "retry_wait_seconds_before_attempt": round(waited_before_attempt, 3),
+                                "cumulative_retry_wait_seconds": round(total_retry_wait_seconds, 3),
+                                "next_retry_delay_seconds": next_delay,
                                 "status_code": response.status_code,
                                 "response": preview_response_body(body),
                                 "body_preview": preview_response_body(body),
@@ -1454,9 +1456,9 @@ class AiProvider:
                                 **payload_diagnostics(payload),
                             }
                         )
-                    if attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
+                    if response.status_code != 429 and attempt > 0 and attempt % RETRY_PAYLOAD_COMPACT_EVERY == 0 and on_retry_compact is not None:
                         await on_retry_compact(attempt)
-                    if attempt >= MAX_PROVIDER_ATTEMPTS:
+                    if attempt >= attempt_limit:
                         break
                     continue
                 break
@@ -1468,6 +1470,7 @@ class AiProvider:
             data = response.json()
             raise_for_embedded_provider_error(data)
             data["_cockpit_retry_attempts"] = attempt
+            data["_cockpit_retry_wait_seconds"] = round(total_retry_wait_seconds, 3)
             return data
 
 
@@ -1871,6 +1874,55 @@ def preview_response_body(body: str, limit: int = 220) -> str:
     return f"{text[:limit].rstrip()}... [truncated; {len(text)} chars]"
 
 
+def response_stream_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Enable Responses SSE without mutating the caller's reusable retry payload."""
+    streamed = deepcopy(payload)
+    streamed["stream"] = True
+    return streamed
+
+
+async def decode_response_event_stream(lines: AsyncIterable[str]) -> dict[str, Any]:
+    """Return the canonical Response object from an OpenAI Responses SSE stream."""
+    latest_response: dict[str, Any] | None = None
+    async for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line or line.startswith(":") or not line.startswith("data:"):
+            continue
+        encoded = line[5:].strip()
+        if not encoded or encoded == "[DONE]":
+            continue
+        try:
+            event = json.loads(encoded)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Provider returned an invalid Responses stream event: {encoded[:220]}") from exc
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        response = event.get("response")
+        if isinstance(response, dict):
+            latest_response = response
+        if event_type == "response.completed":
+            if not isinstance(response, dict):
+                raise RuntimeError("Responses stream completed without a response object")
+            return response
+        if event_type == "response.incomplete":
+            if not isinstance(response, dict):
+                raise RuntimeError("Responses stream ended incomplete without a response object")
+            return response
+        if event_type in {"response.failed", "error"}:
+            error = event.get("error")
+            if not error and isinstance(response, dict):
+                error = response.get("error")
+            if isinstance(error, dict):
+                message = error.get("message") or error.get("code") or json.dumps(error, ensure_ascii=True)
+            else:
+                message = str(error or event_type)
+            raise RuntimeError(f"Provider Responses stream failed: {message}")
+    if isinstance(latest_response, dict) and latest_response.get("status") in {"completed", "incomplete"}:
+        return latest_response
+    raise RuntimeError("Provider Responses stream ended before a completion event")
+
+
 def looks_like_html(text: str) -> bool:
     lowered = text[:500].lower()
     return "<!doctype html" in lowered or "<html" in lowered or "<body" in lowered
@@ -2008,9 +2060,10 @@ def model_response_metrics(
         else None,
         **reasoning_summary_metrics(data),
         "total_tokens": usage.get("total_tokens"),
-        "retry_attempts": data.get("_cockpit_retry_attempts"),
+        **provider_retry_metrics(data, elapsed_seconds),
         "context_compaction_strategy": payload_context_compaction_strategy(payload),
     }
+    metrics.update(next_guides_metadata(data))
     if payload is not None:
         request_chars = encoded_json_length(payload)
         metrics.update(
@@ -2060,9 +2113,10 @@ def chat_model_response_metrics(
         "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
         "reasoning_tokens": reasoning_tokens,
         "total_tokens": usage.get("total_tokens"),
-        "retry_attempts": data.get("_cockpit_retry_attempts"),
+        **provider_retry_metrics(data, elapsed_seconds),
         "context_compaction_strategy": payload_context_compaction_strategy(payload),
     }
+    metrics.update(next_guides_metadata(data))
     if payload is not None:
         request_chars = encoded_json_length(payload)
         metrics.update(
@@ -2105,9 +2159,10 @@ def anthropic_model_response_metrics(
             if isinstance(value, (int, float))
         )
         or None,
-        "retry_attempts": data.get("_cockpit_retry_attempts"),
+        **provider_retry_metrics(data, elapsed_seconds),
         "context_compaction_strategy": payload_context_compaction_strategy(payload),
     }
+    metrics.update(next_guides_metadata(data))
     if payload is not None:
         request_chars = encoded_json_length(payload)
         metrics.update(
@@ -2120,6 +2175,18 @@ def anthropic_model_response_metrics(
             }
         )
     return metrics
+
+
+def provider_retry_metrics(data: dict[str, Any], elapsed_seconds: float) -> dict[str, Any]:
+    """Expose retry accounting separately from provider/model processing time."""
+    provider_attempts = max(1, int(data.get("_cockpit_retry_attempts") or 1))
+    retry_wait_seconds = max(0.0, float(data.get("_cockpit_retry_wait_seconds") or 0.0))
+    return {
+        "provider_attempts": provider_attempts,
+        "retry_attempts": max(0, provider_attempts - 1),
+        "retry_wait_seconds": round(retry_wait_seconds, 3),
+        "elapsed_excluding_retry_wait_seconds": round(max(0.0, elapsed_seconds - retry_wait_seconds), 3),
+    }
 
 
 def estimate_tokens_from_chars(chars: int | float | None) -> int | None:
@@ -2629,6 +2696,46 @@ def is_retryable_status(status_code: int) -> bool:
     return status_code in {408, 409, 425, 429, 500, 502, 503, 504}
 
 
+def normalized_provider_attempt_limit(max_attempts: int | None) -> int:
+    """Return a safe per-request attempt limit, including the initial request."""
+    if max_attempts is None:
+        return MAX_PROVIDER_ATTEMPTS
+    return max(1, int(max_attempts))
+
+
+def retry_after_seconds(response: httpx.Response, now: float | None = None) -> float | None:
+    """Parse Retry-After as seconds or an HTTP date and cap unreasonable waits."""
+    headers = getattr(response, "headers", None)
+    raw_value = headers.get("retry-after") if headers is not None else None
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            seconds = retry_at.timestamp() - (time.time() if now is None else now)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return min(MAX_RETRY_AFTER_SECONDS, max(0.0, seconds))
+
+
+def provider_retry_delay_seconds(failed_attempt: int, response: httpx.Response | None = None) -> float:
+    """Choose the delay before the next attempt, with slower 429 backoff."""
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    schedule = RATE_LIMIT_RETRY_DELAYS_SECONDS if status_code == 429 else PROVIDER_RETRY_DELAYS_SECONDS
+    index = min(max(0, int(failed_attempt)), len(schedule) - 1)
+    delay = schedule[index]
+    if response is not None:
+        advertised_delay = retry_after_seconds(response)
+        if advertised_delay is not None:
+            delay = max(delay, advertised_delay)
+    return float(delay)
+
+
 def is_retryable_response(response: httpx.Response) -> bool:
     if not is_retryable_status(response.status_code):
         return False
@@ -2704,6 +2811,77 @@ def extract_reasoning_summary(data: dict[str, Any]) -> list[str]:
                     if text:
                         summaries.append(str(text))
     return summaries
+
+
+NEXT_GUIDES_METADATA_PATTERN = re.compile(r"(?im)^\s*NEXT_GUIDES\s*:\s*(\[[^\r\n]*\])\s*$")
+
+
+def next_guides_metadata(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize guide declarations exposed by DGX, Responses, Chat, or Claude."""
+    direct_candidates: list[tuple[Any, str]] = []
+    containers: list[tuple[dict[str, Any], str]] = [(data, "provider_metadata")]
+    if isinstance(data.get("dgx_routing"), dict):
+        containers.append((data["dgx_routing"], "dgx_routing"))
+        if isinstance(data["dgx_routing"].get("handoff"), dict):
+            containers.append((data["dgx_routing"]["handoff"], "dgx_handoff"))
+    message = None
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+    if isinstance(message, dict):
+        containers.append((message, "native_response"))
+    for output in data.get("output", []) or []:
+        if isinstance(output, dict):
+            containers.append((output, "native_response"))
+            for content in output.get("content", []) or []:
+                if isinstance(content, dict):
+                    containers.append((content, "native_response"))
+    for container, source in containers:
+        for key in ("next_guides", "guide_paths"):
+            if key in container:
+                direct_candidates.append((container.get(key), source))
+    for value, source in direct_candidates:
+        if isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value):
+            paths: list[str] = []
+            for item in value:
+                path = item.strip().replace("\\", "/")
+                if path not in paths:
+                    paths.append(path)
+            return {"next_guides": paths, "next_guides_status": "declared", "next_guides_source": source}
+        if value is not None:
+            return {"next_guides": [], "next_guides_status": "invalid", "next_guides_source": source}
+
+    text_candidates: list[tuple[str, str]] = []
+    for container, source in containers:
+        for key in ("content", "text", "reasoning_content", "reasoning", "thinking"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                text_candidates.append((value, source))
+            elif isinstance(value, list):
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    for nested_key in ("text", "thinking", "reasoning_content", "reasoning"):
+                        nested = item.get(nested_key)
+                        if isinstance(nested, str) and nested.strip():
+                            text_candidates.append((nested, source))
+    for text, source in text_candidates:
+        matches = NEXT_GUIDES_METADATA_PATTERN.findall(text)
+        if not matches:
+            continue
+        try:
+            value = json.loads(matches[-1])
+        except json.JSONDecodeError:
+            return {"next_guides": [], "next_guides_status": "invalid", "next_guides_source": source}
+        if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+            return {"next_guides": [], "next_guides_status": "invalid", "next_guides_source": source}
+        paths = []
+        for item in value:
+            path = item.strip().replace("\\", "/")
+            if path not in paths:
+                paths.append(path)
+        return {"next_guides": paths, "next_guides_status": "declared", "next_guides_source": source}
+    return {"next_guides": [], "next_guides_status": "missing", "next_guides_source": None}
 
 
 def reasoning_summary_metrics(data: dict[str, Any]) -> dict[str, Any]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tempfile
 import unittest
 import sys
 from pathlib import Path
@@ -37,7 +38,7 @@ sys.modules.setdefault("mcp.server.stdio", SimpleNamespace(stdio_server=None))
 from backend.agent_tools import filter_agent_tools
 from backend.mcp_client import McpStdioClient
 from backend.runtime_utils import websocket_closed_ok
-from backend.server import CockpitApp, exception_diagnostic
+from backend.server import CockpitApp, exception_diagnostic, parse_next_guide_declaration
 
 
 class AgentFailureDiagnosticTests(unittest.TestCase):
@@ -693,6 +694,51 @@ class RequiredGuideContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorded[0][1]["source"], "tool_requirement")
         self.assertTrue(recorded[0][1]["internal"])
 
+    async def test_required_guides_fail_closed_when_one_does_not_fit(self) -> None:
+        app = object.__new__(CockpitApp)
+
+        async def fake_call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+            return {
+                "ok": True,
+                "selected_paths": [
+                    "agent-guide/10-imaging-light-vision.md",
+                    "agent-guide/11-temperature.md",
+                ],
+                "revision": 1,
+            }
+
+        async def fake_record(_event_type: str, **_fields: object) -> dict[str, object]:
+            return {}
+
+        app.call_agent_mcp_tool = fake_call
+        app.load_turn_guide_expansions = lambda _paths: (
+            "guide text",
+            {
+                "files": [
+                    {"path": "agent-guide/10-imaging-light-vision.md"},
+                    {
+                        "path": "agent-guide/11-temperature.md",
+                        "omitted": True,
+                        "reason": "guide_priority_budget_exhausted",
+                    },
+                ]
+            },
+        )
+        app.record = fake_record
+        state = {"paths": [], "reason": "", "revision": 0}
+
+        result = await app.ensure_required_guide_context(
+            state,
+            "start_melting_curve_capture",
+            {},
+            trigger_round=2,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["missing_guide_paths"], ["agent-guide/11-temperature.md"])
+        self.assertEqual(state["paths"], [])
+
     def test_melting_capture_defaults_to_microscope_mode_and_both_channels(self) -> None:
         app = object.__new__(CockpitApp)
         app.goal_status = lambda: {
@@ -767,68 +813,9 @@ class DashboardGoalCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorded[0][0], "goal_completed")
 
 
-class SeparateGuideSelectorTests(unittest.IsolatedAsyncioTestCase):
+class GuideContextBudgetTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.app = object.__new__(CockpitApp)
-
-    async def test_separate_selector_updates_context_without_agent_tool_events(self) -> None:
-        recorded: list[tuple[str, dict[str, object]]] = []
-
-        class FakeRecorder:
-            run_id = "run"
-
-            def events_for_run(self, _run_id: str) -> list[dict[str, object]]:
-                return [{"type": "mcp_tool_result", "tool": "plan_move", "ok": True}]
-
-        async def fake_select(*_args: object) -> dict[str, object]:
-            return {
-                "paths": ["agent-guide/11-temperature.md"],
-                "reason": "Thermal step follows the completed move.",
-                "catalog_count": 12,
-            }
-
-        async def fake_ensure(*_args: object, **_kwargs: object) -> bool:
-            return False
-
-        async def fake_call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
-            return {
-                "ok": True,
-                "selected_paths": ["agent-guide/11-temperature.md"],
-                "reason": "Thermal step follows the completed move.",
-                "revision": 1,
-            }
-
-        async def fake_record(event_type: str, **fields: object) -> dict[str, object]:
-            recorded.append((event_type, fields))
-            return {}
-
-        self.app.recorder = FakeRecorder()
-        self.app.goal_status = lambda: {"status": "active", "objective": "Run a thermal step."}
-        self.app.deterministic_guide_paths = lambda *_args: []
-        self.app.select_turn_guide_shards = fake_select
-        self.app.ensure_mcp_started_for_tool = fake_ensure
-        self.app.call_agent_mcp_tool = fake_call
-        self.app.load_turn_guide_expansions = lambda paths: (
-            "guide text",
-            {"files": [{"path": path} for path in paths]},
-        )
-        self.app.record = fake_record
-
-        state = {"paths": [], "reason": "", "revision": 0}
-        selected = await self.app.refresh_agent_guide_context(
-            state,
-            "Run a thermal step.",
-            trigger_tool="plan_move",
-            trigger_round=4,
-            on_retry=None,
-            on_context_compacted=None,
-        )
-
-        self.assertTrue(selected)
-        self.assertEqual(state["paths"], ["agent-guide/11-temperature.md"])
-        self.assertEqual(recorded[0][0], "guide_context_selected")
-        self.assertTrue(recorded[0][1]["internal"])
-        self.assertEqual(recorded[0][1]["source"], "separate_guide_selector")
 
     def test_omitted_shards_are_not_reported_as_effective_context(self) -> None:
         metadata = {
@@ -846,16 +833,6 @@ class SeparateGuideSelectorTests(unittest.IsolatedAsyncioTestCase):
             CockpitApp.effective_guide_paths(metadata),
             ["agent-guide/06-planning-execution-rhythm.md"],
         )
-        capacity_error = CockpitApp.guide_selection_capacity_result(
-            {"selected_paths": [item["path"] for item in metadata["files"]]},
-            metadata,
-        )
-        self.assertIsNotNone(capacity_error)
-        self.assertEqual(
-            capacity_error["omitted_guide_paths"],
-            ["agent-guide/11-temperature.md"],
-        )
-        self.assertTrue(capacity_error["isError"])
 
     def test_agent_tool_catalog_hides_internal_guide_selector(self) -> None:
         tools = filter_agent_tools(
@@ -867,29 +844,112 @@ class SeparateGuideSelectorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([tool["name"] for tool in tools], ["plan_move"])
 
-    def test_common_protocol_guide_routing_is_deterministic(self) -> None:
-        self.app.available_guide_shards = lambda: [
-            {"path": "agent-guide/03-startup-state-large-values.md"},
-            {"path": "agent-guide/06-planning-execution-rhythm.md"},
-            {"path": "agent-guide/07-droplets-reservoirs-injection.md"},
-            {"path": "agent-guide/09-execution-view-modes-diagnostics.md"},
-            {"path": "agent-guide/10-imaging-light-vision.md"},
+    def test_ranked_guides_load_as_an_ordered_prefix_within_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shard_dir = root / "agent-guide"
+            shard_dir.mkdir()
+            paths = ["agent-guide/a.md", "agent-guide/b.md", "agent-guide/c.md"]
+            for path in paths:
+                (root / path).write_text("x" * 70, encoding="utf-8")
+            self.app.pinned_context_roots = lambda: [("default", root)]
+
+            with patch("backend.server.GUIDE_EXPANSION_CHAR_LIMIT", 350):
+                _context, metadata = self.app.load_turn_guide_expansions(paths)
+
+        self.assertEqual(self.app.effective_guide_paths(metadata), paths[:2])
+        self.assertEqual(
+            [item["path"] for item in metadata["files"] if item.get("omitted")],
+            paths[2:],
+        )
+
+
+class AgentGuideDeclarationTests(unittest.IsolatedAsyncioTestCase):
+    def test_parses_exact_ranked_next_guides_line(self) -> None:
+        allowed = ["agent-guide/a.md", "agent-guide/b.md"]
+
+        result = parse_next_guide_declaration(
+            'Reasoning summary.\nNEXT_GUIDES: ["agent-guide/b.md", "agent-guide/a.md"]',
+            allowed,
+        )
+
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["paths"], ["agent-guide/b.md", "agent-guide/a.md"])
+
+    def test_rejects_invented_guide_names(self) -> None:
+        result = parse_next_guide_declaration(
+            'NEXT_GUIDES: ["agent-guide/not-real.md"]',
+            ["agent-guide/a.md"],
+        )
+
+        self.assertEqual(result["status"], "invalid")
+        self.assertEqual(result["invalid_paths"], ["agent-guide/not-real.md"])
+
+    async def test_agent_declaration_applies_ranked_prefix_and_records_omissions(self) -> None:
+        app = object.__new__(CockpitApp)
+        recorded: list[tuple[str, dict[str, object]]] = []
+        ranked = ["agent-guide/a.md", "agent-guide/b.md", "agent-guide/c.md"]
+
+        app.available_guide_shards = lambda: [
+            {"path": path, "title": path, "chars": 100} for path in ranked
+        ]
+        app.load_turn_guide_expansions = lambda _paths: (
+            "guide context",
+            {
+                "files": [
+                    {"path": ranked[0]},
+                    {"path": ranked[1]},
+                    {"path": ranked[2], "omitted": True, "reason": "guide_priority_budget_exhausted"},
+                ]
+            },
+        )
+
+        async def fake_record(event_type: str, **fields: object) -> dict[str, object]:
+            recorded.append((event_type, fields))
+            return {}
+
+        app.record = fake_record
+        guide_state = {"paths": [], "reason": "", "revision": 0}
+        declaration_state = {"round": 0, "status": "missing", "alert": "MISSING"}
+
+        applied = await app.apply_agent_guide_declaration(
+            guide_state,
+            declaration_state,
+            f'NEXT_GUIDES: {json.dumps(ranked)}',
+            round_index=0,
+            source="reasoning",
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(guide_state["paths"], ranked[:2])
+        self.assertEqual(declaration_state["alert"], "")
+        self.assertEqual(recorded[0][1]["ranked_paths"], ranked)
+        self.assertEqual(recorded[0][1]["omitted_guide_paths"], ranked[2:])
+
+    async def test_invalid_declaration_creates_uppercase_retry_alert(self) -> None:
+        app = object.__new__(CockpitApp)
+        app.available_guide_shards = lambda: [
+            {"path": "agent-guide/a.md", "title": "A", "chars": 100}
         ]
 
-        paths = self.app.deterministic_guide_paths(
-            "Initialize BoxMini, clear matrix, create a droplet, move it in a path, and show the whole cartridge.",
-            {"objective": "Execute the protocol."},
+        async def fake_record(_event_type: str, **_fields: object) -> dict[str, object]:
+            return {}
+
+        app.record = fake_record
+        guide_state = {"paths": [], "reason": "", "revision": 0}
+        declaration_state = {"round": 0, "status": "missing", "alert": ""}
+
+        applied = await app.apply_agent_guide_declaration(
+            guide_state,
+            declaration_state,
+            'NEXT_GUIDES: ["agent-guide/invented.md"]',
+            round_index=0,
+            source="reasoning",
         )
 
-        self.assertEqual(
-            paths,
-            [
-                "agent-guide/03-startup-state-large-values.md",
-                "agent-guide/06-planning-execution-rhythm.md",
-                "agent-guide/07-droplets-reservoirs-injection.md",
-                "agent-guide/09-execution-view-modes-diagnostics.md",
-            ],
-        )
+        self.assertFalse(applied)
+        self.assertIn("THE PREVIOUS NEXT_GUIDES LINE WAS INVALID", declaration_state["alert"])
+        self.assertIn("agent-guide/a.md", declaration_state["alert"])
 
 
 if __name__ == "__main__":
